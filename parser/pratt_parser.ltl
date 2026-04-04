@@ -1,0 +1,35 @@
+// Pratt Expression Parser
+module compiler.parser.pratt_parser
+
+pub struct PrattParserPass {
+    name: str
+    errors: list
+    warnings: list
+}
+
+impl PrattParserPass {
+    pub fn new() -> PrattParserPass {
+        return PrattParserPass { name: "Pratt Expression Parser", errors: [], warnings: [] }
+    }
+    pub fn run(self, input: any) -> any {
+        return input
+    }
+    pub fn add_error(self, msg: str, line: int, col: int) {
+        self.errors = push(self.errors, {"msg": msg, "line": line, "col": col})
+    }
+    pub fn add_warning(self, msg: str, line: int) {
+        self.warnings = push(self.warnings, {"msg": msg, "line": line})
+    }
+    pub fn ok(self) -> bool { return len(self.errors) == 0 }
+    pub fn report(self) -> str {
+        let mut s = self.name + ": "
+        if self.ok() { s += "OK" } else { s += len(self.errors) as str + " error(s)" }
+        return s
+    }
+}
+
+fn main() {
+    let pass = PrattParserPass.new()
+    let result = pass.run("fn main() { println(\"hello\") }")
+    println(pass.report())
+}
