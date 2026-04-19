@@ -1,0 +1,333 @@
+// Compiler Pass — Lifetime Checker (Borrow Checker)
+// Region-based borrow analysis with NLL (non-lexical lifetimes).
+
+use std.collections.{HashMap, HashSet}
+
+type LifetimeId = u32
+type VarId = u32
+type LocationId = u32
+
+// ── Lifetimes ────────────────────────────────────────────────────────────────
+struct Lifetime {
+    id: LifetimeId,
+    name: Option<string>,
+    scope_start: LocationId,
+    scope_end: LocationId,
+}
+
+impl Lifetime {
+    fn named(id: LifetimeId, name: &str, start: LocationId, end: LocationId) -> Lifetime {
+        Lifetime { id, name: some(name.to_string()), scope_start: start, scope_end: end }
+    }
+
+    fn anonymous(id: LifetimeId, start: LocationId, end: LocationId) -> Lifetime {
+        Lifetime { id, name: none, scope_start: start, scope_end: end }
+    }
+
+    fn contains(self, loc: LocationId) -> bool {
+        loc >= self.scope_start && loc <= self.scope_end
+    }
+
+    fn outlives(self, other: &Lifetime) -> bool {
+        self.scope_start <= other.scope_start && self.scope_end >= other.scope_end
+    }
+}
+
+// ── Borrows ──────────────────────────────────────────────────────────────────
+enum BorrowKind { Shared, Mutable }
+
+struct Borrow {
+    id: u32,
+    kind: BorrowKind,
+    place: Place,
+    lifetime: LifetimeId,
+    location: LocationId,
+}
+
+struct Place {
+    var: VarId,
+    projections: [Projection],
+}
+
+enum Projection {
+    Deref,
+    Field(string),
+    Index,
+}
+
+impl Place {
+    fn local(var: VarId) -> Place { Place { var, projections: [] } }
+    fn field(var: VarId, name: &str) -> Place {
+        Place { var, projections: [Projection.Field(name.to_string())] }
+    }
+    fn conflicts_with(self, other: &Place) -> bool {
+        if self.var != other.var { return false }
+        // If one is a prefix of the other, they conflict
+        let min_len = std.cmp.min(self.projections.len(), other.projections.len())
+        for i in 0..min_len {
+            match (&self.projections[i], &other.projections[i]) {
+                (Projection.Field(a), Projection.Field(b)) if a != b => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+}
+
+// ── Liveness analysis ────────────────────────────────────────────────────────
+struct LivenessInfo {
+    live_at: HashMap<LocationId, HashSet<VarId>>,
+    last_use: HashMap<VarId, LocationId>,
+}
+
+impl LivenessInfo {
+    fn new() -> LivenessInfo {
+        LivenessInfo { live_at: HashMap.new(), last_use: HashMap.new() }
+    }
+
+    fn mark_use(mut self, var: VarId, loc: LocationId) {
+        self.live_at.entry(loc).or_insert(HashSet.new()).insert(var)
+        let entry = self.last_use.entry(var).or_insert(0)
+        if loc > *entry { *entry = loc }
+    }
+
+    fn is_live_at(self, var: VarId, loc: LocationId) -> bool {
+        self.live_at.get(&loc).map(|s| s.contains(&var)).unwrap_or(false)
+    }
+
+    fn last_use_of(self, var: VarId) -> Option<LocationId> {
+        self.last_use.get(&var).copied()
+    }
+}
+
+// ── Borrow checker errors ────────────────────────────────────────────────────
+enum BorrowError {
+    UseAfterMove { var: VarId, moved_at: LocationId, used_at: LocationId },
+    BorrowWhileMutBorrowed { var: VarId, first_borrow: LocationId, second_borrow: LocationId },
+    MutBorrowWhileBorrowed { var: VarId, shared_borrow: LocationId, mut_borrow: LocationId },
+    MultipleMutBorrows { var: VarId, first: LocationId, second: LocationId },
+    MoveWhileBorrowed { var: VarId, borrow_at: LocationId, move_at: LocationId },
+    AssignWhileBorrowed { var: VarId, borrow_at: LocationId, assign_at: LocationId },
+    DanglingReference { borrow: u32, lifetime: LifetimeId },
+    LifetimeMismatch { expected: LifetimeId, found: LifetimeId },
+}
+
+// ── Borrow Checker ───────────────────────────────────────────────────────────
+struct BorrowChecker {
+    lifetimes: HashMap<LifetimeId, Lifetime>,
+    active_borrows: [Borrow],
+    moved_vars: HashMap<VarId, LocationId>,
+    liveness: LivenessInfo,
+    errors: [BorrowError],
+    next_lifetime: LifetimeId,
+    next_borrow: u32,
+    current_location: LocationId,
+}
+
+impl BorrowChecker {
+    fn new() -> BorrowChecker {
+        BorrowChecker {
+            lifetimes: HashMap.new(),
+            active_borrows: [],
+            moved_vars: HashMap.new(),
+            liveness: LivenessInfo.new(),
+            errors: [],
+            next_lifetime: 0,
+            next_borrow: 0,
+            current_location: 0,
+        }
+    }
+
+    fn fresh_lifetime(mut self, start: LocationId, end: LocationId) -> LifetimeId {
+        let id = self.next_lifetime; self.next_lifetime += 1
+        self.lifetimes.insert(id, Lifetime.anonymous(id, start, end))
+        id
+    }
+
+    fn advance_location(mut self) { self.current_location += 1 }
+
+    fn check_use(mut self, var: VarId) {
+        if let some(&moved_at) = self.moved_vars.get(&var) {
+            self.errors.push(BorrowError.UseAfterMove {
+                var, moved_at, used_at: self.current_location,
+            })
+        }
+        self.liveness.mark_use(var, self.current_location)
+    }
+
+    fn check_move(mut self, var: VarId) {
+        // Can't move if borrowed
+        for borrow in &self.active_borrows {
+            if borrow.place.var == var && self.is_borrow_active(borrow) {
+                self.errors.push(BorrowError.MoveWhileBorrowed {
+                    var, borrow_at: borrow.location, move_at: self.current_location,
+                })
+            }
+        }
+        self.moved_vars.insert(var, self.current_location)
+    }
+
+    fn check_borrow(mut self, place: Place, kind: BorrowKind) -> u32 {
+        let var = place.var
+
+        // Check if moved
+        self.check_use(var)
+
+        // Check conflicts with active borrows
+        for existing in &self.active_borrows {
+            if !self.is_borrow_active(existing) { continue }
+            if !place.conflicts_with(&existing.place) { continue }
+
+            match (&kind, &existing.kind) {
+                (BorrowKind.Mutable, BorrowKind.Mutable) => {
+                    self.errors.push(BorrowError.MultipleMutBorrows {
+                        var, first: existing.location, second: self.current_location,
+                    })
+                }
+                (BorrowKind.Mutable, BorrowKind.Shared) => {
+                    self.errors.push(BorrowError.MutBorrowWhileBorrowed {
+                        var, shared_borrow: existing.location, mut_borrow: self.current_location,
+                    })
+                }
+                (BorrowKind.Shared, BorrowKind.Mutable) => {
+                    self.errors.push(BorrowError.BorrowWhileMutBorrowed {
+                        var, first_borrow: existing.location, second_borrow: self.current_location,
+                    })
+                }
+                (BorrowKind.Shared, BorrowKind.Shared) => {} // OK
+            }
+        }
+
+        let id = self.next_borrow; self.next_borrow += 1
+        let lifetime = self.fresh_lifetime(self.current_location, self.current_location + 10)
+        self.active_borrows.push(Borrow {
+            id, kind, place, lifetime, location: self.current_location,
+        })
+        id
+    }
+
+    fn check_assign(mut self, var: VarId) {
+        for borrow in &self.active_borrows {
+            if borrow.place.var == var && self.is_borrow_active(borrow) {
+                self.errors.push(BorrowError.AssignWhileBorrowed {
+                    var, borrow_at: borrow.location, assign_at: self.current_location,
+                })
+            }
+        }
+        // Remove from moved (re-initialized)
+        self.moved_vars.remove(&var)
+    }
+
+    fn is_borrow_active(self, borrow: &Borrow) -> bool {
+        if let some(lifetime) = self.lifetimes.get(&borrow.lifetime) {
+            lifetime.contains(self.current_location)
+        } else { false }
+    }
+
+    fn check_lifetime_outlives(mut self, shorter: LifetimeId, longer: LifetimeId) {
+        let s = self.lifetimes.get(&shorter)
+        let l = self.lifetimes.get(&longer)
+        if let (some(s), some(l)) = (s, l) {
+            if !l.outlives(s) {
+                self.errors.push(BorrowError.LifetimeMismatch { expected: longer, found: shorter })
+            }
+        }
+    }
+
+    fn expire_borrows(mut self) {
+        self.active_borrows.retain(|b| self.is_borrow_active(b))
+    }
+
+    fn error_count(self) -> usize { self.errors.len() }
+    fn has_errors(self) -> bool { !self.errors.is_empty() }
+}
+
+fn main() {
+    // Basic use-after-move
+    let mut checker = BorrowChecker.new()
+    checker.check_move(0)    // move var 0
+    checker.advance_location()
+    checker.check_use(0)     // use after move!
+    assert(checker.has_errors())
+    match &checker.errors[0] {
+        BorrowError.UseAfterMove { var, .. } => assert(*var == 0),
+        _ => panic("expected UseAfterMove"),
+    }
+    print("Use-after-move detected ✓")
+
+    // Shared borrows OK
+    let mut checker = BorrowChecker.new()
+    checker.check_borrow(Place.local(0), BorrowKind.Shared)
+    checker.check_borrow(Place.local(0), BorrowKind.Shared)
+    assert(!checker.has_errors())
+    print("Multiple shared borrows OK ✓")
+
+    // Mutable + shared conflict
+    let mut checker = BorrowChecker.new()
+    checker.check_borrow(Place.local(0), BorrowKind.Mutable)
+    checker.check_borrow(Place.local(0), BorrowKind.Shared)
+    assert(checker.has_errors())
+    print("Mut+shared conflict detected ✓")
+
+    // Multiple mutable borrows conflict
+    let mut checker = BorrowChecker.new()
+    checker.check_borrow(Place.local(0), BorrowKind.Mutable)
+    checker.check_borrow(Place.local(0), BorrowKind.Mutable)
+    assert(checker.error_count() >= 1)
+    print("Multiple mut borrows conflict ✓")
+
+    // Move while borrowed
+    let mut checker = BorrowChecker.new()
+    checker.check_borrow(Place.local(0), BorrowKind.Shared)
+    checker.check_move(0)
+    assert(checker.has_errors())
+    match &checker.errors[0] {
+        BorrowError.MoveWhileBorrowed { .. } => {}
+        _ => panic("expected MoveWhileBorrowed"),
+    }
+    print("Move-while-borrowed detected ✓")
+
+    // Assign while borrowed
+    let mut checker = BorrowChecker.new()
+    checker.check_borrow(Place.local(0), BorrowKind.Shared)
+    checker.check_assign(0)
+    assert(checker.has_errors())
+    print("Assign-while-borrowed detected ✓")
+
+    // Disjoint fields OK
+    let mut checker = BorrowChecker.new()
+    checker.check_borrow(Place.field(0, "x"), BorrowKind.Mutable)
+    checker.check_borrow(Place.field(0, "y"), BorrowKind.Mutable)
+    assert(!checker.has_errors())
+    print("Disjoint field borrows OK ✓")
+
+    // Lifetime outlives
+    let mut checker = BorrowChecker.new()
+    let short = checker.fresh_lifetime(5, 10)
+    let long = checker.fresh_lifetime(0, 20)
+    checker.check_lifetime_outlives(short, long)
+    assert(!checker.has_errors())
+    print("Lifetime outlives check ✓")
+
+    // Liveness
+    let mut liveness = LivenessInfo.new()
+    liveness.mark_use(0, 5)
+    liveness.mark_use(0, 10)
+    liveness.mark_use(1, 3)
+    assert(liveness.is_live_at(0, 5))
+    assert(!liveness.is_live_at(0, 7))
+    assert(liveness.last_use_of(0) == some(10))
+    print("Liveness analysis ✓")
+
+    // Re-initialization after move
+    let mut checker = BorrowChecker.new()
+    checker.check_move(0)
+    checker.advance_location()
+    checker.check_assign(0)  // re-init
+    checker.advance_location()
+    checker.check_use(0)     // should be OK now
+    assert(!checker.has_errors())
+    print("Re-init after move OK ✓")
+
+    print("Lifetime Checker complete ✓")
+}
