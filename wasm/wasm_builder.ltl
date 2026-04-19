@@ -1,0 +1,103 @@
+// wasm_builder.ltl — Programmatic WebAssembly module builder
+use crate.wasm.wasm_types.{ValType, FuncType, Limits, encode_leb128_u, encode_vec}
+
+const WASM_MAGIC:   [u8] = [0x00, 0x61, 0x73, 0x6D]
+const WASM_VERSION: [u8] = [0x01, 0x00, 0x00, 0x00]
+
+struct WasmModule {
+    types:     [FuncType],
+    imports:   [Import],
+    functions: [Function],
+    exports:   [Export],
+    memory:    Limits?,
+    globals:   [Global],
+    data:      [DataSegment],
+}
+
+struct Import   { module: string, name: string, kind: ImportKind }
+struct Function { type_idx: int, locals: [(int, ValType)], body: [Instr] }
+struct Export   { name: string, kind: ExportKind, index: int }
+struct Global   { ty: (ValType, bool), init: Instr }
+struct DataSegment { memory_idx: int, offset: Instr, data: [u8] }
+
+enum ImportKind  { Func(int), Memory(Limits), Global(ValType, bool) }
+enum ExportKind  { Func, Memory, Global, Table }
+
+enum Instr {
+    I32Const(int), I64Const(int),
+    F32Const(float), F64Const(float),
+    I32Add, I32Sub, I32Mul, I32DivS,
+    I64Add, I64Sub, I64Mul,
+    LocalGet(int), LocalSet(int), LocalTee(int),
+    GlobalGet(int), GlobalSet(int),
+    Call(int), CallIndirect(int, int),
+    Return, Drop, Select,
+    If(FuncType?), Else, End, Block(FuncType?), Loop(FuncType?),
+    I32Load(int, int), I32Store(int, int),
+    MemorySize, MemoryGrow,
+}
+
+impl WasmModule {
+    fn new() -> WasmModule {
+        WasmModule { types: [], imports: [], functions: [], exports: [], memory: none, globals: [], data: [] }
+    }
+
+    fn add_type(mut self, ty: FuncType) -> int {
+        let idx = self.types.len()
+        self.types.push(ty)
+        idx
+    }
+
+    fn add_function(mut self, type_idx: int, locals: [(int, ValType)], body: [Instr]) -> int {
+        let idx = self.functions.len() + self.imports |> filter(|i| matches!(i.kind, ImportKind.Func(_))) |> count()
+        self.functions.push(Function { type_idx, locals, body })
+        idx
+    }
+
+    fn export_func(mut self, name: string, index: int) {
+        self.exports.push(Export { name, kind: ExportKind.Func, index })
+    }
+
+    fn encode(self) -> [u8] {
+        let mut out = [...WASM_MAGIC, ...WASM_VERSION]
+        if !self.types.is_empty()     { out.extend(self.encode_type_section()) }
+        if !self.imports.is_empty()   { out.extend(self.encode_import_section()) }
+        if !self.functions.is_empty() { out.extend(self.encode_function_section()) }
+        if let some(m) = self.memory  { out.extend(self.encode_memory_section(m)) }
+        if !self.globals.is_empty()   { out.extend(self.encode_global_section()) }
+        if !self.exports.is_empty()   { out.extend(self.encode_export_section()) }
+        if !self.functions.is_empty() { out.extend(self.encode_code_section()) }
+        if !self.data.is_empty()      { out.extend(self.encode_data_section()) }
+        out
+    }
+
+    fn section(id: u8, content: [u8]) -> [u8] {
+        [id, ...encode_leb128_u(content.len()), ...content]
+    }
+
+    fn encode_type_section(self) -> [u8] {
+        Self.section(1, encode_vec(self.types |> map(|t| t.encode()) |> collect()))
+    }
+
+    fn encode_function_section(self) -> [u8] {
+        Self.section(3, encode_vec(self.functions |> map(|f| encode_leb128_u(f.type_idx)) |> collect()))
+    }
+
+    fn encode_memory_section(self, limits: Limits) -> [u8] {
+        Self.section(5, encode_vec([limits.encode()]))
+    }
+
+    fn encode_export_section(self) -> [u8] {
+        let items = self.exports |> map(|e| {
+            let name_bytes = e.name.as_bytes()
+            let kind = match e.kind { ExportKind.Func => 0x00, ExportKind.Memory => 0x02, ExportKind.Global => 0x03, _ => 0x01 }
+            [...encode_leb128_u(name_bytes.len()), ...name_bytes, kind, ...encode_leb128_u(e.index)]
+        }) |> collect()
+        Self.section(7, encode_vec(items))
+    }
+
+    fn encode_import_section(self) -> [u8] { Self.section(2, []) }
+    fn encode_global_section(self)  -> [u8] { Self.section(6, []) }
+    fn encode_code_section(self)    -> [u8] { Self.section(10, []) }
+    fn encode_data_section(self)    -> [u8] { Self.section(11, []) }
+}
