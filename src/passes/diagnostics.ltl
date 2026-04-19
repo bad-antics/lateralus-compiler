@@ -1,0 +1,240 @@
+// Compiler Pass - Diagnostics
+// Structured error/warning reporting with source locations, spans, fix suggestions.
+
+use std.collections.HashMap
+
+enum Severity { Error, Warning, Info, Hint }
+
+impl Severity {
+    fn label(self) -> &str {
+        match self { Severity.Error => "error", Severity.Warning => "warning", Severity.Info => "info", Severity.Hint => "hint" }
+    }
+}
+
+struct Span {
+    file_id: usize,
+    start: usize,
+    end: usize,
+}
+
+impl Span {
+    fn new(file_id: usize, start: usize, end: usize) -> Span { Span { file_id, start, end } }
+    fn len(self) -> usize { self.end - self.start }
+    fn merge(self, other: &Span) -> Span {
+        Span { file_id: self.file_id, start: self.start.min(other.start), end: self.end.max(other.end) }
+    }
+}
+
+struct SourceLocation {
+    line: usize,
+    column: usize,
+    line_text: string,
+}
+
+struct SourceFile {
+    id: usize,
+    name: string,
+    content: string,
+    line_starts: [usize],
+}
+
+impl SourceFile {
+    fn new(id: usize, name: &str, content: &str) -> SourceFile {
+        let mut line_starts = [0usize]
+        for (i, ch) in content.chars().enumerate() {
+            if ch == '\n' { line_starts.push(i + 1) }
+        }
+        SourceFile { id, name: name.to_string(), content: content.to_string(), line_starts }
+    }
+
+    fn location(self, offset: usize) -> SourceLocation {
+        let mut line = 0
+        for i in 0..self.line_starts.len() {
+            if self.line_starts[i] > offset { break }
+            line = i
+        }
+        let col = offset - self.line_starts[line]
+        let line_end = if line + 1 < self.line_starts.len() {
+            self.line_starts[line + 1] - 1
+        } else { self.content.len() }
+        let line_text = self.content[self.line_starts[line]..line_end].to_string()
+        SourceLocation { line: line + 1, column: col + 1, line_text }
+    }
+}
+
+struct SourceMap {
+    files: [SourceFile],
+}
+
+impl SourceMap {
+    fn new() -> SourceMap { SourceMap { files: [] } }
+    fn add_file(mut self, name: &str, content: &str) -> usize {
+        let id = self.files.len()
+        self.files.push(SourceFile.new(id, name, content))
+        id
+    }
+    fn get_file(self, id: usize) -> Option<&SourceFile> { self.files.get(id) }
+}
+
+struct Label {
+    span: Span,
+    message: string,
+    is_primary: bool,
+}
+
+impl Label {
+    fn primary(span: Span, message: &str) -> Label {
+        Label { span, message: message.to_string(), is_primary: true }
+    }
+    fn secondary(span: Span, message: &str) -> Label {
+        Label { span, message: message.to_string(), is_primary: false }
+    }
+}
+
+struct FixSuggestion {
+    message: string,
+    span: Span,
+    replacement: string,
+}
+
+impl FixSuggestion {
+    fn new(message: &str, span: Span, replacement: &str) -> FixSuggestion {
+        FixSuggestion { message: message.to_string(), span, replacement: replacement.to_string() }
+    }
+}
+
+struct Diagnostic {
+    severity: Severity,
+    code: Option<string>,
+    message: string,
+    labels: [Label],
+    notes: [string],
+    suggestions: [FixSuggestion],
+}
+
+impl Diagnostic {
+    fn error(message: &str) -> Diagnostic {
+        Diagnostic { severity: Severity.Error, code: none, message: message.to_string(), labels: [], notes: [], suggestions: [] }
+    }
+    fn warning(message: &str) -> Diagnostic {
+        Diagnostic { severity: Severity.Warning, code: none, message: message.to_string(), labels: [], notes: [], suggestions: [] }
+    }
+    fn with_code(mut self, code: &str) -> Diagnostic { self.code = some(code.to_string()); self }
+    fn with_label(mut self, label: Label) -> Diagnostic { self.labels.push(label); self }
+    fn with_note(mut self, note: &str) -> Diagnostic { self.notes.push(note.to_string()); self }
+    fn with_suggestion(mut self, suggestion: FixSuggestion) -> Diagnostic { self.suggestions.push(suggestion); self }
+}
+
+struct DiagnosticEmitter {
+    source_map: SourceMap,
+    use_color: bool,
+}
+
+impl DiagnosticEmitter {
+    fn new(source_map: SourceMap) -> DiagnosticEmitter {
+        DiagnosticEmitter { source_map, use_color: true }
+    }
+
+    fn emit(self, diag: &Diagnostic) -> string {
+        let mut out = string.new()
+        out.push_str(diag.severity.label())
+        if let some(code) = &diag.code { out.push_str(&format!("[{code}]")) }
+        out.push_str(&format!(": {}\n", diag.message))
+
+        for label in &diag.labels {
+            if let some(file) = self.source_map.get_file(label.span.file_id) {
+                let loc = file.location(label.span.start)
+                let marker = if label.is_primary { "^" } else { "-" }
+                out.push_str(&format!("  --> {}:{}:{}\n", file.name, loc.line, loc.column))
+                out.push_str(&format!("  | {}\n", loc.line_text))
+                let underline_padding = " ".repeat(loc.column - 1)
+                let underline = marker.repeat(label.span.len().max(1))
+                out.push_str(&format!("  | {underline_padding}{underline}"))
+                if !label.message.is_empty() { out.push_str(&format!(" {}", label.message)) }
+                out.push('\n')
+            }
+        }
+
+        for note in &diag.notes { out.push_str(&format!("  = note: {note}\n")) }
+        for suggestion in &diag.suggestions { out.push_str(&format!("  = help: {}\n", suggestion.message)) }
+        out
+    }
+}
+
+struct DiagnosticCollector {
+    diagnostics: [Diagnostic],
+    error_count: usize,
+    warning_count: usize,
+}
+
+impl DiagnosticCollector {
+    fn new() -> DiagnosticCollector { DiagnosticCollector { diagnostics: [], error_count: 0, warning_count: 0 } }
+
+    fn add(mut self, diag: Diagnostic) {
+        match diag.severity { Severity.Error => self.error_count += 1, Severity.Warning => self.warning_count += 1, _ => {} }
+        self.diagnostics.push(diag)
+    }
+
+    fn has_errors(self) -> bool { self.error_count > 0 }
+    fn is_empty(self) -> bool { self.diagnostics.is_empty() }
+    fn total(self) -> usize { self.diagnostics.len() }
+
+    fn summary(self) -> string {
+        if self.is_empty() { return "no diagnostics".to_string() }
+        let mut parts: [string] = []
+        if self.error_count > 0 { parts.push(format!("{} error(s)", self.error_count)) }
+        if self.warning_count > 0 { parts.push(format!("{} warning(s)", self.warning_count)) }
+        parts.join(", ")
+    }
+
+    fn emit_all(self, emitter: &DiagnosticEmitter) -> string {
+        let mut out = string.new()
+        for diag in &self.diagnostics { out.push_str(&emitter.emit(diag)) }
+        out.push_str(&format!("\n{}\n", self.summary()))
+        out
+    }
+}
+
+fn main() {
+    let mut source_map = SourceMap.new()
+    let file_id = source_map.add_file("test.ltl", "fn main() {\n    let x = 42\n    let y = x + true\n}\n")
+
+    let file = source_map.get_file(file_id).unwrap()
+    let loc = file.location(0)
+    assert(loc.line == 1 && loc.column == 1)
+    print("Source location \u2713")
+
+    let diag = Diagnostic.error("mismatched types")
+        .with_code("E0308")
+        .with_label(Label.primary(Span.new(file_id, 40, 44), "expected i64, found bool"))
+        .with_note("cannot add bool to i64")
+        .with_suggestion(FixSuggestion.new("convert to integer", Span.new(file_id, 40, 44), "true as i64"))
+
+    let emitter = DiagnosticEmitter.new(source_map)
+    let output = emitter.emit(&diag)
+    assert(output.contains("error[E0308]"))
+    assert(output.contains("mismatched types"))
+    assert(output.contains("-->"))
+    print("Diagnostic rendering \u2713")
+
+    let mut collector = DiagnosticCollector.new()
+    collector.add(Diagnostic.error("type error"))
+    collector.add(Diagnostic.warning("unused variable"))
+    assert(collector.error_count == 1)
+    assert(collector.warning_count == 1)
+    assert(collector.has_errors())
+    print("Collector: {} \u2713", collector.summary())
+
+    let s1 = Span.new(0, 10, 20)
+    let s2 = Span.new(0, 15, 30)
+    let merged = s1.merge(&s2)
+    assert(merged.start == 10 && merged.end == 30)
+    print("Span merge \u2713")
+
+    let empty = DiagnosticCollector.new()
+    assert(!empty.has_errors())
+    assert(empty.summary() == "no diagnostics")
+    print("Empty collector \u2713")
+
+    print("Diagnostics complete \u2713")
+}
