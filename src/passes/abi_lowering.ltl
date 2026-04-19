@@ -1,0 +1,333 @@
+// Compiler Pass - ABI Lowering
+// Transforms high-level function signatures to platform ABI conventions.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug, PartialEq)]
+enum AbiType {
+    I8, I16, I32, I64, I128,
+    U8, U16, U32, U64, U128,
+    F32, F64,
+    Ptr,
+    Void,
+    Struct(string, [AbiType]),
+    Array(Box<AbiType>, usize),
+}
+
+impl AbiType {
+    fn size(self) -> usize {
+        match self {
+            AbiType.I8 | AbiType.U8 => 1,
+            AbiType.I16 | AbiType.U16 => 2,
+            AbiType.I32 | AbiType.U32 | AbiType.F32 => 4,
+            AbiType.I64 | AbiType.U64 | AbiType.F64 | AbiType.Ptr => 8,
+            AbiType.I128 | AbiType.U128 => 16,
+            AbiType.Void => 0,
+            AbiType.Struct(_, fields) => {
+                let mut total: usize = 0
+                for f in fields {
+                    let align = f.alignment()
+                    total = (total + align - 1) & !(align - 1)
+                    total += f.size()
+                }
+                let struct_align = self.alignment()
+                (total + struct_align - 1) & !(struct_align - 1)
+            },
+            AbiType.Array(elem, count) => elem.size() * count,
+        }
+    }
+
+    fn alignment(self) -> usize {
+        match self {
+            AbiType.I8 | AbiType.U8 => 1,
+            AbiType.I16 | AbiType.U16 => 2,
+            AbiType.I32 | AbiType.U32 | AbiType.F32 => 4,
+            AbiType.I64 | AbiType.U64 | AbiType.F64 | AbiType.Ptr => 8,
+            AbiType.I128 | AbiType.U128 => 16,
+            AbiType.Void => 1,
+            AbiType.Struct(_, fields) => fields.iter().map(|f| f.alignment()).max().unwrap_or(1),
+            AbiType.Array(elem, _) => elem.alignment(),
+        }
+    }
+
+    fn is_integer(self) -> bool {
+        match self {
+            AbiType.I8 | AbiType.I16 | AbiType.I32 | AbiType.I64 | AbiType.I128 |
+            AbiType.U8 | AbiType.U16 | AbiType.U32 | AbiType.U64 | AbiType.U128 |
+            AbiType.Ptr => true,
+            _ => false,
+        }
+    }
+
+    fn is_float(self) -> bool {
+        match self { AbiType.F32 | AbiType.F64 => true, _ => false }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PassMode {
+    Direct(Register),         // passed directly in register
+    Indirect(Register),       // pointer to value in register
+    OnStack(usize),           // offset on stack
+    Pair(Register, Register), // split across two registers
+    Ignore,                   // void/zero-sized type
+}
+
+#[derive(Clone, Debug)]
+enum Register {
+    // System V AMD64 ABI
+    Rdi, Rsi, Rdx, Rcx, R8, R9,
+    // Float registers
+    Xmm0, Xmm1, Xmm2, Xmm3, Xmm4, Xmm5, Xmm6, Xmm7,
+    // Return
+    Rax, Rdx_ret,
+    Xmm0_ret, Xmm1_ret,
+}
+
+#[derive(Clone, Debug)]
+enum CallingConvention { SysV, Win64, Aarch64, Wasm }
+
+struct FnSignature {
+    name: string,
+    params: [(string, AbiType)],
+    return_type: AbiType,
+    convention: CallingConvention,
+    is_variadic: bool,
+}
+
+struct LoweredSignature {
+    name: string,
+    params: [(string, PassMode)],
+    return_mode: PassMode,
+    stack_size: usize,
+    convention: CallingConvention,
+}
+
+struct AbiLowerer {
+    convention: CallingConvention,
+}
+
+impl AbiLowerer {
+    fn new(convention: CallingConvention) -> AbiLowerer {
+        AbiLowerer { convention }
+    }
+
+    fn lower_signature(self, sig: &FnSignature) -> LoweredSignature {
+        match self.convention {
+            CallingConvention.SysV => self.lower_sysv(sig),
+            CallingConvention.Win64 => self.lower_win64(sig),
+            _ => self.lower_sysv(sig),  // fallback
+        }
+    }
+
+    fn lower_sysv(self, sig: &FnSignature) -> LoweredSignature {
+        let int_regs = [Register.Rdi, Register.Rsi, Register.Rdx, Register.Rcx, Register.R8, Register.R9]
+        let float_regs = [Register.Xmm0, Register.Xmm1, Register.Xmm2, Register.Xmm3,
+                          Register.Xmm4, Register.Xmm5, Register.Xmm6, Register.Xmm7]
+
+        let mut int_idx: usize = 0
+        let mut float_idx: usize = 0
+        let mut stack_offset: usize = 0
+        let mut lowered_params: [(string, PassMode)] = []
+
+        for (name, ty) in &sig.params {
+            let mode = self.classify_param_sysv(ty, &int_regs, &float_regs, &mut int_idx, &mut float_idx, &mut stack_offset)
+            lowered_params.push((name.clone(), mode))
+        }
+
+        let return_mode = self.classify_return_sysv(&sig.return_type)
+
+        LoweredSignature {
+            name: sig.name.clone(), params: lowered_params,
+            return_mode, stack_size: stack_offset, convention: CallingConvention.SysV,
+        }
+    }
+
+    fn classify_param_sysv(self, ty: &AbiType, int_regs: &[Register], float_regs: &[Register],
+                           int_idx: &mut usize, float_idx: &mut usize, stack_offset: &mut usize) -> PassMode {
+        match ty {
+            AbiType.Void => PassMode.Ignore,
+            _ if ty.is_integer() && *int_idx < int_regs.len() => {
+                let reg = int_regs[*int_idx].clone()
+                *int_idx += 1
+                PassMode.Direct(reg)
+            },
+            _ if ty.is_float() && *float_idx < float_regs.len() => {
+                let reg = float_regs[*float_idx].clone()
+                *float_idx += 1
+                PassMode.Direct(reg)
+            },
+            AbiType.Struct(_, fields) if ty.size() <= 16 => {
+                if *int_idx + 1 < int_regs.len() {
+                    let r1 = int_regs[*int_idx].clone()
+                    let r2 = int_regs[*int_idx + 1].clone()
+                    *int_idx += 2
+                    PassMode.Pair(r1, r2)
+                } else {
+                    if *int_idx < int_regs.len() {
+                        let reg = int_regs[*int_idx].clone()
+                        *int_idx += 1
+                        PassMode.Indirect(reg)
+                    } else {
+                        let offset = *stack_offset
+                        *stack_offset += ty.size()
+                        PassMode.OnStack(offset)
+                    }
+                }
+            },
+            AbiType.Struct(_, _) => {
+                // Large struct: pass by pointer
+                if *int_idx < int_regs.len() {
+                    let reg = int_regs[*int_idx].clone()
+                    *int_idx += 1
+                    PassMode.Indirect(reg)
+                } else {
+                    let offset = *stack_offset
+                    *stack_offset += 8  // pointer size
+                    PassMode.OnStack(offset)
+                }
+            },
+            _ => {
+                let offset = *stack_offset
+                *stack_offset += ty.size().max(8)  // align to 8
+                PassMode.OnStack(offset)
+            },
+        }
+    }
+
+    fn classify_return_sysv(self, ty: &AbiType) -> PassMode {
+        match ty {
+            AbiType.Void => PassMode.Ignore,
+            _ if ty.is_integer() && ty.size() <= 8 => PassMode.Direct(Register.Rax),
+            _ if ty.is_float() => PassMode.Direct(Register.Xmm0_ret),
+            AbiType.Struct(_, _) if ty.size() <= 16 => PassMode.Pair(Register.Rax, Register.Rdx_ret),
+            _ => PassMode.Indirect(Register.Rdi),  // sret pointer
+        }
+    }
+
+    fn lower_win64(self, sig: &FnSignature) -> LoweredSignature {
+        let regs = [Register.Rcx, Register.Rdx, Register.R8, Register.R9]
+        let float_regs = [Register.Xmm0, Register.Xmm1, Register.Xmm2, Register.Xmm3]
+        let mut reg_idx: usize = 0
+        let mut stack_offset: usize = 32  // shadow space
+        let mut lowered_params: [(string, PassMode)] = []
+
+        for (name, ty) in &sig.params {
+            let mode = if reg_idx < 4 {
+                let r = if ty.is_float() { float_regs[reg_idx].clone() } else { regs[reg_idx].clone() }
+                reg_idx += 1
+                if ty.size() > 8 { PassMode.Indirect(r) } else { PassMode.Direct(r) }
+            } else {
+                let offset = stack_offset
+                stack_offset += 8
+                PassMode.OnStack(offset)
+            }
+            lowered_params.push((name.clone(), mode))
+        }
+
+        let return_mode = match &sig.return_type {
+            AbiType.Void => PassMode.Ignore,
+            t if t.is_float() => PassMode.Direct(Register.Xmm0_ret),
+            t if t.size() <= 8 => PassMode.Direct(Register.Rax),
+            _ => PassMode.Indirect(Register.Rcx),
+        }
+
+        LoweredSignature {
+            name: sig.name.clone(), params: lowered_params,
+            return_mode, stack_size: stack_offset, convention: CallingConvention.Win64,
+        }
+    }
+}
+
+fn main() {
+    // AbiType sizes
+    assert(AbiType.I8.size() == 1)
+    assert(AbiType.I32.size() == 4)
+    assert(AbiType.I64.size() == 8)
+    assert(AbiType.F64.size() == 8)
+    assert(AbiType.Ptr.size() == 8)
+    assert(AbiType.Void.size() == 0)
+    print("Type sizes ✓")
+
+    // Alignment
+    assert(AbiType.I8.alignment() == 1)
+    assert(AbiType.I64.alignment() == 8)
+    assert(AbiType.I128.alignment() == 16)
+    print("Alignment ✓")
+
+    // Struct size with padding
+    let point = AbiType.Struct("Point".to_string(), vec![AbiType.F64, AbiType.F64])
+    assert(point.size() == 16)
+    assert(point.alignment() == 8)
+    print("Struct size ✓")
+
+    // Array size
+    let arr = AbiType.Array(Box.new(AbiType.I32), 10)
+    assert(arr.size() == 40)
+    print("Array size ✓")
+
+    // is_integer / is_float
+    assert(AbiType.I32.is_integer())
+    assert(AbiType.Ptr.is_integer())
+    assert(!AbiType.F64.is_integer())
+    assert(AbiType.F64.is_float())
+    assert(!AbiType.I32.is_float())
+    print("Type classification ✓")
+
+    // SysV lowering: simple function
+    let lowerer = AbiLowerer.new(CallingConvention.SysV)
+    let sig = FnSignature {
+        name: "add".to_string(),
+        params: [("a".to_string(), AbiType.I64), ("b".to_string(), AbiType.I64)],
+        return_type: AbiType.I64,
+        convention: CallingConvention.SysV,
+        is_variadic: false,
+    }
+    let lowered = lowerer.lower_signature(&sig)
+    assert(lowered.params.len() == 2)
+    match &lowered.params[0].1 { PassMode.Direct(Register.Rdi) => {} _ => panic!("expected rdi") }
+    match &lowered.params[1].1 { PassMode.Direct(Register.Rsi) => {} _ => panic!("expected rsi") }
+    match &lowered.return_mode { PassMode.Direct(Register.Rax) => {} _ => panic!("expected rax") }
+    print("SysV simple ✓")
+
+    // SysV with float params
+    let sig2 = FnSignature {
+        name: "fma".to_string(),
+        params: [("a".to_string(), AbiType.F64), ("b".to_string(), AbiType.F64), ("c".to_string(), AbiType.F64)],
+        return_type: AbiType.F64,
+        convention: CallingConvention.SysV,
+        is_variadic: false,
+    }
+    let lowered2 = lowerer.lower_signature(&sig2)
+    match &lowered2.params[0].1 { PassMode.Direct(Register.Xmm0) => {} _ => panic!("expected xmm0") }
+    match &lowered2.return_mode { PassMode.Direct(Register.Xmm0_ret) => {} _ => panic!("expected xmm0") }
+    print("SysV float ✓")
+
+    // Void return
+    let sig3 = FnSignature {
+        name: "nop".to_string(), params: [], return_type: AbiType.Void,
+        convention: CallingConvention.SysV, is_variadic: false,
+    }
+    let lowered3 = lowerer.lower_signature(&sig3)
+    match &lowered3.return_mode { PassMode.Ignore => {} _ => panic!("expected ignore") }
+    print("Void return ✓")
+
+    // Win64
+    let win_lowerer = AbiLowerer.new(CallingConvention.Win64)
+    let lowered4 = win_lowerer.lower_signature(&sig)
+    match &lowered4.params[0].1 { PassMode.Direct(Register.Rcx) => {} _ => panic!("expected rcx") }
+    assert(lowered4.stack_size >= 32)  // shadow space
+    print("Win64 ✓")
+
+    // Large struct passed indirectly
+    let big = AbiType.Struct("Big".to_string(), vec![AbiType.I64, AbiType.I64, AbiType.I64])
+    let sig5 = FnSignature {
+        name: "take_big".to_string(), params: [("s".to_string(), big)],
+        return_type: AbiType.Void, convention: CallingConvention.SysV, is_variadic: false,
+    }
+    let lowered5 = lowerer.lower_signature(&sig5)
+    match &lowered5.params[0].1 { PassMode.Indirect(_) => {} _ => panic!("expected indirect") }
+    print("Large struct indirect ✓")
+
+    print("ABI Lowering complete ✓")
+}
