@@ -1,0 +1,83 @@
+// error_reporter.ltl — User-friendly compiler error messages
+use crate.ast.source_span.SourceSpan
+use crate.lexer.token_types.Token
+
+enum Severity { Error, Warning, Note, Help }
+
+struct Diagnostic {
+    severity: Severity,
+    code:     string,
+    message:  string,
+    span:     SourceSpan,
+    labels:   [DiagLabel],
+    notes:    [string],
+}
+
+struct DiagLabel {
+    span:    SourceSpan,
+    message: string,
+    primary: bool,
+}
+
+impl Diagnostic {
+    fn error(code: string, message: string, span: SourceSpan) -> Diagnostic {
+        Diagnostic { severity: Severity.Error, code, message, span, labels: [], notes: [] }
+    }
+
+    fn warning(code: string, message: string, span: SourceSpan) -> Diagnostic {
+        Diagnostic { severity: Severity.Warning, code, message, span, labels: [], notes: [] }
+    }
+
+    fn with_label(mut self, span: SourceSpan, msg: string, primary: bool) -> Diagnostic {
+        self.labels.push(DiagLabel { span, message: msg, primary })
+        self
+    }
+
+    fn with_note(mut self, note: string) -> Diagnostic {
+        self.notes.push(note)
+        self
+    }
+
+    fn render(self, source: string) -> string {
+        let sev = match self.severity {
+            Severity.Error   => "\e[31merror\e[0m",
+            Severity.Warning => "\e[33mwarning\e[0m",
+            Severity.Note    => "\e[36mnote\e[0m",
+            Severity.Help    => "\e[32mhelp\e[0m",
+        }
+        let mut out = "${sev}[${self.code}]: ${self.message}
+"
+        out += self.render_snippet(source)
+        for note in self.notes { out += "
+  = note: ${note}" }
+        out
+    }
+
+    fn render_snippet(self, source: string) -> string {
+        let lines = source.lines() |> collect()
+        let line  = self.span.start_line.min(lines.len())
+        if line == 0 || line > lines.len() { return "" }
+        let src_line = lines[line - 1]
+        let col      = self.span.start_col
+        let marker   = " ".repeat(col - 1) + "^".repeat(self.span.len().max(1))
+        "  --> ${self.span.file}:${line}:${col}
+   | ${src_line}
+   | \e[31m${marker}\e[0m
+"
+    }
+}
+
+struct DiagEngine {
+    diags: [Diagnostic],
+}
+
+impl DiagEngine {
+    fn new() -> DiagEngine { DiagEngine { diags: [] } }
+    fn emit(mut self, d: Diagnostic) { self.diags.push(d) }
+    fn has_errors(self) -> bool { self.diags |> any(|d| matches!(d.severity, Severity.Error)) }
+    fn error_count(self) -> int { self.diags |> filter(|d| matches!(d.severity, Severity.Error)) |> count() }
+    fn render_all(self, source: string) -> string {
+        self.diags |> map(|d| d.render(source)) |> join("
+")
+    }
+}
