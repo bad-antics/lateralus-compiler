@@ -1,0 +1,60 @@
+// dead_code_elim.ltl — Linker-level dead code elimination
+use crate.ir.basic_blocks.BasicBlock
+
+struct CallGraph {
+    nodes:  set<string>,
+    edges:  dict<string, set<string>>,
+}
+
+impl CallGraph {
+    fn new() -> CallGraph {
+        CallGraph { nodes: set(), edges: {} }
+    }
+
+    fn add_function(mut self, name: string) {
+        self.nodes.insert(name)
+        self.edges.entry(name).or_insert(set())
+    }
+
+    fn add_call(mut self, caller: string, callee: string) {
+        self.edges.entry(caller).or_insert(set()).insert(callee)
+    }
+
+    fn reachable_from(self, roots: [string]) -> set<string> {
+        mut visited: set<string> = set()
+        mut worklist = roots.clone()
+        while !worklist.is_empty() {
+            let fn_name = worklist.pop()
+            if visited.contains(fn_name) { continue }
+            visited.insert(fn_name.clone())
+            for callee in self.edges.get(fn_name) ?? set() {
+                if !visited.contains(callee) {
+                    worklist.push(callee)
+                }
+            }
+        }
+        visited
+    }
+
+    fn dead_functions(self, entry_points: [string]) -> set<string> {
+        let live = self.reachable_from(entry_points)
+        self.nodes |> filter(|n| !live.contains(n)) |> collect_set()
+    }
+}
+
+fn eliminate_dead_code(
+    functions: dict<string, [BasicBlock]>,
+    entry_points: [string],
+) -> dict<string, [BasicBlock]> {
+    let mut cg = CallGraph.new()
+    for name in functions.keys() { cg.add_function(name) }
+    for (name, blocks) in functions.iter() {
+        for block in blocks {
+            for call in block.calls() {
+                cg.add_call(name, call)
+            }
+        }
+    }
+    let dead = cg.dead_functions(entry_points)
+    functions |> filter(|(name, _)| !dead.contains(name)) |> collect_dict()
+}
