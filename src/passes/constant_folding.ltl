@@ -1,0 +1,286 @@
+// src/passes/constant_folding.ltl — Compile-time constant propagation and folding
+use std.collections.HashMap
+
+// ── IR representation ────────────────────────────────────────────────────────
+type VarId = u32
+
+enum Constant {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(string),
+}
+
+enum BinOp { Add, Sub, Mul, Div, Mod, Shl, Shr, And, Or, Xor, Eq, Ne, Lt, Le, Gt, Ge }
+enum UnaryOp { Neg, Not, BitNot }
+
+enum IRValue {
+    Const(Constant),
+    Var(VarId),
+    BinExpr { op: BinOp, lhs: Box<IRValue>, rhs: Box<IRValue> },
+    UnaryExpr { op: UnaryOp, operand: Box<IRValue> },
+    Call { name: string, args: [IRValue] },
+    Phi { incoming: [(BlockId, IRValue)] },
+    Load { addr: Box<IRValue> },
+}
+
+type BlockId = u32
+
+enum IRInst {
+    Assign { dst: VarId, value: IRValue },
+    Store { addr: IRValue, value: IRValue },
+    Branch { cond: IRValue, true_block: BlockId, false_block: BlockId },
+    Jump(BlockId),
+    Return(Option<IRValue>),
+}
+
+struct BasicBlock {
+    id:    BlockId,
+    insts: [IRInst],
+}
+
+struct Function {
+    name:   string,
+    params: [VarId],
+    blocks: [BasicBlock],
+}
+
+// ── Lattice for constant propagation ─────────────────────────────────────────
+enum LatticeVal {
+    Top,            // unknown
+    Constant(Constant),
+    Bottom,         // overdefined — not constant
+}
+
+impl LatticeVal {
+    fn meet(self, other: LatticeVal) -> LatticeVal {
+        match (self, other) {
+            (LatticeVal.Top, x) | (x, LatticeVal.Top) => x,
+            (LatticeVal.Constant(a), LatticeVal.Constant(b)) => {
+                if a == b { LatticeVal.Constant(a) } else { LatticeVal.Bottom }
+            }
+            _ => LatticeVal.Bottom,
+        }
+    }
+
+    fn is_constant(self) -> bool {
+        matches!(self, LatticeVal.Constant(_))
+    }
+}
+
+// ── Constant folder ──────────────────────────────────────────────────────────
+struct ConstantFolder {
+    lattice: HashMap<VarId, LatticeVal>,
+    worklist: [BlockId],
+    visited: std.collections.HashSet<BlockId>,
+}
+
+impl ConstantFolder {
+    fn new() -> ConstantFolder {
+        ConstantFolder {
+            lattice: HashMap.new(),
+            worklist: [],
+            visited: std.collections.HashSet.new(),
+        }
+    }
+
+    fn fold_binop(op: BinOp, lhs: &Constant, rhs: &Constant) -> Option<Constant> {
+        match (op, lhs, rhs) {
+            (BinOp.Add, Constant.Int(a), Constant.Int(b)) => some(Constant.Int(a + b)),
+            (BinOp.Sub, Constant.Int(a), Constant.Int(b)) => some(Constant.Int(a - b)),
+            (BinOp.Mul, Constant.Int(a), Constant.Int(b)) => some(Constant.Int(a * b)),
+            (BinOp.Div, Constant.Int(a), Constant.Int(b)) if *b != 0 => some(Constant.Int(a / b)),
+            (BinOp.Mod, Constant.Int(a), Constant.Int(b)) if *b != 0 => some(Constant.Int(a % b)),
+            (BinOp.Shl, Constant.Int(a), Constant.Int(b)) => some(Constant.Int(a << b)),
+            (BinOp.Shr, Constant.Int(a), Constant.Int(b)) => some(Constant.Int(a >> b)),
+            (BinOp.And, Constant.Int(a), Constant.Int(b)) => some(Constant.Int(a & b)),
+            (BinOp.Or,  Constant.Int(a), Constant.Int(b)) => some(Constant.Int(a | b)),
+            (BinOp.Xor, Constant.Int(a), Constant.Int(b)) => some(Constant.Int(a ^ b)),
+            (BinOp.Eq,  Constant.Int(a), Constant.Int(b)) => some(Constant.Bool(a == b)),
+            (BinOp.Ne,  Constant.Int(a), Constant.Int(b)) => some(Constant.Bool(a != b)),
+            (BinOp.Lt,  Constant.Int(a), Constant.Int(b)) => some(Constant.Bool(a < b)),
+            (BinOp.Le,  Constant.Int(a), Constant.Int(b)) => some(Constant.Bool(a <= b)),
+            (BinOp.Gt,  Constant.Int(a), Constant.Int(b)) => some(Constant.Bool(a > b)),
+            (BinOp.Ge,  Constant.Int(a), Constant.Int(b)) => some(Constant.Bool(a >= b)),
+            (BinOp.Add, Constant.Float(a), Constant.Float(b)) => some(Constant.Float(a + b)),
+            (BinOp.Sub, Constant.Float(a), Constant.Float(b)) => some(Constant.Float(a - b)),
+            (BinOp.Mul, Constant.Float(a), Constant.Float(b)) => some(Constant.Float(a * b)),
+            (BinOp.Div, Constant.Float(a), Constant.Float(b)) if *b != 0.0 => some(Constant.Float(a / b)),
+            (BinOp.And, Constant.Bool(a), Constant.Bool(b)) => some(Constant.Bool(*a && *b)),
+            (BinOp.Or,  Constant.Bool(a), Constant.Bool(b)) => some(Constant.Bool(*a || *b)),
+            _ => none,
+        }
+    }
+
+    fn fold_unary(op: UnaryOp, operand: &Constant) -> Option<Constant> {
+        match (op, operand) {
+            (UnaryOp.Neg, Constant.Int(a))    => some(Constant.Int(-a)),
+            (UnaryOp.Neg, Constant.Float(a))  => some(Constant.Float(-a)),
+            (UnaryOp.Not, Constant.Bool(a))   => some(Constant.Bool(!a)),
+            (UnaryOp.BitNot, Constant.Int(a)) => some(Constant.Int(!a)),
+            _ => none,
+        }
+    }
+
+    fn evaluate(self, value: &IRValue) -> LatticeVal {
+        match value {
+            IRValue.Const(c) => LatticeVal.Constant(c.clone()),
+            IRValue.Var(id) => self.lattice.get(id).cloned().unwrap_or(LatticeVal.Top),
+            IRValue.BinExpr { op, lhs, rhs } => {
+                let l = self.evaluate(lhs)
+                let r = self.evaluate(rhs)
+                match (l, r) {
+                    (LatticeVal.Constant(lc), LatticeVal.Constant(rc)) => {
+                        match ConstantFolder.fold_binop(*op, &lc, &rc) {
+                            some(c) => LatticeVal.Constant(c),
+                            none    => LatticeVal.Bottom,
+                        }
+                    }
+                    (LatticeVal.Bottom, _) | (_, LatticeVal.Bottom) => LatticeVal.Bottom,
+                    _ => LatticeVal.Top,
+                }
+            }
+            IRValue.UnaryExpr { op, operand } => {
+                match self.evaluate(operand) {
+                    LatticeVal.Constant(c) => {
+                        match ConstantFolder.fold_unary(*op, &c) {
+                            some(c) => LatticeVal.Constant(c),
+                            none    => LatticeVal.Bottom,
+                        }
+                    }
+                    LatticeVal.Bottom => LatticeVal.Bottom,
+                    LatticeVal.Top    => LatticeVal.Top,
+                }
+            }
+            _ => LatticeVal.Bottom,
+        }
+    }
+
+    fn run(mut self, func: &mut Function) -> u32 {
+        // Initialize all vars to Top
+        self.worklist.push(0)
+        let mut folded: u32 = 0
+
+        while let some(block_id) = self.worklist.pop() {
+            if self.visited.contains(&block_id) { continue }
+            self.visited.insert(block_id)
+
+            let block = &mut func.blocks[block_id as usize]
+            for inst in &mut block.insts {
+                match inst {
+                    IRInst.Assign { dst, value } => {
+                        let val = self.evaluate(value)
+                        let old = self.lattice.get(dst).cloned().unwrap_or(LatticeVal.Top)
+                        let new_val = old.meet(val)
+                        self.lattice.insert(*dst, new_val.clone())
+
+                        // Replace with constant if possible
+                        if let LatticeVal.Constant(c) = new_val {
+                            *value = IRValue.Const(c)
+                            folded += 1
+                        }
+                    }
+                    IRInst.Branch { cond, true_block, false_block } => {
+                        match self.evaluate(cond) {
+                            LatticeVal.Constant(Constant.Bool(true))  => {
+                                *inst = IRInst.Jump(*true_block)
+                                self.worklist.push(*true_block)
+                                folded += 1
+                            }
+                            LatticeVal.Constant(Constant.Bool(false)) => {
+                                *inst = IRInst.Jump(*false_block)
+                                self.worklist.push(*false_block)
+                                folded += 1
+                            }
+                            _ => {
+                                self.worklist.push(*true_block)
+                                self.worklist.push(*false_block)
+                            }
+                        }
+                    }
+                    IRInst.Jump(target) => { self.worklist.push(*target) }
+                    _ => {}
+                }
+            }
+        }
+        folded
+    }
+}
+
+// ── Strength reduction ───────────────────────────────────────────────────────
+fn strength_reduce(value: &mut IRValue) -> bool {
+    match value {
+        IRValue.BinExpr { op: BinOp.Mul, lhs, rhs: box IRValue.Const(Constant.Int(n)) } => {
+            if *n == 0 { *value = IRValue.Const(Constant.Int(0)); return true }
+            if *n == 1 { *value = *lhs.clone(); return true }
+            if n.is_power_of_two() {
+                let shift = n.trailing_zeros() as i64
+                *value = IRValue.BinExpr { op: BinOp.Shl, lhs: lhs.clone(), rhs: Box.new(IRValue.Const(Constant.Int(shift))) }
+                return true
+            }
+            false
+        }
+        IRValue.BinExpr { op: BinOp.Div, lhs, rhs: box IRValue.Const(Constant.Int(n)) } if n.is_power_of_two() => {
+            let shift = n.trailing_zeros() as i64
+            *value = IRValue.BinExpr { op: BinOp.Shr, lhs: lhs.clone(), rhs: Box.new(IRValue.Const(Constant.Int(shift))) }
+            true
+        }
+        IRValue.BinExpr { op: BinOp.Add, lhs, rhs: box IRValue.Const(Constant.Int(0)) } => {
+            *value = *lhs.clone(); true
+        }
+        IRValue.BinExpr { op: BinOp.Sub, lhs, rhs: box IRValue.Const(Constant.Int(0)) } => {
+            *value = *lhs.clone(); true
+        }
+        _ => false,
+    }
+}
+
+fn main() {
+    // Test constant folding
+    let result = ConstantFolder.fold_binop(BinOp.Add, &Constant.Int(10), &Constant.Int(32))
+    assert(result == some(Constant.Int(42)))
+    print("10 + 32 = 42 ✓")
+
+    let result = ConstantFolder.fold_binop(BinOp.Mul, &Constant.Int(6), &Constant.Int(7))
+    assert(result == some(Constant.Int(42)))
+    print("6 * 7 = 42 ✓")
+
+    let result = ConstantFolder.fold_binop(BinOp.Lt, &Constant.Int(3), &Constant.Int(5))
+    assert(result == some(Constant.Bool(true)))
+    print("3 < 5 = true ✓")
+
+    let result = ConstantFolder.fold_unary(UnaryOp.Neg, &Constant.Int(42))
+    assert(result == some(Constant.Int(-42)))
+    print("-42 ✓")
+
+    let result = ConstantFolder.fold_unary(UnaryOp.Not, &Constant.Bool(true))
+    assert(result == some(Constant.Bool(false)))
+    print("!true = false ✓")
+
+    // Lattice meet
+    let a = LatticeVal.Constant(Constant.Int(5))
+    let b = LatticeVal.Constant(Constant.Int(5))
+    assert(matches!(a.meet(b), LatticeVal.Constant(Constant.Int(5))))
+    print("Lattice meet(5, 5) = 5 ✓")
+
+    let a = LatticeVal.Constant(Constant.Int(5))
+    let b = LatticeVal.Constant(Constant.Int(3))
+    assert(matches!(a.meet(b), LatticeVal.Bottom))
+    print("Lattice meet(5, 3) = ⊥ ✓")
+
+    // Strength reduction
+    let mut val = IRValue.BinExpr {
+        op: BinOp.Mul,
+        lhs: Box.new(IRValue.Var(1)),
+        rhs: Box.new(IRValue.Const(Constant.Int(8))),
+    }
+    assert(strength_reduce(&mut val))
+    match val {
+        IRValue.BinExpr { op: BinOp.Shl, rhs: box IRValue.Const(Constant.Int(3)), .. } => {
+            print("x * 8 → x << 3 ✓")
+        }
+        _ => panic("strength reduction failed"),
+    }
+
+    print("Constant folding & strength reduction — all passed ✓")
+}
