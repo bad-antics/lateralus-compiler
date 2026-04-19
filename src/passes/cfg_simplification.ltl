@@ -1,0 +1,385 @@
+// Compiler Pass - Control Flow Graph Simplification
+// Merges basic blocks, removes empty blocks, simplifies branches.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Debug)]
+enum Terminator {
+    Branch(usize),                     // unconditional jump
+    CondBranch(usize, usize, usize),   // cond, true_target, false_target
+    Return(Option<usize>),
+    Switch(usize, [(i64, usize)], usize), // value, cases, default
+    Unreachable,
+}
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    id: usize,
+    instructions: [usize],    // instruction indices
+    terminator: Terminator,
+    predecessors: HashSet<usize>,
+    successors: HashSet<usize>,
+}
+
+impl BasicBlock {
+    fn new(id: usize) -> BasicBlock {
+        BasicBlock {
+            id, instructions: [],
+            terminator: Terminator.Unreachable,
+            predecessors: HashSet.new(),
+            successors: HashSet.new(),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.instructions.is_empty()
+    }
+
+    fn instruction_count(self) -> usize {
+        self.instructions.len()
+    }
+
+    fn has_single_predecessor(self) -> bool {
+        self.predecessors.len() == 1
+    }
+
+    fn has_single_successor(self) -> bool {
+        self.successors.len() == 1
+    }
+
+    fn is_unconditional_branch(self) -> bool {
+        match self.terminator {
+            Terminator.Branch(_) => true,
+            _ => false,
+        }
+    }
+
+    fn branch_target(self) -> Option<usize> {
+        match self.terminator {
+            Terminator.Branch(t) => some(t),
+            _ => none,
+        }
+    }
+}
+
+struct CFG {
+    blocks: HashMap<usize, BasicBlock>,
+    entry: usize,
+    next_id: usize,
+}
+
+impl CFG {
+    fn new(entry: usize) -> CFG {
+        CFG { blocks: HashMap.new(), entry, next_id: 0 }
+    }
+
+    fn add_block(mut self, block: BasicBlock) {
+        if block.id >= self.next_id { self.next_id = block.id + 1 }
+        self.blocks.insert(block.id, block)
+    }
+
+    fn block_count(self) -> usize {
+        self.blocks.len()
+    }
+
+    fn get_block(self, id: usize) -> Option<&BasicBlock> {
+        self.blocks.get(&id)
+    }
+
+    fn get_block_mut(mut self, id: usize) -> Option<&mut BasicBlock> {
+        self.blocks.get_mut(&id)
+    }
+
+    fn remove_block(mut self, id: usize) {
+        self.blocks.remove(&id)
+    }
+}
+
+struct CFGSimplifier {
+    cfg: CFG,
+    merged_blocks: usize,
+    removed_blocks: usize,
+    simplified_branches: usize,
+}
+
+impl CFGSimplifier {
+    fn new(cfg: CFG) -> CFGSimplifier {
+        CFGSimplifier {
+            cfg,
+            merged_blocks: 0,
+            removed_blocks: 0,
+            simplified_branches: 0,
+        }
+    }
+
+    fn run(mut self) -> CFG {
+        let mut changed = true
+        while changed {
+            changed = false
+            changed |= self.merge_linear_blocks()
+            changed |= self.remove_empty_blocks()
+            changed |= self.simplify_branches()
+            changed |= self.remove_unreachable()
+        }
+        self.cfg.clone()
+    }
+
+    fn merge_linear_blocks(mut self) -> bool {
+        let mut changed = false
+        let block_ids: [usize] = self.cfg.blocks.keys().cloned().collect()
+
+        for &id in &block_ids {
+            if !self.cfg.blocks.contains_key(&id) { continue }
+
+            let target = match self.cfg.blocks.get(&id) {
+                some(block) => match block.terminator {
+                    Terminator.Branch(t) => some(t),
+                    _ => none,
+                },
+                none => none,
+            };
+
+            if let some(target_id) = target {
+                if target_id == id { continue } // self-loop
+                if !self.cfg.blocks.contains_key(&target_id) { continue }
+
+                let can_merge = self.cfg.blocks.get(&target_id)
+                    .map(|t| t.has_single_predecessor())
+                    .unwrap_or(false);
+
+                if can_merge {
+                    // Merge target into current block
+                    let target_block = self.cfg.blocks.remove(&target_id).unwrap()
+                    if let some(block) = self.cfg.blocks.get_mut(&id) {
+                        block.instructions.extend(target_block.instructions)
+                        block.terminator = target_block.terminator
+                        block.successors = target_block.successors
+                        self.merged_blocks += 1
+                        changed = true
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    fn remove_empty_blocks(mut self) -> bool {
+        let mut changed = false
+        let block_ids: [usize] = self.cfg.blocks.keys().cloned().collect()
+
+        for &id in &block_ids {
+            if id == self.cfg.entry { continue }
+            if !self.cfg.blocks.contains_key(&id) { continue }
+
+            let (is_empty, target) = match self.cfg.blocks.get(&id) {
+                some(block) => (block.is_empty(), block.branch_target()),
+                none => (false, none),
+            };
+
+            if is_empty {
+                if let some(target_id) = target {
+                    // Redirect predecessors to target
+                    let preds: [usize] = self.cfg.blocks.get(&id)
+                        .map(|b| b.predecessors.iter().cloned().collect())
+                        .unwrap_or([]);
+
+                    for &pred_id in &preds {
+                        if let some(pred) = self.cfg.blocks.get_mut(&pred_id) {
+                            self.redirect_terminator(&mut pred.terminator, id, target_id)
+                            pred.successors.remove(&id)
+                            pred.successors.insert(target_id)
+                        }
+                    }
+
+                    self.cfg.remove_block(id)
+                    self.removed_blocks += 1
+                    changed = true
+                }
+            }
+        }
+
+        changed
+    }
+
+    fn simplify_branches(mut self) -> bool {
+        let mut changed = false
+        let block_ids: [usize] = self.cfg.blocks.keys().cloned().collect()
+
+        for &id in &block_ids {
+            if let some(block) = self.cfg.blocks.get_mut(&id) {
+                match block.terminator.clone() {
+                    // Conditional branch where both targets are the same
+                    Terminator.CondBranch(_, t, f) if t == f => {
+                        block.terminator = Terminator.Branch(t)
+                        block.successors.clear()
+                        block.successors.insert(t)
+                        self.simplified_branches += 1
+                        changed = true
+                    },
+                    // Switch with single case + default pointing to same target
+                    Terminator.Switch(_, cases, default) => {
+                        let all_same = cases.iter().all(|(_, t)| *t == default)
+                        if all_same {
+                            block.terminator = Terminator.Branch(default)
+                            block.successors.clear()
+                            block.successors.insert(default)
+                            self.simplified_branches += 1
+                            changed = true
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        changed
+    }
+
+    fn remove_unreachable(mut self) -> bool {
+        let mut reachable = HashSet.new()
+        let mut worklist = [self.cfg.entry]
+        while let some(id) = worklist.pop() {
+            if !reachable.insert(id) { continue }
+            if let some(block) = self.cfg.blocks.get(&id) {
+                for &succ in &block.successors {
+                    worklist.push(succ)
+                }
+            }
+        }
+
+        let all: [usize] = self.cfg.blocks.keys().cloned().collect()
+        let mut changed = false
+        for id in all {
+            if !reachable.contains(&id) {
+                self.cfg.remove_block(id)
+                self.removed_blocks += 1
+                changed = true
+            }
+        }
+        changed
+    }
+
+    fn redirect_terminator(self, term: &mut Terminator, from: usize, to: usize) {
+        match term {
+            Terminator.Branch(ref mut t) => {
+                if *t == from { *t = to }
+            },
+            Terminator.CondBranch(_, ref mut tt, ref mut ft) => {
+                if *tt == from { *tt = to }
+                if *ft == from { *ft = to }
+            },
+            Terminator.Switch(_, ref mut cases, ref mut default) => {
+                for (_, ref mut target) in cases { if *target == from { *target = to } }
+                if *default == from { *default = to }
+            },
+            _ => {},
+        }
+    }
+
+    fn stats(self) -> (usize, usize, usize) {
+        (self.merged_blocks, self.removed_blocks, self.simplified_branches)
+    }
+}
+
+fn main() {
+    // Basic block
+    let mut bb = BasicBlock.new(0)
+    assert(bb.is_empty())
+    assert(bb.instruction_count() == 0)
+    bb.instructions.push(100)
+    bb.instructions.push(101)
+    assert(bb.instruction_count() == 2)
+    assert(!bb.is_empty())
+    print("BasicBlock ✓")
+
+    // Predecessors / successors
+    bb.predecessors.insert(1)
+    assert(bb.has_single_predecessor())
+    bb.successors.insert(2)
+    bb.successors.insert(3)
+    assert(!bb.has_single_successor())
+    print("Pred/Succ ✓")
+
+    // Branch detection
+    let mut branch_bb = BasicBlock.new(1)
+    branch_bb.terminator = Terminator.Branch(5)
+    assert(branch_bb.is_unconditional_branch())
+    assert(branch_bb.branch_target().unwrap() == 5)
+    print("Branch detection ✓")
+
+    // CFG
+    let mut cfg = CFG.new(0)
+
+    // Block 0 -> Block 1
+    let mut b0 = BasicBlock.new(0)
+    b0.instructions = [10, 11]
+    b0.terminator = Terminator.Branch(1)
+    b0.successors.insert(1)
+
+    // Block 1 -> Block 2 (single pred, can merge with 0)
+    let mut b1 = BasicBlock.new(1)
+    b1.instructions = [20, 21]
+    b1.terminator = Terminator.Branch(2)
+    b1.predecessors.insert(0)
+    b1.successors.insert(2)
+
+    // Block 2: return
+    let mut b2 = BasicBlock.new(2)
+    b2.instructions = [30]
+    b2.terminator = Terminator.Return(some(30))
+    b2.predecessors.insert(1)
+
+    // Block 3: unreachable
+    let mut b3 = BasicBlock.new(3)
+    b3.instructions = [40]
+    b3.terminator = Terminator.Return(none)
+
+    cfg.add_block(b0)
+    cfg.add_block(b1)
+    cfg.add_block(b2)
+    cfg.add_block(b3)
+
+    assert(cfg.block_count() == 4)
+    print("CFG creation ✓")
+
+    // Simplify
+    let mut simplifier = CFGSimplifier.new(cfg)
+    let result = simplifier.run()
+
+    // Block 3 should be removed (unreachable)
+    assert(!result.blocks.contains_key(&3))
+    print("Unreachable removal ✓")
+
+    let (merged, removed, simplified) = simplifier.stats()
+    assert(removed >= 1) // at least block 3
+    print(format!("Stats: merged={}, removed={}, simplified={} ✓", merged, removed, simplified))
+
+    // Terminator variants
+    let _t1 = Terminator.Branch(0)
+    let _t2 = Terminator.CondBranch(0, 1, 2)
+    let _t3 = Terminator.Return(some(0))
+    let _t4 = Terminator.Switch(0, [(1, 2), (3, 4)], 5)
+    let _t5 = Terminator.Unreachable
+    print("Terminator variants ✓")
+
+    // Simplify conditional branch with same targets
+    let mut cfg2 = CFG.new(0)
+    let mut b0 = BasicBlock.new(0)
+    b0.terminator = Terminator.CondBranch(0, 1, 1) // both point to 1
+    b0.successors.insert(1)
+    let mut b1 = BasicBlock.new(1)
+    b1.terminator = Terminator.Return(none)
+    b1.predecessors.insert(0)
+    cfg2.add_block(b0)
+    cfg2.add_block(b1)
+
+    let mut s2 = CFGSimplifier.new(cfg2)
+    let result2 = s2.run()
+    // Should have simplified the conditional to unconditional
+    let block0 = result2.get_block(0).unwrap()
+    assert(block0.is_unconditional_branch())
+    print("Simplify same-target branch ✓")
+
+    print("CFG Simplification complete ✓")
+}
