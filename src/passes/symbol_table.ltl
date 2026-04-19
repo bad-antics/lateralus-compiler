@@ -1,0 +1,203 @@
+// Compiler Pass - Symbol Table
+// Scoped symbol resolution, namespace management, import tracking.
+
+use std.collections.HashMap
+
+enum SymbolKind {
+    Variable, Function, Type, Struct, Enum, Trait,
+    Module, Constant, Static, TypeAlias, Macro,
+}
+
+enum Visibility { Public, Private, Crate, Super }
+
+struct Symbol {
+    name: string,
+    kind: SymbolKind,
+    visibility: Visibility,
+    type_id: Option<usize>,
+    scope_id: usize,
+    span: (usize, usize),
+    mutable: bool,
+    defined: bool,
+    used: bool,
+}
+
+impl Symbol {
+    fn new(name: &str, kind: SymbolKind, scope_id: usize) -> Symbol {
+        Symbol {
+            name: name.to_string(), kind, visibility: Visibility.Private,
+            type_id: none, scope_id, span: (0, 0), mutable: false,
+            defined: true, used: false,
+        }
+    }
+    fn with_visibility(mut self, vis: Visibility) -> Symbol { self.visibility = vis; self }
+    fn with_type(mut self, type_id: usize) -> Symbol { self.type_id = some(type_id); self }
+    fn with_span(mut self, start: usize, end: usize) -> Symbol { self.span = (start, end); self }
+    fn with_mutable(mut self) -> Symbol { self.mutable = true; self }
+    fn mark_used(mut self) { self.used = true }
+}
+
+struct Scope {
+    id: usize,
+    parent: Option<usize>,
+    children: [usize],
+    symbols: HashMap<string, usize>,  // name -> symbol index
+    kind: ScopeKind,
+    depth: usize,
+}
+
+enum ScopeKind { Global, Module, Function, Block, Loop, Match, Impl, Trait }
+
+impl Scope {
+    fn new(id: usize, parent: Option<usize>, kind: ScopeKind, depth: usize) -> Scope {
+        Scope { id, parent, children: [], symbols: HashMap.new(), kind, depth }
+    }
+}
+
+struct ImportEntry {
+    path: [string],
+    alias: Option<string>,
+    glob: bool,
+    used: bool,
+}
+
+struct SymbolTable {
+    symbols: [Symbol],
+    scopes: [Scope],
+    current_scope: usize,
+    imports: [ImportEntry],
+}
+
+impl SymbolTable {
+    fn new() -> SymbolTable {
+        let global = Scope.new(0, none, ScopeKind.Global, 0)
+        SymbolTable { symbols: [], scopes: [global], current_scope: 0, imports: [] }
+    }
+
+    fn enter_scope(mut self, kind: ScopeKind) -> usize {
+        let id = self.scopes.len()
+        let depth = self.scopes[self.current_scope].depth + 1
+        let scope = Scope.new(id, some(self.current_scope), kind, depth)
+        self.scopes.push(scope)
+        self.scopes[self.current_scope].children.push(id)
+        self.current_scope = id
+        id
+    }
+
+    fn leave_scope(mut self) -> usize {
+        let old = self.current_scope
+        self.current_scope = self.scopes[old].parent.unwrap_or(0)
+        old
+    }
+
+    fn define(mut self, name: &str, kind: SymbolKind) -> Result<usize, string> {
+        if self.scopes[self.current_scope].symbols.contains_key(name) {
+            return err(format!("symbol '{}' already defined in this scope", name))
+        }
+        let idx = self.symbols.len()
+        self.symbols.push(Symbol.new(name, kind, self.current_scope))
+        self.scopes[self.current_scope].symbols.insert(name.to_string(), idx)
+        ok(idx)
+    }
+
+    fn resolve(mut self, name: &str) -> Option<usize> {
+        let mut scope_id = self.current_scope
+        loop {
+            if let some(&idx) = self.scopes[scope_id].symbols.get(name) {
+                self.symbols[idx].mark_used()
+                return some(idx)
+            }
+            match self.scopes[scope_id].parent {
+                some(parent) => scope_id = parent,
+                none => break,
+            }
+        }
+        // Check imports
+        for import in &mut self.imports {
+            let target = import.alias.as_deref().unwrap_or(import.path.last().map(|s| s.as_str()).unwrap_or(""))
+            if target == name { import.used = true; /* resolve from module */ }
+        }
+        none
+    }
+
+    fn resolve_in_scope(self, name: &str, scope_id: usize) -> Option<usize> {
+        self.scopes.get(scope_id)?.symbols.get(name).copied()
+    }
+
+    fn add_import(mut self, path: [string], alias: Option<string>, glob: bool) {
+        self.imports.push(ImportEntry { path, alias, glob, used: false })
+    }
+
+    fn unused_symbols(self) -> [&Symbol] {
+        self.symbols.iter().filter(|s| !s.used && s.defined).collect()
+    }
+
+    fn unused_imports(self) -> [&ImportEntry] {
+        self.imports.iter().filter(|i| !i.used).collect()
+    }
+
+    fn get_symbol(self, idx: usize) -> Option<&Symbol> { self.symbols.get(idx) }
+    fn get_symbol_mut(mut self, idx: usize) -> Option<&mut Symbol> { self.symbols.get_mut(idx) }
+
+    fn symbols_in_scope(self, scope_id: usize) -> [&Symbol] {
+        if let some(scope) = self.scopes.get(scope_id) {
+            scope.symbols.values().filter_map(|&idx| self.symbols.get(idx)).collect()
+        } else { [] }
+    }
+
+    fn scope_depth(self) -> usize { self.scopes[self.current_scope].depth }
+
+    fn dump(self) -> string {
+        let mut out = string.new()
+        for (i, scope) in self.scopes.iter().enumerate() {
+            out.push_str(&format!("Scope {} (depth={}, kind={:?}):\n", i, scope.depth, scope.kind))
+            for (name, &idx) in &scope.symbols {
+                let sym = &self.symbols[idx]
+                out.push_str(&format!("  {} {:?} (used={})\n", name, sym.kind, sym.used))
+            }
+        }
+        out
+    }
+}
+
+fn main() {
+    let mut table = SymbolTable.new()
+
+    let x_idx = table.define("x", SymbolKind.Variable).unwrap()
+    let f_idx = table.define("foo", SymbolKind.Function).unwrap()
+    assert(table.resolve("x") == some(x_idx))
+    assert(table.resolve("foo") == some(f_idx))
+    print("Global define/resolve \u2713")
+
+    table.enter_scope(ScopeKind.Function)
+    let y_idx = table.define("y", SymbolKind.Variable).unwrap()
+    assert(table.resolve("y") == some(y_idx))
+    assert(table.resolve("x") == some(x_idx))  // parent scope
+    print("Nested scope \u2713")
+
+    table.enter_scope(ScopeKind.Block)
+    let x2_idx = table.define("x", SymbolKind.Variable).unwrap()  // shadow
+    assert(table.resolve("x") == some(x2_idx))  // resolves inner
+    assert(table.scope_depth() == 2)
+    print("Shadowing \u2713")
+
+    table.leave_scope()
+    table.leave_scope()
+    assert(table.resolve("x") == some(x_idx))  // back to global
+    assert(table.resolve("y") == none)  // out of scope
+    print("Scope exit \u2713")
+
+    let dup = table.define("x", SymbolKind.Variable)
+    assert(dup.is_err())
+    print("Duplicate detection \u2713")
+
+    table.add_import(["std".into(), "io".into()], none, false)
+    assert(table.unused_imports().len() == 1)
+    print("Import tracking \u2713")
+
+    let dump = table.dump()
+    assert(dump.contains("Scope 0"))
+    print("Dump \u2713")
+
+    print("Symbol Table complete \u2713")
+}
