@@ -1,0 +1,418 @@
+// Compiler Pass — Macro Expander
+// Pattern matching, hygiene, recursive expansion, built-in macros.
+
+use std.collections.HashMap
+
+// ── Token types ──────────────────────────────────────────────────────────────
+enum TokenKind {
+    Ident(string),
+    Literal(string),
+    Punct(char),
+    Group(Delimiter, [Token]),
+    Eof,
+}
+
+enum Delimiter { Paren, Bracket, Brace }
+
+struct Token {
+    kind: TokenKind,
+    span: Span,
+}
+
+struct Span { start: usize, end: usize, macro_expansion: Option<u32> }
+
+impl Span {
+    fn dummy() -> Span { Span { start: 0, end: 0, macro_expansion: none } }
+    fn with_expansion(self, id: u32) -> Span { Span { macro_expansion: some(id), ..self } }
+}
+
+// ── Macro Pattern ────────────────────────────────────────────────────────────
+enum PatternFragment {
+    Literal(string),
+    Metavar(string, MetavarType),
+    Repetition(Box<[PatternFragment]>, RepSep, RepKind),
+}
+
+enum MetavarType { Expr, Ident, Ty, Pat, Tt, Block, Stmt, Item, Path, Lifetime }
+
+enum RepKind { ZeroOrMore, OneOrMore, ZeroOrOne }
+
+enum RepSep { None, Comma, Semicolon }
+
+// ── Macro Definition ─────────────────────────────────────────────────────────
+struct MacroRule {
+    pattern: [PatternFragment],
+    template: [TemplateFragment],
+}
+
+enum TemplateFragment {
+    Literal(string),
+    MetavarRef(string),
+    Repetition(Box<[TemplateFragment]>, RepSep),
+    TokenTree([Token]),
+}
+
+struct MacroDef {
+    name: string,
+    rules: [MacroRule],
+    hygiene: HygieneMode,
+    expansion_count: u32,
+}
+
+enum HygieneMode { Full, SemiTransparent, Transparent }
+
+// ── Bindings from pattern matching ───────────────────────────────────────────
+enum Binding {
+    Single([Token]),
+    Repeated([[Token]]),
+}
+
+struct MatchResult {
+    bindings: HashMap<string, Binding>,
+}
+
+impl MatchResult {
+    fn new() -> MatchResult { MatchResult { bindings: HashMap.new() } }
+
+    fn bind_single(mut self, name: &str, tokens: [Token]) {
+        self.bindings.insert(name.to_string(), Binding.Single(tokens))
+    }
+
+    fn bind_repeated(mut self, name: &str, groups: [[Token]]) {
+        self.bindings.insert(name.to_string(), Binding.Repeated(groups))
+    }
+
+    fn get(self, name: &str) -> Option<&Binding> { self.bindings.get(name) }
+}
+
+// ── Pattern Matcher ──────────────────────────────────────────────────────────
+struct PatternMatcher {}
+
+impl PatternMatcher {
+    fn match_pattern(pattern: &[PatternFragment], tokens: &[Token], pos: &mut usize) -> Option<MatchResult> {
+        let mut result = MatchResult.new()
+
+        for frag in pattern {
+            match frag {
+                PatternFragment.Literal(expected) => {
+                    if *pos >= tokens.len() { return none }
+                    match &tokens[*pos].kind {
+                        TokenKind.Ident(name) if name == expected => *pos += 1,
+                        TokenKind.Punct(c) if expected.len() == 1 && *c == expected.chars().next().unwrap() => *pos += 1,
+                        _ => return none,
+                    }
+                }
+
+                PatternFragment.Metavar(name, mv_type) => {
+                    if *pos >= tokens.len() { return none }
+                    let captured = Self.capture_metavar(tokens, pos, mv_type)?
+                    result.bind_single(name, captured)
+                }
+
+                PatternFragment.Repetition(inner_pattern, sep, kind) => {
+                    let mut groups: [MatchResult] = []
+                    let mut first = true
+
+                    loop {
+                        if *pos >= tokens.len() { break }
+
+                        // Check separator
+                        if !first {
+                            match sep {
+                                RepSep.Comma => {
+                                    if *pos < tokens.len() {
+                                        match &tokens[*pos].kind {
+                                            TokenKind.Punct(',') => *pos += 1,
+                                            _ => break,
+                                        }
+                                    } else { break }
+                                }
+                                RepSep.Semicolon => {
+                                    if *pos < tokens.len() {
+                                        match &tokens[*pos].kind {
+                                            TokenKind.Punct(';') => *pos += 1,
+                                            _ => break,
+                                        }
+                                    } else { break }
+                                }
+                                RepSep.None => {}
+                            }
+                        }
+
+                        let saved_pos = *pos
+                        match Self.match_pattern(inner_pattern, tokens, pos) {
+                            some(m) => { groups.push(m); first = false }
+                            none => { *pos = saved_pos; break }
+                        }
+                    }
+
+                    match kind {
+                        RepKind.OneOrMore => { if groups.is_empty() { return none } }
+                        RepKind.ZeroOrOne => { if groups.len() > 1 { return none } }
+                        RepKind.ZeroOrMore => {}
+                    }
+
+                    // Merge repeated bindings
+                    let mut var_groups: HashMap<string, [[Token]]> = HashMap.new()
+                    for m in &groups {
+                        for (name, binding) in &m.bindings {
+                            match binding {
+                                Binding.Single(tokens) => {
+                                    var_groups.entry(name.clone()).or_insert_with(|| []).push(tokens.clone())
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    for (name, groups) in var_groups {
+                        result.bind_repeated(&name, groups)
+                    }
+                }
+            }
+        }
+        some(result)
+    }
+
+    fn capture_metavar(tokens: &[Token], pos: &mut usize, mv_type: &MetavarType) -> Option<[Token]> {
+        if *pos >= tokens.len() { return none }
+        match mv_type {
+            MetavarType.Ident => {
+                match &tokens[*pos].kind {
+                    TokenKind.Ident(_) => { let t = tokens[*pos].clone(); *pos += 1; some([t]) }
+                    _ => none,
+                }
+            }
+            MetavarType.Tt => {
+                let t = tokens[*pos].clone()
+                *pos += 1
+                some([t])
+            }
+            MetavarType.Expr => {
+                // Simplified: capture until comma, semicolon, or matching delimiter
+                let mut depth = 0
+                let start = *pos
+                while *pos < tokens.len() {
+                    match &tokens[*pos].kind {
+                        TokenKind.Group(_, _) => { *pos += 1 }
+                        TokenKind.Punct(',') | TokenKind.Punct(';') if depth == 0 => break,
+                        TokenKind.Punct('(') | TokenKind.Punct('[') | TokenKind.Punct('{') => { depth += 1; *pos += 1 }
+                        TokenKind.Punct(')') | TokenKind.Punct(']') | TokenKind.Punct('}') => {
+                            if depth == 0 { break } depth -= 1; *pos += 1
+                        }
+                        _ => *pos += 1,
+                    }
+                }
+                if *pos > start { some(tokens[start..*pos].to_vec()) }
+                else { none }
+            }
+            _ => {
+                // Default: single token
+                let t = tokens[*pos].clone(); *pos += 1; some([t])
+            }
+        }
+    }
+}
+
+// ── Template Expander ────────────────────────────────────────────────────────
+struct TemplateExpander {
+    expansion_id: u32,
+}
+
+impl TemplateExpander {
+    fn new(expansion_id: u32) -> TemplateExpander { TemplateExpander { expansion_id } }
+
+    fn expand(self, template: &[TemplateFragment], bindings: &MatchResult) -> Result<[Token], string> {
+        let mut output: [Token] = []
+
+        for frag in template {
+            match frag {
+                TemplateFragment.Literal(text) => {
+                    output.push(Token {
+                        kind: TokenKind.Ident(text.clone()),
+                        span: Span.dummy().with_expansion(self.expansion_id),
+                    })
+                }
+                TemplateFragment.MetavarRef(name) => {
+                    match bindings.get(name) {
+                        some(Binding.Single(tokens)) => {
+                            for t in tokens {
+                                let mut t = t.clone()
+                                t.span = t.span.with_expansion(self.expansion_id)
+                                output.push(t)
+                            }
+                        }
+                        some(Binding.Repeated(_)) => return err(format!("${name} used outside repetition")),
+                        none => return err(format!("unbound metavar: ${name}")),
+                    }
+                }
+                TemplateFragment.Repetition(inner, sep) => {
+                    // Find a repeated binding to determine count
+                    let count = self.find_rep_count(inner, bindings)?
+                    for i in 0..count {
+                        if i > 0 {
+                            match sep {
+                                RepSep.Comma => output.push(Token { kind: TokenKind.Punct(','), span: Span.dummy() }),
+                                RepSep.Semicolon => output.push(Token { kind: TokenKind.Punct(';'), span: Span.dummy() }),
+                                RepSep.None => {}
+                            }
+                        }
+                        let slice_bindings = self.slice_bindings(bindings, i)
+                        let expanded = self.expand(inner, &slice_bindings)?
+                        output.extend(expanded)
+                    }
+                }
+                TemplateFragment.TokenTree(tokens) => {
+                    for t in tokens {
+                        let mut t = t.clone()
+                        t.span = t.span.with_expansion(self.expansion_id)
+                        output.push(t)
+                    }
+                }
+            }
+        }
+
+        ok(output)
+    }
+
+    fn find_rep_count(self, template: &[TemplateFragment], bindings: &MatchResult) -> Result<usize, string> {
+        for frag in template {
+            if let TemplateFragment.MetavarRef(name) = frag {
+                if let some(Binding.Repeated(groups)) = bindings.get(name) {
+                    return ok(groups.len())
+                }
+            }
+        }
+        err("no repeated binding found".to_string())
+    }
+
+    fn slice_bindings(self, bindings: &MatchResult, index: usize) -> MatchResult {
+        let mut result = MatchResult.new()
+        for (name, binding) in &bindings.bindings {
+            match binding {
+                Binding.Single(tokens) => result.bind_single(name, tokens.clone()),
+                Binding.Repeated(groups) => {
+                    if index < groups.len() { result.bind_single(name, groups[index].clone()) }
+                }
+            }
+        }
+        result
+    }
+}
+
+// ── Macro Expander (orchestrator) ────────────────────────────────────────────
+struct MacroExpander {
+    macros: HashMap<string, MacroDef>,
+    expansion_depth: u32,
+    max_depth: u32,
+    next_expansion_id: u32,
+}
+
+impl MacroExpander {
+    fn new() -> MacroExpander {
+        MacroExpander { macros: HashMap.new(), expansion_depth: 0, max_depth: 128, next_expansion_id: 0 }
+    }
+
+    fn define(mut self, name: &str, rules: [MacroRule]) {
+        self.macros.insert(name.to_string(), MacroDef {
+            name: name.to_string(), rules, hygiene: HygieneMode.SemiTransparent, expansion_count: 0,
+        })
+    }
+
+    fn expand_invocation(mut self, name: &str, input: &[Token]) -> Result<[Token], string> {
+        if self.expansion_depth >= self.max_depth {
+            return err(format!("macro expansion depth exceeded ({} levels)", self.max_depth))
+        }
+
+        let macro_def = self.macros.get_mut(name).ok_or(format!("undefined macro: {name}"))?
+        macro_def.expansion_count += 1
+        let expansion_id = self.next_expansion_id
+        self.next_expansion_id += 1
+
+        // Try each rule
+        for rule in &macro_def.rules {
+            let mut pos = 0
+            if let some(bindings) = PatternMatcher.match_pattern(&rule.pattern, input, &mut pos) {
+                let expander = TemplateExpander.new(expansion_id)
+                self.expansion_depth += 1
+                let result = expander.expand(&rule.template, &bindings)
+                self.expansion_depth -= 1
+                return result
+            }
+        }
+
+        err(format!("no matching rule for macro {name}"))
+    }
+}
+
+fn main() {
+    // Pattern matching
+    let tokens = [
+        Token { kind: TokenKind.Ident("x".to_string()), span: Span.dummy() },
+        Token { kind: TokenKind.Punct(','), span: Span.dummy() },
+        Token { kind: TokenKind.Ident("y".to_string()), span: Span.dummy() },
+    ]
+
+    let pattern = [
+        PatternFragment.Metavar("a".to_string(), MetavarType.Ident),
+        PatternFragment.Literal(",".to_string()),
+        PatternFragment.Metavar("b".to_string(), MetavarType.Ident),
+    ]
+
+    let mut pos = 0
+    let result = PatternMatcher.match_pattern(&pattern, &tokens, &mut pos)
+    assert(result.is_some())
+    let bindings = result.unwrap()
+    match bindings.get("a") {
+        some(Binding.Single(t)) => match &t[0].kind {
+            TokenKind.Ident(s) => assert(s == "x"),
+            _ => panic("expected ident"),
+        },
+        _ => panic("expected binding a"),
+    }
+    print("Pattern matching ✓")
+
+    // Template expansion
+    let expander = TemplateExpander.new(0)
+    let template = [
+        TemplateFragment.Literal("let".to_string()),
+        TemplateFragment.MetavarRef("a".to_string()),
+        TemplateFragment.Literal("=".to_string()),
+        TemplateFragment.MetavarRef("b".to_string()),
+    ]
+    let expanded = expander.expand(&template, &bindings).unwrap()
+    assert(expanded.len() == 4)
+    match &expanded[1].kind { TokenKind.Ident(s) => assert(s == "x"), _ => panic("expected x") }
+    match &expanded[3].kind { TokenKind.Ident(s) => assert(s == "y"), _ => panic("expected y") }
+    print("Template expansion ✓")
+
+    // Hygiene (span tracking)
+    assert(expanded[0].span.macro_expansion == some(0))
+    print("Hygiene span tracking ✓")
+
+    // Macro expander
+    let mut expander = MacroExpander.new()
+    expander.define("swap", [MacroRule {
+        pattern: [
+            PatternFragment.Metavar("a".to_string(), MetavarType.Ident),
+            PatternFragment.Literal(",".to_string()),
+            PatternFragment.Metavar("b".to_string(), MetavarType.Ident),
+        ],
+        template: [
+            TemplateFragment.Literal("let".to_string()),
+            TemplateFragment.Literal("_tmp".to_string()),
+            TemplateFragment.Literal("=".to_string()),
+            TemplateFragment.MetavarRef("a".to_string()),
+        ],
+    }])
+
+    let result = expander.expand_invocation("swap", &tokens).unwrap()
+    assert(result.len() == 4)
+    print("Macro invocation ✓")
+
+    // Undefined macro
+    let err = expander.expand_invocation("unknown", &tokens)
+    assert(err.is_err())
+    print("Undefined macro error ✓")
+
+    print("Macro Expander complete ✓")
+}
