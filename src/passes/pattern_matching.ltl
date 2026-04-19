@@ -1,0 +1,281 @@
+// Compiler Pass - Pattern Matching Compilation
+// Transforms high-level match expressions into decision trees.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug)]
+enum Pattern {
+    Wildcard,
+    Variable(string),
+    Literal(LitValue),
+    Constructor(string, [Pattern]),  // enum variant or struct
+    Tuple([Pattern]),
+    Or([Pattern]),
+    Guard(Box<Pattern>, string),  // pattern with guard expression
+    Range(LitValue, LitValue),    // inclusive range pattern
+    Ref(Box<Pattern>),
+    Slice([Pattern], Option<string>, [Pattern]),  // [head.., rest, ..tail]
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum LitValue {
+    Int(i64),
+    Float(f64),
+    Str(string),
+    Bool(bool),
+    Char(char),
+}
+
+#[derive(Clone, Debug)]
+enum DecisionTree {
+    Leaf(usize, HashMap<string, string>),  // arm index, bindings
+    Switch(string, [SwitchCase], Option<Box<DecisionTree>>),  // scrutinee, cases, default
+    Guard(string, Box<DecisionTree>, Box<DecisionTree>),       // condition, then, else
+    Fail,
+}
+
+#[derive(Clone, Debug)]
+struct SwitchCase {
+    tag: string,
+    bindings: [(string, string)],  // (var_name, field_access)
+    subtree: DecisionTree,
+}
+
+struct MatchArm {
+    pattern: Pattern,
+    guard: Option<string>,
+    body_index: usize,
+}
+
+struct PatternCompiler {
+    arms: [MatchArm],
+    scrutinee: string,
+    warnings: [string],
+}
+
+impl PatternCompiler {
+    fn new(scrutinee: &str) -> PatternCompiler {
+        PatternCompiler { arms: [], scrutinee: scrutinee.to_string(), warnings: [] }
+    }
+
+    fn add_arm(mut self, pattern: Pattern, guard: Option<string>, body_index: usize) {
+        self.arms.push(MatchArm { pattern, guard, body_index })
+    }
+
+    fn compile(mut self) -> DecisionTree {
+        let patterns: [(Pattern, usize)] = self.arms.iter()
+            .map(|arm| (arm.pattern.clone(), arm.body_index))
+            .collect()
+        self.compile_patterns(&self.scrutinee.clone(), &patterns)
+    }
+
+    fn compile_patterns(mut self, scrutinee: &str, patterns: &[(Pattern, usize)]) -> DecisionTree {
+        if patterns.is_empty() { return DecisionTree.Fail }
+
+        // Check for wildcard/variable at top
+        let (ref pat, arm_idx) = patterns[0]
+        match pat {
+            Pattern.Wildcard => {
+                if patterns.len() > 1 { self.warnings.push("unreachable pattern".to_string()) }
+                DecisionTree.Leaf(arm_idx, HashMap.new())
+            },
+            Pattern.Variable(name) => {
+                let mut bindings = HashMap.new()
+                bindings.insert(name.clone(), scrutinee.to_string())
+                if patterns.len() > 1 { self.warnings.push("unreachable pattern".to_string()) }
+                DecisionTree.Leaf(arm_idx, bindings)
+            },
+            Pattern.Literal(lit) => self.compile_literal_patterns(scrutinee, patterns),
+            Pattern.Constructor(_, _) => self.compile_constructor_patterns(scrutinee, patterns),
+            Pattern.Or(sub) => {
+                // Expand or-patterns
+                let mut expanded: [(Pattern, usize)] = []
+                for s in sub { expanded.push((s.clone(), arm_idx)) }
+                expanded.extend(patterns[1..].iter().cloned())
+                self.compile_patterns(scrutinee, &expanded)
+            },
+            Pattern.Guard(inner, cond) => {
+                let then_tree = self.compile_patterns(scrutinee, &[(*inner.clone(), arm_idx)])
+                let else_tree = self.compile_patterns(scrutinee, &patterns[1..])
+                DecisionTree.Guard(cond.clone(), Box.new(then_tree), Box.new(else_tree))
+            },
+            Pattern.Tuple(pats) => self.compile_tuple_patterns(scrutinee, pats, arm_idx, &patterns[1..]),
+            Pattern.Range(lo, hi) => self.compile_range_pattern(scrutinee, lo, hi, arm_idx, &patterns[1..]),
+            _ => DecisionTree.Fail,
+        }
+    }
+
+    fn compile_literal_patterns(mut self, scrutinee: &str, patterns: &[(Pattern, usize)]) -> DecisionTree {
+        let mut cases: [SwitchCase] = []
+        let mut default_patterns: [(Pattern, usize)] = []
+
+        for (pat, idx) in patterns {
+            match pat {
+                Pattern.Literal(lit) => {
+                    let tag = format!("{:?}", lit)
+                    cases.push(SwitchCase {
+                        tag,
+                        bindings: [],
+                        subtree: DecisionTree.Leaf(*idx, HashMap.new()),
+                    })
+                },
+                _ => default_patterns.push((pat.clone(), *idx)),
+            }
+        }
+
+        let default = if default_patterns.is_empty() { none }
+                       else { some(Box.new(self.compile_patterns(scrutinee, &default_patterns))) }
+        DecisionTree.Switch(scrutinee.to_string(), cases, default)
+    }
+
+    fn compile_constructor_patterns(mut self, scrutinee: &str, patterns: &[(Pattern, usize)]) -> DecisionTree {
+        let mut grouped: HashMap<string, [([(Pattern, usize)], usize)]> = HashMap.new()
+        let mut default_patterns: [(Pattern, usize)] = []
+
+        for (pat, idx) in patterns {
+            match pat {
+                Pattern.Constructor(name, sub_pats) => {
+                    let fields: [(Pattern, usize)] = sub_pats.iter().enumerate()
+                        .map(|(i, p)| (p.clone(), i))
+                        .collect()
+                    grouped.entry(name.clone()).or_insert_with(|| []).push((fields, *idx))
+                },
+                _ => default_patterns.push((pat.clone(), *idx)),
+            }
+        }
+
+        let mut cases: [SwitchCase] = []
+        for (ctor_name, arms) in &grouped {
+            let (first_fields, first_idx) = &arms[0]
+            let bindings: [(string, string)] = first_fields.iter().enumerate()
+                .map(|(i, _)| (format!("_field_{}", i), format!("{}.{}", scrutinee, i)))
+                .collect()
+            let subtree = DecisionTree.Leaf(*first_idx, HashMap.new())
+            cases.push(SwitchCase { tag: ctor_name.clone(), bindings, subtree })
+        }
+
+        let default = if default_patterns.is_empty() { none }
+                       else { some(Box.new(self.compile_patterns(scrutinee, &default_patterns))) }
+        DecisionTree.Switch(scrutinee.to_string(), cases, default)
+    }
+
+    fn compile_tuple_patterns(mut self, scrutinee: &str, pats: &[Pattern], arm_idx: usize, rest: &[(Pattern, usize)]) -> DecisionTree {
+        let mut bindings = HashMap.new()
+        for (i, pat) in pats.iter().enumerate() {
+            match pat {
+                Pattern.Variable(name) => { bindings.insert(name.clone(), format!("{}.{}", scrutinee, i)); },
+                Pattern.Wildcard => {},
+                _ => {},
+            }
+        }
+        DecisionTree.Leaf(arm_idx, bindings)
+    }
+
+    fn compile_range_pattern(mut self, scrutinee: &str, lo: &LitValue, hi: &LitValue, arm_idx: usize, rest: &[(Pattern, usize)]) -> DecisionTree {
+        let cond = format!("{} >= {:?} && {} <= {:?}", scrutinee, lo, scrutinee, hi)
+        let then_tree = DecisionTree.Leaf(arm_idx, HashMap.new())
+        let else_tree = self.compile_patterns(scrutinee, rest)
+        DecisionTree.Guard(cond, Box.new(then_tree), Box.new(else_tree))
+    }
+
+    fn check_exhaustiveness(self, type_info: &TypeInfo) -> bool {
+        // Simplified: check if there's a wildcard/variable pattern
+        self.arms.iter().any(|arm| match &arm.pattern {
+            Pattern.Wildcard | Pattern.Variable(_) => true,
+            _ => false,
+        })
+    }
+
+    fn count_arms(self) -> usize { self.arms.len() }
+}
+
+struct TypeInfo {
+    name: string,
+    variants: [string],
+}
+
+fn tree_depth(tree: &DecisionTree) -> usize {
+    match tree {
+        DecisionTree.Leaf(_, _) => 1,
+        DecisionTree.Fail => 0,
+        DecisionTree.Switch(_, cases, default) => {
+            let max_case = cases.iter().map(|c| tree_depth(&c.subtree)).max().unwrap_or(0)
+            let def_depth = default.as_ref().map(|d| tree_depth(d)).unwrap_or(0)
+            1 + max_case.max(def_depth)
+        },
+        DecisionTree.Guard(_, then_tree, else_tree) => {
+            1 + tree_depth(then_tree).max(tree_depth(else_tree))
+        },
+    }
+}
+
+fn main() {
+    // Literal patterns
+    let mut compiler = PatternCompiler.new("x")
+    compiler.add_arm(Pattern.Literal(LitValue.Int(1)), none, 0)
+    compiler.add_arm(Pattern.Literal(LitValue.Int(2)), none, 1)
+    compiler.add_arm(Pattern.Wildcard, none, 2)
+    let tree = compiler.compile()
+    match &tree { DecisionTree.Switch(_, _, _) => {} _ => panic!("expected switch") }
+    print("Literal compile ✓")
+
+    // Constructor patterns
+    let mut compiler2 = PatternCompiler.new("val")
+    compiler2.add_arm(Pattern.Constructor("Some".to_string(), [Pattern.Variable("x".to_string())]), none, 0)
+    compiler2.add_arm(Pattern.Constructor("None".to_string(), []), none, 1)
+    let tree2 = compiler2.compile()
+    match &tree2 { DecisionTree.Switch(_, _, _) => {} _ => panic!("expected switch") }
+    print("Constructor compile ✓")
+
+    // Or-pattern
+    let mut compiler3 = PatternCompiler.new("n")
+    compiler3.add_arm(Pattern.Or(vec![
+        Pattern.Literal(LitValue.Int(1)),
+        Pattern.Literal(LitValue.Int(2)),
+    ]), none, 0)
+    compiler3.add_arm(Pattern.Wildcard, none, 1)
+    let tree3 = compiler3.compile()
+    print("Or-pattern compile ✓")
+
+    // Guard pattern
+    let mut compiler4 = PatternCompiler.new("x")
+    compiler4.add_arm(Pattern.Guard(Box.new(Pattern.Variable("n".to_string())), "n > 0".to_string()), none, 0)
+    compiler4.add_arm(Pattern.Wildcard, none, 1)
+    let tree4 = compiler4.compile()
+    match &tree4 { DecisionTree.Guard(_, _, _) => {} _ => panic!("expected guard") }
+    print("Guard pattern ✓")
+
+    // Range pattern
+    let mut compiler5 = PatternCompiler.new("ch")
+    compiler5.add_arm(Pattern.Range(LitValue.Char('a'), LitValue.Char('z')), none, 0)
+    compiler5.add_arm(Pattern.Wildcard, none, 1)
+    let tree5 = compiler5.compile()
+    print("Range pattern ✓")
+
+    // Tuple pattern
+    let mut compiler6 = PatternCompiler.new("pair")
+    compiler6.add_arm(Pattern.Tuple(vec![Pattern.Variable("a".to_string()), Pattern.Variable("b".to_string())]), none, 0)
+    let tree6 = compiler6.compile()
+    match &tree6 { DecisionTree.Leaf(0, bindings) => { assert(bindings.len() == 2) }, _ => panic!("expected leaf") }
+    print("Tuple pattern ✓")
+
+    // Tree depth
+    let depth = tree_depth(&tree)
+    assert(depth >= 1)
+    print("Tree depth ✓")
+
+    // Exhaustiveness
+    assert(compiler.check_exhaustiveness(&TypeInfo { name: "i32".to_string(), variants: [] }))
+    print("Exhaustiveness ✓")
+
+    // Arm count
+    assert(compiler.count_arms() == 3)
+    print("Arm count ✓")
+
+    // LitValue equality
+    assert(LitValue.Int(42) == LitValue.Int(42))
+    assert(LitValue.Bool(true) != LitValue.Bool(false))
+    print("LitValue eq ✓")
+
+    print("Pattern Matching complete ✓")
+}
