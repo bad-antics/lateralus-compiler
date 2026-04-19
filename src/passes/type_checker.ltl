@@ -1,0 +1,338 @@
+// Compiler Pass — Type Checker
+// Hindley-Milner type inference with constraint solving.
+
+use std.collections.HashMap
+
+type TypeId = u32
+
+// ── Types ────────────────────────────────────────────────────────────────────
+enum Type {
+    Int(IntSize),
+    Float(FloatSize),
+    Bool,
+    Char,
+    String,
+    Unit,
+    Never,
+    TypeVar(TypeId),
+    Function([Type], Box<Type>),
+    Tuple([Type]),
+    Array(Box<Type>),
+    Slice(Box<Type>),
+    Reference(Box<Type>, Mutability),
+    Struct(string, [(string, Type)]),
+    Enum(string, [(string, [Type])]),
+    Generic(string, [Type]),
+    Error(string),
+}
+
+enum IntSize { I8, I16, I32, I64, I128, U8, U16, U32, U64, U128, Isize, Usize }
+enum FloatSize { F32, F64 }
+enum Mutability { Immutable, Mutable }
+
+// ── Type environment ─────────────────────────────────────────────────────────
+struct TypeEnv {
+    scopes: [HashMap<string, Type>],
+    type_defs: HashMap<string, Type>,
+    trait_impls: HashMap<(string, string), [Type]>,  // (type, trait) -> methods
+}
+
+impl TypeEnv {
+    fn new() -> TypeEnv {
+        TypeEnv {
+            scopes: [HashMap.new()],
+            type_defs: HashMap.new(),
+            trait_impls: HashMap.new(),
+        }
+    }
+
+    fn push_scope(mut self) { self.scopes.push(HashMap.new()) }
+    fn pop_scope(mut self) { self.scopes.pop(); }
+
+    fn define(mut self, name: &str, ty: Type) {
+        self.scopes.last_mut().unwrap().insert(name.to_string(), ty)
+    }
+
+    fn lookup(self, name: &str) -> Option<&Type> {
+        for scope in self.scopes.iter().rev() {
+            if let some(ty) = scope.get(name) { return some(ty) }
+        }
+        none
+    }
+}
+
+// ── Constraint solver (unification) ──────────────────────────────────────────
+struct Substitution {
+    mapping: HashMap<TypeId, Type>,
+    next_var: TypeId,
+}
+
+impl Substitution {
+    fn new() -> Substitution { Substitution { mapping: HashMap.new(), next_var: 0 } }
+
+    fn fresh_var(mut self) -> Type {
+        let id = self.next_var; self.next_var += 1
+        Type.TypeVar(id)
+    }
+
+    fn apply(self, ty: &Type) -> Type {
+        match ty {
+            Type.TypeVar(id) => {
+                if let some(resolved) = self.mapping.get(id) {
+                    self.apply(resolved)
+                } else { ty.clone() }
+            }
+            Type.Function(params, ret) => {
+                let params = params.iter().map(|t| self.apply(t)).collect()
+                Type.Function(params, box self.apply(ret))
+            }
+            Type.Array(inner) => Type.Array(box self.apply(inner)),
+            Type.Reference(inner, m) => Type.Reference(box self.apply(inner), m.clone()),
+            Type.Tuple(elems) => Type.Tuple(elems.iter().map(|t| self.apply(t)).collect()),
+            Type.Generic(name, args) => {
+                Type.Generic(name.clone(), args.iter().map(|t| self.apply(t)).collect())
+            }
+            _ => ty.clone(),
+        }
+    }
+
+    fn unify(mut self, a: &Type, b: &Type) -> Result<(), TypeError> {
+        let a = self.apply(a)
+        let b = self.apply(b)
+
+        match (&a, &b) {
+            _ if a == b => ok(()),
+
+            (Type.TypeVar(id), _) => {
+                if self.occurs_in(*id, &b) { return err(TypeError.InfiniteType(*id, b)) }
+                self.mapping.insert(*id, b); ok(())
+            }
+            (_, Type.TypeVar(id)) => {
+                if self.occurs_in(*id, &a) { return err(TypeError.InfiniteType(*id, a)) }
+                self.mapping.insert(*id, a); ok(())
+            }
+
+            (Type.Function(p1, r1), Type.Function(p2, r2)) => {
+                if p1.len() != p2.len() { return err(TypeError.ArityMismatch(p1.len(), p2.len())) }
+                for (a, b) in p1.iter().zip(p2) { self.unify(a, b)? }
+                self.unify(r1, r2)
+            }
+
+            (Type.Array(a), Type.Array(b)) => self.unify(a, b),
+            (Type.Reference(a, m1), Type.Reference(b, m2)) => {
+                if m1 != m2 { return err(TypeError.MutabilityMismatch) }
+                self.unify(a, b)
+            }
+            (Type.Tuple(a), Type.Tuple(b)) => {
+                if a.len() != b.len() { return err(TypeError.TypeMismatch(Type.Tuple(a.clone()), Type.Tuple(b.clone()))) }
+                for (x, y) in a.iter().zip(b) { self.unify(x, y)? }
+                ok(())
+            }
+            (Type.Generic(n1, a1), Type.Generic(n2, a2)) if n1 == n2 => {
+                if a1.len() != a2.len() { return err(TypeError.TypeMismatch(a.clone(), b.clone())) }
+                for (x, y) in a1.iter().zip(a2) { self.unify(x, y)? }
+                ok(())
+            }
+
+            // Integer coercion
+            (Type.Int(_), Type.Int(_)) => ok(()),
+            // Float coercion
+            (Type.Float(_), Type.Float(_)) => ok(()),
+
+            _ => err(TypeError.TypeMismatch(a, b)),
+        }
+    }
+
+    fn occurs_in(self, var: TypeId, ty: &Type) -> bool {
+        match ty {
+            Type.TypeVar(id) => {
+                if *id == var { return true }
+                if let some(resolved) = self.mapping.get(id) { self.occurs_in(var, resolved) }
+                else { false }
+            }
+            Type.Function(params, ret) => {
+                params.iter().any(|t| self.occurs_in(var, t)) || self.occurs_in(var, ret)
+            }
+            Type.Array(inner) | Type.Reference(inner, _) => self.occurs_in(var, inner),
+            Type.Tuple(elems) => elems.iter().any(|t| self.occurs_in(var, t)),
+            Type.Generic(_, args) => args.iter().any(|t| self.occurs_in(var, t)),
+            _ => false,
+        }
+    }
+}
+
+// ── Type errors ──────────────────────────────────────────────────────────────
+enum TypeError {
+    TypeMismatch(Type, Type),
+    UnboundVariable(string),
+    ArityMismatch(usize, usize),
+    InfiniteType(TypeId, Type),
+    MutabilityMismatch,
+    NotCallable(Type),
+    FieldNotFound(string, string),
+    MissingReturn,
+    BreakOutsideLoop,
+}
+
+// ── Type checker ─────────────────────────────────────────────────────────────
+struct TypeChecker {
+    env: TypeEnv,
+    subst: Substitution,
+    errors: [TypeError],
+    in_loop: bool,
+    return_type: Option<Type>,
+}
+
+impl TypeChecker {
+    fn new() -> TypeChecker {
+        let mut checker = TypeChecker {
+            env: TypeEnv.new(),
+            subst: Substitution.new(),
+            errors: [],
+            in_loop: false,
+            return_type: none,
+        }
+
+        // Built-in functions
+        checker.env.define("print", Type.Function([Type.String], box Type.Unit))
+        checker.env.define("println", Type.Function([Type.String], box Type.Unit))
+        checker.env.define("assert", Type.Function([Type.Bool], box Type.Unit))
+        checker.env.define("panic", Type.Function([Type.String], box Type.Never))
+
+        checker
+    }
+
+    fn check_binary_op(mut self, op: &str, left: &Type, right: &Type) -> Type {
+        match op {
+            "+" | "-" | "*" | "/" | "%" => {
+                self.subst.unify(left, right).unwrap_or_else(|e| self.errors.push(e))
+                left.clone()
+            }
+            "==" | "!=" | "<" | ">" | "<=" | ">=" => {
+                self.subst.unify(left, right).unwrap_or_else(|e| self.errors.push(e))
+                Type.Bool
+            }
+            "&&" | "||" => {
+                self.subst.unify(left, &Type.Bool).unwrap_or_else(|e| self.errors.push(e))
+                self.subst.unify(right, &Type.Bool).unwrap_or_else(|e| self.errors.push(e))
+                Type.Bool
+            }
+            _ => { self.errors.push(TypeError.TypeMismatch(left.clone(), right.clone())); Type.Error("unknown op".to_string()) }
+        }
+    }
+
+    fn check_field_access(mut self, ty: &Type, field: &str) -> Type {
+        match ty {
+            Type.Struct(name, fields) => {
+                for (f_name, f_type) in fields {
+                    if f_name == field { return f_type.clone() }
+                }
+                self.errors.push(TypeError.FieldNotFound(name.clone(), field.to_string()))
+                Type.Error(format!("no field {field}"))
+            }
+            Type.Tuple(elems) => {
+                if let ok(idx) = field.parse::<usize>() {
+                    if idx < elems.len() { return elems[idx].clone() }
+                }
+                self.errors.push(TypeError.FieldNotFound("tuple".to_string(), field.to_string()))
+                Type.Error("bad tuple index".to_string())
+            }
+            _ => {
+                self.errors.push(TypeError.FieldNotFound("?".to_string(), field.to_string()))
+                Type.Error("not a struct".to_string())
+            }
+        }
+    }
+
+    fn error_count(self) -> usize { self.errors.len() }
+    fn has_errors(self) -> bool { !self.errors.is_empty() }
+}
+
+fn main() {
+    // Basic unification
+    let mut subst = Substitution.new()
+    let tv = subst.fresh_var()
+    subst.unify(&tv, &Type.Int(IntSize.I32)).unwrap()
+    let resolved = subst.apply(&tv)
+    assert(matches!(resolved, Type.Int(IntSize.I32)))
+    print("Unify TypeVar → Int ✓")
+
+    // Function type unification
+    let mut subst = Substitution.new()
+    let a = subst.fresh_var()
+    let b = subst.fresh_var()
+    let fn1 = Type.Function([a.clone()], box b.clone())
+    let fn2 = Type.Function([Type.Int(IntSize.I32)], box Type.Bool)
+    subst.unify(&fn1, &fn2).unwrap()
+    assert(matches!(subst.apply(&a), Type.Int(IntSize.I32)))
+    assert(matches!(subst.apply(&b), Type.Bool))
+    print("Function unification ✓")
+
+    // Occurs check
+    let mut subst = Substitution.new()
+    let tv = subst.fresh_var()
+    let arr = Type.Array(box tv.clone())
+    let result = subst.unify(&tv, &arr)
+    assert(result.is_err())
+    print("Occurs check ✓")
+
+    // Arity mismatch
+    let mut subst = Substitution.new()
+    let fn1 = Type.Function([Type.Int(IntSize.I32)], box Type.Bool)
+    let fn2 = Type.Function([Type.Int(IntSize.I32), Type.String], box Type.Bool)
+    let result = subst.unify(&fn1, &fn2)
+    assert(matches!(result, err(TypeError.ArityMismatch(1, 2))))
+    print("Arity mismatch ✓")
+
+    // Type environment
+    let mut env = TypeEnv.new()
+    env.define("x", Type.Int(IntSize.I32))
+    env.push_scope()
+    env.define("x", Type.String)
+    assert(matches!(env.lookup("x"), some(Type.String)))
+    env.pop_scope()
+    assert(matches!(env.lookup("x"), some(Type.Int(IntSize.I32))))
+    print("Scoped environment ✓")
+
+    // TypeChecker
+    let mut checker = TypeChecker.new()
+    let result = checker.check_binary_op("+", &Type.Int(IntSize.I32), &Type.Int(IntSize.I32))
+    assert(matches!(result, Type.Int(IntSize.I32)))
+    print("Binary op check ✓")
+
+    let result = checker.check_binary_op("==", &Type.Int(IntSize.I32), &Type.Int(IntSize.I32))
+    assert(matches!(result, Type.Bool))
+    print("Comparison op → Bool ✓")
+
+    // Field access
+    let struct_ty = Type.Struct("Point".to_string(), [
+        ("x".to_string(), Type.Float(FloatSize.F64)),
+        ("y".to_string(), Type.Float(FloatSize.F64)),
+    ])
+    let field_ty = checker.check_field_access(&struct_ty, "x")
+    assert(matches!(field_ty, Type.Float(FloatSize.F64)))
+    print("Field access ✓")
+
+    let field_ty = checker.check_field_access(&struct_ty, "z")
+    assert(matches!(field_ty, Type.Error(_)))
+    assert(checker.has_errors())
+    print("Missing field error ✓")
+
+    // Tuple access
+    let tuple_ty = Type.Tuple([Type.Int(IntSize.I32), Type.String, Type.Bool])
+    let mut checker2 = TypeChecker.new()
+    let elem = checker2.check_field_access(&tuple_ty, "1")
+    assert(matches!(elem, Type.String))
+    print("Tuple field access ✓")
+
+    // Generic unification
+    let mut subst = Substitution.new()
+    let tv = subst.fresh_var()
+    let gen1 = Type.Generic("Vec".to_string(), [tv.clone()])
+    let gen2 = Type.Generic("Vec".to_string(), [Type.Int(IntSize.I32)])
+    subst.unify(&gen1, &gen2).unwrap()
+    assert(matches!(subst.apply(&tv), Type.Int(IntSize.I32)))
+    print("Generic unification ✓")
+
+    print("Type Checker complete ✓")
+}
