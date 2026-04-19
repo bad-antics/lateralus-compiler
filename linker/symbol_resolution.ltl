@@ -1,0 +1,75 @@
+// symbol_resolution.ltl — Symbol resolution and relocation
+use crate.codegen.elf_writer.{Section, Symbol}
+
+enum SymbolBinding { Local, Global, Weak }
+enum SymbolType    { Function, Object, TLS, None }
+
+struct ResolvedSymbol {
+    name:       string,
+    address:    int,
+    size:       int,
+    binding:    SymbolBinding,
+    sym_type:   SymbolType,
+    section:    string,
+    defined_in: string,
+}
+
+struct SymbolTable {
+    symbols:   dict<string, ResolvedSymbol>,
+    undefined: [string],
+}
+
+impl SymbolTable {
+    fn new() -> SymbolTable {
+        SymbolTable { symbols: {}, undefined: [] }
+    }
+
+    fn define(mut self, sym: ResolvedSymbol) -> Result<(), string> {
+        if let some(existing) = self.symbols.get(sym.name.clone()) {
+            match (existing.binding.clone(), sym.binding.clone()) {
+                (SymbolBinding.Weak, SymbolBinding.Global) => {},  // global wins
+                (SymbolBinding.Global, SymbolBinding.Global) =>
+                    return err("duplicate symbol: ${sym.name}"),
+                _ => return ok(()),
+            }
+        }
+        self.symbols[sym.name.clone()] = sym
+        ok(())
+    }
+
+    fn resolve(self, name: string) -> ResolvedSymbol? {
+        self.symbols.get(name)
+    }
+
+    fn check_undefined(self) -> [string] {
+        self.undefined |> filter(|u| !self.symbols.has(u)) |> collect()
+    }
+}
+
+struct Relocation {
+    offset:   int,
+    sym_name: string,
+    rel_type: RelType,
+    addend:   int,
+}
+
+enum RelType { Abs64, PcRel32, Got, Plt, TlsGd }
+
+fn apply_relocations(
+    section_data: mut [u8],
+    relocations:  [Relocation],
+    symbols:      SymbolTable,
+    base_addr:    int,
+) -> Result<(), string> {
+    for rel in relocations {
+        let sym = symbols.resolve(rel.sym_name.clone())
+            .ok_or("Undefined symbol: ${rel.sym_name}")?
+        let value = match rel.rel_type {
+            RelType.Abs64  => sym.address + rel.addend,
+            RelType.PcRel32 => sym.address + rel.addend - (base_addr + rel.offset + 4),
+            _ => sym.address,
+        }
+        section_data.write_le_i64(rel.offset, value)
+    }
+    ok(())
+}
