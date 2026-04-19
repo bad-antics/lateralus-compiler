@@ -1,0 +1,228 @@
+// Compiler Pass - Escape Analysis
+// Determines whether heap allocations can be stack-allocated instead.
+
+use std.collections.HashMap
+use std.collections.HashSet
+
+enum EscapeState {
+    NoEscape,         // Value stays within the function
+    ArgEscape(usize), // Value escapes via argument position
+    GlobalEscape,     // Value escapes to heap/global
+}
+
+impl EscapeState {
+    fn merge(self, other: &EscapeState) -> EscapeState {
+        match (self, other) {
+            (EscapeState.GlobalEscape, _) | (_, EscapeState.GlobalEscape) => EscapeState.GlobalEscape,
+            (EscapeState.ArgEscape(a), EscapeState.ArgEscape(b)) => if a == *b { EscapeState.ArgEscape(a) } else { EscapeState.GlobalEscape },
+            (EscapeState.ArgEscape(a), _) => EscapeState.ArgEscape(a),
+            (_, EscapeState.ArgEscape(b)) => EscapeState.ArgEscape(*b),
+            _ => EscapeState.NoEscape,
+        }
+    }
+    fn escapes(self) -> bool { match self { EscapeState.NoEscape => false, _ => true } }
+}
+
+struct AllocSite { id: usize, ty: string, location: (usize, usize) }
+
+struct EscapeInfo {
+    alloc: AllocSite,
+    state: EscapeState,
+    reasons: [string],
+}
+
+struct ConnectionGraph {
+    nodes: HashMap<usize, CGNode>,
+    edges: [(usize, usize, EdgeKind)],
+}
+
+enum CGNode {
+    Object(usize),       // allocation site
+    Phantom(usize),      // parameter/return
+    Reference(usize),    // local variable
+}
+
+enum EdgeKind {
+    PointsTo,    // reference -> object
+    Deferred,    // ref -> ref (assignment)
+    Field(string), // object -> field object
+}
+
+impl ConnectionGraph {
+    fn new() -> ConnectionGraph { ConnectionGraph { nodes: HashMap.new(), edges: [] } }
+
+    fn add_node(mut self, id: usize, node: CGNode) { self.nodes.insert(id, node) }
+
+    fn add_edge(mut self, from: usize, to: usize, kind: EdgeKind) { self.edges.push((from, to, kind)) }
+
+    fn points_to_set(self, node_id: usize) -> HashSet<usize> {
+        let mut visited = HashSet.new()
+        let mut worklist = [node_id]
+        let mut result = HashSet.new()
+
+        while let some(current) = worklist.pop() {
+            if !visited.insert(current) { continue }
+            for (from, to, kind) in &self.edges {
+                if *from == current {
+                    match kind {
+                        EdgeKind.PointsTo => { result.insert(*to); }
+                        EdgeKind.Deferred => { worklist.push(*to); }
+                        EdgeKind.Field(_) => { result.insert(*to); }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn compute_escape_states(self, params: &[usize], return_nodes: &[usize]) -> HashMap<usize, EscapeState> {
+        let mut states: HashMap<usize, EscapeState> = HashMap.new()
+
+        // Parameters escape via args
+        for (idx, param) in params.iter().enumerate() {
+            let pts = self.points_to_set(*param)
+            for obj in &pts { states.insert(*obj, EscapeState.ArgEscape(idx)); }
+        }
+
+        // Return values escape globally
+        for ret in return_nodes {
+            let pts = self.points_to_set(*ret)
+            for obj in &pts { states.insert(*obj, EscapeState.GlobalEscape); }
+        }
+
+        // Propagate through graph
+        let mut changed = true
+        while changed {
+            changed = false
+            for (from, to, kind) in &self.edges {
+                if let some(from_state) = states.get(from) {
+                    let new_state = match states.get(to) {
+                        some(existing) => existing.merge(from_state),
+                        none => from_state.clone(),
+                    }
+                    if states.get(to) != some(&new_state) {
+                        states.insert(*to, new_state)
+                        changed = true
+                    }
+                }
+            }
+        }
+
+        // Default to NoEscape
+        for (id, _) in &self.nodes {
+            states.entry(*id).or_insert(EscapeState.NoEscape);
+        }
+        states
+    }
+}
+
+struct EscapeAnalyzer {
+    next_id: usize,
+    graph: ConnectionGraph,
+    alloc_sites: HashMap<usize, AllocSite>,
+    param_nodes: [usize],
+    return_nodes: [usize],
+}
+
+impl EscapeAnalyzer {
+    fn new() -> EscapeAnalyzer {
+        EscapeAnalyzer {
+            next_id: 0, graph: ConnectionGraph.new(),
+            alloc_sites: HashMap.new(), param_nodes: [], return_nodes: [],
+        }
+    }
+
+    fn fresh_id(mut self) -> usize { let id = self.next_id; self.next_id += 1; id }
+
+    fn add_allocation(mut self, ty: &str, location: (usize, usize)) -> usize {
+        let id = self.fresh_id()
+        let alloc = AllocSite { id, ty: ty.to_string(), location }
+        self.alloc_sites.insert(id, alloc)
+        self.graph.add_node(id, CGNode.Object(id))
+        id
+    }
+
+    fn add_parameter(mut self) -> usize {
+        let id = self.fresh_id()
+        self.graph.add_node(id, CGNode.Phantom(id))
+        self.param_nodes.push(id)
+        id
+    }
+
+    fn add_local(mut self) -> usize {
+        let id = self.fresh_id()
+        self.graph.add_node(id, CGNode.Reference(id))
+        id
+    }
+
+    fn record_assignment(mut self, dst: usize, src: usize) { self.graph.add_edge(dst, src, EdgeKind.Deferred) }
+    fn record_points_to(mut self, ref_id: usize, obj_id: usize) { self.graph.add_edge(ref_id, obj_id, EdgeKind.PointsTo) }
+    fn record_field_store(mut self, obj_id: usize, field: &str, val_id: usize) { self.graph.add_edge(obj_id, val_id, EdgeKind.Field(field.to_string())) }
+    fn record_return(mut self, node_id: usize) { self.return_nodes.push(node_id) }
+
+    fn analyze(self) -> [EscapeInfo] {
+        let states = self.graph.compute_escape_states(&self.param_nodes, &self.return_nodes)
+        let mut results: [EscapeInfo] = []
+
+        for (id, alloc) in &self.alloc_sites {
+            let state = states.get(id).unwrap_or(&EscapeState.NoEscape).clone()
+            let mut reasons: [string] = []
+            match &state {
+                EscapeState.NoEscape => reasons.push("can be stack-allocated".to_string()),
+                EscapeState.ArgEscape(idx) => reasons.push(format!("escapes via argument {}", idx)),
+                EscapeState.GlobalEscape => reasons.push("escapes to heap".to_string()),
+            }
+            results.push(EscapeInfo { alloc: alloc.clone(), state, reasons })
+        }
+        results
+    }
+
+    fn stack_allocatable(self) -> [usize] {
+        let infos = self.analyze()
+        infos.iter().filter(|i| !i.state.escapes()).map(|i| i.alloc.id).collect()
+    }
+}
+
+fn main() {
+    let mut analyzer = EscapeAnalyzer.new()
+
+    // Simulate: fn foo(param) { let x = Box.new(42); let y = Box.new(99); return y }
+    let param = analyzer.add_parameter()
+    let x_ref = analyzer.add_local()
+    let x_obj = analyzer.add_allocation("i32", (1, 10))
+    analyzer.record_points_to(x_ref, x_obj)
+
+    let y_ref = analyzer.add_local()
+    let y_obj = analyzer.add_allocation("i32", (2, 10))
+    analyzer.record_points_to(y_ref, y_obj)
+    analyzer.record_return(y_ref)
+
+    let results = analyzer.analyze()
+    assert(results.len() == 2)
+
+    let stack_allocs = analyzer.stack_allocatable()
+    assert(stack_allocs.contains(&x_obj))   // x doesn't escape
+    assert(!stack_allocs.contains(&y_obj))   // y is returned
+    print("Escape analysis \u2713")
+
+    // Merge states
+    assert(!EscapeState.NoEscape.escapes())
+    assert(EscapeState.ArgEscape(0).escapes())
+    assert(EscapeState.GlobalEscape.escapes())
+    let merged = EscapeState.NoEscape.merge(&EscapeState.GlobalEscape)
+    assert(merged.escapes())
+    print("Escape states \u2713")
+
+    // Points-to set
+    let mut graph = ConnectionGraph.new()
+    graph.add_node(0, CGNode.Reference(0))
+    graph.add_node(1, CGNode.Object(1))
+    graph.add_node(2, CGNode.Reference(2))
+    graph.add_edge(0, 1, EdgeKind.PointsTo)
+    graph.add_edge(2, 0, EdgeKind.Deferred)
+    let pts = graph.points_to_set(2)
+    assert(pts.contains(&1))
+    print("Points-to set \u2713")
+
+    print("Escape Analysis complete \u2713")
+}
