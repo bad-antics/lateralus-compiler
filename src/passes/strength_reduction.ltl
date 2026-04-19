@@ -1,0 +1,244 @@
+// Compiler Pass - Strength Reduction
+// Replaces expensive operations with cheaper equivalents.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    Const(i64),
+    Reg(string),
+    BinOp(string, Box<Value>, Box<Value>),
+}
+
+#[derive(Clone, Debug)]
+enum Instruction {
+    Assign(string, Value),
+    Mul(string, Value, Value),
+    Div(string, Value, Value),
+    Mod(string, Value, Value),
+    Pow(string, Value, i64),
+    Nop,
+}
+
+struct StrengthReducer {
+    reductions: usize,
+    known_constants: HashMap<string, i64>,
+}
+
+impl StrengthReducer {
+    fn new() -> StrengthReducer {
+        StrengthReducer { reductions: 0, known_constants: HashMap.new() }
+    }
+
+    fn is_power_of_two(n: i64) -> bool {
+        n > 0 && (n & (n - 1)) == 0
+    }
+
+    fn log2(n: i64) -> u32 {
+        assert(Self.is_power_of_two(n))
+        let mut count: u32 = 0
+        let mut v = n
+        while v > 1 { v >>= 1; count += 1 }
+        count
+    }
+
+    fn reduce(mut self, instructions: &mut [Instruction]) {
+        for instr in instructions.iter_mut() {
+            *instr = self.reduce_instruction(instr)
+        }
+    }
+
+    fn reduce_instruction(mut self, instr: &Instruction) -> Instruction {
+        match instr {
+            // Multiply by power of 2 -> shift left
+            Instruction.Mul(dest, lhs, Value.Const(n)) if Self.is_power_of_two(*n) => {
+                let shift = Self.log2(*n)
+                self.reductions += 1
+                Instruction.Assign(dest.clone(),
+                    Value.BinOp("shl".to_string(), Box.new(lhs.clone()), Box.new(Value.Const(shift as i64))))
+            },
+
+            // Multiply by 0 -> 0
+            Instruction.Mul(dest, _, Value.Const(0)) => {
+                self.reductions += 1
+                Instruction.Assign(dest.clone(), Value.Const(0))
+            },
+
+            // Multiply by 1 -> identity
+            Instruction.Mul(dest, lhs, Value.Const(1)) => {
+                self.reductions += 1
+                Instruction.Assign(dest.clone(), lhs.clone())
+            },
+
+            // Multiply by -1 -> negate
+            Instruction.Mul(dest, lhs, Value.Const(-1)) => {
+                self.reductions += 1
+                Instruction.Assign(dest.clone(),
+                    Value.BinOp("neg".to_string(), Box.new(lhs.clone()), Box.new(Value.Const(0))))
+            },
+
+            // Multiply by 3 -> (x << 1) + x
+            Instruction.Mul(dest, lhs, Value.Const(3)) => {
+                self.reductions += 1
+                let shifted = Value.BinOp("shl".to_string(), Box.new(lhs.clone()), Box.new(Value.Const(1)))
+                Instruction.Assign(dest.clone(),
+                    Value.BinOp("add".to_string(), Box.new(shifted), Box.new(lhs.clone())))
+            },
+
+            // Multiply by 5 -> (x << 2) + x
+            Instruction.Mul(dest, lhs, Value.Const(5)) => {
+                self.reductions += 1
+                let shifted = Value.BinOp("shl".to_string(), Box.new(lhs.clone()), Box.new(Value.Const(2)))
+                Instruction.Assign(dest.clone(),
+                    Value.BinOp("add".to_string(), Box.new(shifted), Box.new(lhs.clone())))
+            },
+
+            // Multiply by 7 -> (x << 3) - x
+            Instruction.Mul(dest, lhs, Value.Const(7)) => {
+                self.reductions += 1
+                let shifted = Value.BinOp("shl".to_string(), Box.new(lhs.clone()), Box.new(Value.Const(3)))
+                Instruction.Assign(dest.clone(),
+                    Value.BinOp("sub".to_string(), Box.new(shifted), Box.new(lhs.clone())))
+            },
+
+            // Divide by power of 2 -> shift right (unsigned)
+            Instruction.Div(dest, lhs, Value.Const(n)) if *n > 0 && Self.is_power_of_two(*n) => {
+                let shift = Self.log2(*n)
+                self.reductions += 1
+                Instruction.Assign(dest.clone(),
+                    Value.BinOp("shr".to_string(), Box.new(lhs.clone()), Box.new(Value.Const(shift as i64))))
+            },
+
+            // Divide by 1 -> identity
+            Instruction.Div(dest, lhs, Value.Const(1)) => {
+                self.reductions += 1
+                Instruction.Assign(dest.clone(), lhs.clone())
+            },
+
+            // Modulo by power of 2 -> bitwise AND
+            Instruction.Mod(dest, lhs, Value.Const(n)) if *n > 0 && Self.is_power_of_two(*n) => {
+                self.reductions += 1
+                Instruction.Assign(dest.clone(),
+                    Value.BinOp("and".to_string(), Box.new(lhs.clone()), Box.new(Value.Const(*n - 1))))
+            },
+
+            // Power of 2 -> shift
+            Instruction.Pow(dest, lhs, 2) => {
+                self.reductions += 1
+                Instruction.Assign(dest.clone(),
+                    Value.BinOp("mul".to_string(), Box.new(lhs.clone()), Box.new(lhs.clone())))
+            },
+
+            // Power of 0 -> 1
+            Instruction.Pow(dest, _, 0) => {
+                self.reductions += 1
+                Instruction.Assign(dest.clone(), Value.Const(1))
+            },
+
+            // Power of 1 -> identity
+            Instruction.Pow(dest, lhs, 1) => {
+                self.reductions += 1
+                Instruction.Assign(dest.clone(), lhs.clone())
+            },
+
+            _ => instr.clone(),
+        }
+    }
+
+    fn stats(self) -> usize { self.reductions }
+}
+
+fn main() {
+    let x = Value.Reg("x".to_string())
+
+    // Multiply by power of 2
+    let mut sr = StrengthReducer.new()
+    let mut instrs = vec![
+        Instruction.Mul("r1".to_string(), x.clone(), Value.Const(8)),
+    ]
+    sr.reduce(&mut instrs)
+    match &instrs[0] {
+        Instruction.Assign(_, Value.BinOp(op, _, shift)) => {
+            assert(op == "shl")
+            assert(**shift == Value.Const(3))
+        },
+        _ => panic("Expected shift"),
+    }
+    print("Mul by pow2 -> shl ✓")
+
+    // Multiply by 0
+    let mut instrs2 = vec![Instruction.Mul("r2".to_string(), x.clone(), Value.Const(0))]
+    sr.reduce(&mut instrs2)
+    match &instrs2[0] {
+        Instruction.Assign(_, Value.Const(0)) => {},
+        _ => panic("Expected 0"),
+    }
+    print("Mul by 0 ✓")
+
+    // Multiply by 1
+    let mut instrs3 = vec![Instruction.Mul("r3".to_string(), x.clone(), Value.Const(1))]
+    sr.reduce(&mut instrs3)
+    match &instrs3[0] {
+        Instruction.Assign(_, val) => assert(*val == x),
+        _ => panic("Expected identity"),
+    }
+    print("Mul by 1 ✓")
+
+    // Multiply by 3 -> (x<<1)+x
+    let mut instrs4 = vec![Instruction.Mul("r4".to_string(), x.clone(), Value.Const(3))]
+    sr.reduce(&mut instrs4)
+    match &instrs4[0] {
+        Instruction.Assign(_, Value.BinOp(op, _, _)) => assert(op == "add"),
+        _ => panic("Expected add"),
+    }
+    print("Mul by 3 ✓")
+
+    // Divide by power of 2
+    let mut instrs5 = vec![Instruction.Div("r5".to_string(), x.clone(), Value.Const(16))]
+    sr.reduce(&mut instrs5)
+    match &instrs5[0] {
+        Instruction.Assign(_, Value.BinOp(op, _, shift)) => {
+            assert(op == "shr")
+            assert(**shift == Value.Const(4))
+        },
+        _ => panic("Expected shr"),
+    }
+    print("Div by pow2 -> shr ✓")
+
+    // Mod by power of 2
+    let mut instrs6 = vec![Instruction.Mod("r6".to_string(), x.clone(), Value.Const(32))]
+    sr.reduce(&mut instrs6)
+    match &instrs6[0] {
+        Instruction.Assign(_, Value.BinOp(op, _, mask)) => {
+            assert(op == "and")
+            assert(**mask == Value.Const(31))
+        },
+        _ => panic("Expected and"),
+    }
+    print("Mod by pow2 -> and ✓")
+
+    // Power of 0 -> 1
+    let mut instrs7 = vec![Instruction.Pow("r7".to_string(), x.clone(), 0)]
+    sr.reduce(&mut instrs7)
+    match &instrs7[0] {
+        Instruction.Assign(_, Value.Const(1)) => {},
+        _ => panic("Expected 1"),
+    }
+    print("Pow 0 -> 1 ✓")
+
+    // Power helpers
+    assert(StrengthReducer.is_power_of_two(1))
+    assert(StrengthReducer.is_power_of_two(2))
+    assert(StrengthReducer.is_power_of_two(1024))
+    assert(!StrengthReducer.is_power_of_two(3))
+    assert(!StrengthReducer.is_power_of_two(0))
+    assert(StrengthReducer.log2(8) == 3)
+    assert(StrengthReducer.log2(1) == 0)
+    print("Power helpers ✓")
+
+    // Stats
+    assert(sr.stats() >= 7)
+    print("Stats ✓")
+
+    print("Strength Reduction complete ✓")
+}
