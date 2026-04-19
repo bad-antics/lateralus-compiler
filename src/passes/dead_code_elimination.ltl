@@ -1,226 +1,304 @@
-// src/passes/dead_code_elimination.ltl — Remove unreachable and unused code
+// Compiler Pass - Dead Code Elimination
+// Removes unreachable code, unused variables, and unnecessary computations.
+
 use std.collections.{HashMap, HashSet}
 
-type VarId = u32
-type BlockId = u32
-
-enum IRValue {
-    Const(i64),
-    Var(VarId),
-    BinExpr { op: string, lhs: Box<IRValue>, rhs: Box<IRValue> },
-    Call { name: string, args: [IRValue] },
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct Variable {
+    id: usize,
+    name: string,
+    defined_in: string,  // function name
 }
 
-enum IRInst {
-    Assign { dst: VarId, value: IRValue },
-    Store { addr: IRValue, value: IRValue },
-    Branch { cond: IRValue, true_blk: BlockId, false_blk: BlockId },
-    Jump(BlockId),
-    Return(Option<IRValue>),
+#[derive(Clone, Debug)]
+enum Instruction {
+    Assign(usize, Expression),    // var_id, expr
+    Branch(usize, usize, usize),  // cond_var, true_block, false_block
+    Jump(usize),                   // target block
+    Return(Option<usize>),         // optional var_id
+    Call(Option<usize>, string, [usize]), // result, fn_name, args
+    Phi(usize, [(usize, usize)]), // result_var, [(block, var)]
+    Unreachable,
     Nop,
 }
 
+#[derive(Clone, Debug)]
+enum Expression {
+    Constant(i64),
+    VarRef(usize),
+    BinOp(string, usize, usize),
+    UnaryOp(string, usize),
+    FnCall(string, [usize]),
+}
+
+#[derive(Clone, Debug)]
 struct BasicBlock {
-    id:    BlockId,
-    insts: [IRInst],
-    succs: [BlockId],
-    preds: [BlockId],
+    id: usize,
+    instructions: [Instruction],
+    predecessors: [usize],
+    successors: [usize],
 }
 
-struct Function {
-    name:   string,
-    blocks: [BasicBlock],
-}
-
-// ── Collect uses of each variable ────────────────────────────────────────────
-fn collect_uses(value: &IRValue, uses: &mut HashSet<VarId>) {
-    match value {
-        IRValue.Var(v) => { uses.insert(*v); }
-        IRValue.BinExpr { lhs, rhs, .. } => {
-            collect_uses(lhs, uses)
-            collect_uses(rhs, uses)
-        }
-        IRValue.Call { args, .. } => {
-            for arg in args { collect_uses(arg, uses) }
-        }
-        _ => {}
+impl BasicBlock {
+    fn new(id: usize) -> BasicBlock {
+        BasicBlock { id, instructions: [], predecessors: [], successors: [] }
     }
-}
 
-fn collect_inst_uses(inst: &IRInst, uses: &mut HashSet<VarId>) {
-    match inst {
-        IRInst.Assign { value, .. } => collect_uses(value, uses),
-        IRInst.Store { addr, value }  => { collect_uses(addr, uses); collect_uses(value, uses) }
-        IRInst.Branch { cond, .. }    => collect_uses(cond, uses),
-        IRInst.Return(some(v))        => collect_uses(v, uses),
-        _ => {}
+    fn add_instruction(mut self, inst: Instruction) {
+        self.instructions.push(inst)
     }
+
+    fn is_empty(self) -> bool { self.instructions.is_empty() }
+
+    fn instruction_count(self) -> usize { self.instructions.len() }
 }
 
-// ── Dead store elimination ───────────────────────────────────────────────────
-fn has_side_effects(value: &IRValue) -> bool {
-    match value {
-        IRValue.Call { .. } => true,
-        IRValue.BinExpr { lhs, rhs, .. } => has_side_effects(lhs) || has_side_effects(rhs),
-        _ => false,
-    }
+struct DCEPass {
+    blocks: HashMap<usize, BasicBlock>,
+    variables: HashMap<usize, Variable>,
+    entry_block: usize,
+    used_vars: HashSet<usize>,
+    reachable_blocks: HashSet<usize>,
+    eliminated_instructions: usize,
+    eliminated_blocks: usize,
+    eliminated_vars: usize,
 }
 
-fn eliminate_dead_stores(func: &mut Function) -> u32 {
-    let mut removed: u32 = 0
-    let mut changed = true
-
-    while changed {
-        changed = false
-        // Collect all used variables
-        let mut used: HashSet<VarId> = HashSet.new()
-        for block in &func.blocks {
-            for inst in &block.insts {
-                collect_inst_uses(inst, &mut used)
-            }
+impl DCEPass {
+    fn new(entry_block: usize) -> DCEPass {
+        DCEPass {
+            blocks: HashMap.new(),
+            variables: HashMap.new(),
+            entry_block,
+            used_vars: HashSet.new(),
+            reachable_blocks: HashSet.new(),
+            eliminated_instructions: 0,
+            eliminated_blocks: 0,
+            eliminated_vars: 0,
         }
+    }
 
-        // Remove assignments to unused variables (if no side effects)
-        for block in &mut func.blocks {
-            for inst in &mut block.insts {
-                match inst {
-                    IRInst.Assign { dst, value } => {
-                        if !used.contains(dst) && !has_side_effects(value) {
-                            *inst = IRInst.Nop
-                            removed += 1
-                            changed = true
-                        }
+    fn add_block(mut self, block: BasicBlock) {
+        self.blocks.insert(block.id, block)
+    }
+
+    fn add_variable(mut self, var: Variable) {
+        self.variables.insert(var.id, var)
+    }
+
+    fn run(mut self) {
+        self.mark_reachable_blocks()
+        self.mark_used_variables()
+        self.eliminate_dead_code()
+    }
+
+    fn mark_reachable_blocks(mut self) {
+        let mut worklist: [usize] = [self.entry_block]
+        while let some(block_id) = worklist.pop() {
+            if !self.reachable_blocks.insert(block_id) { continue }
+            if let some(block) = self.blocks.get(&block_id) {
+                for &succ in &block.successors {
+                    if !self.reachable_blocks.contains(&succ) {
+                        worklist.push(succ)
                     }
-                    _ => {}
                 }
             }
-            // Remove Nops
-            block.insts.retain(|i| !matches!(i, IRInst.Nop))
         }
     }
-    removed
-}
 
-// ── Unreachable block elimination ────────────────────────────────────────────
-fn find_reachable_blocks(func: &Function) -> HashSet<BlockId> {
-    let mut reachable: HashSet<BlockId> = HashSet.new()
-    let mut worklist: [BlockId] = [0]  // entry block
+    fn mark_used_variables(mut self) {
+        // Mark variables used in reachable blocks
+        let mut worklist: [usize] = []
 
-    while let some(id) = worklist.pop() {
-        if reachable.contains(&id) { continue }
-        reachable.insert(id)
-        if let some(block) = func.blocks.iter().find(|b| b.id == id) {
-            for &succ in &block.succs {
-                worklist.push(succ)
+        // First pass: find all directly used vars (in returns, branches, calls)
+        for &block_id in &self.reachable_blocks {
+            if let some(block) = self.blocks.get(&block_id) {
+                for inst in &block.instructions {
+                    match inst {
+                        Instruction.Return(some(v)) => { worklist.push(*v); },
+                        Instruction.Branch(cond, _, _) => { worklist.push(*cond); },
+                        Instruction.Call(_, _, args) => {
+                            for &arg in args { worklist.push(arg); }
+                        },
+                        _ => {},
+                    }
+                }
+            }
+        }
+
+        // Propagate: mark transitively used vars
+        while let some(var_id) = worklist.pop() {
+            if !self.used_vars.insert(var_id) { continue }
+
+            // Find the definition of this var and mark its operands
+            for &block_id in &self.reachable_blocks {
+                if let some(block) = self.blocks.get(&block_id) {
+                    for inst in &block.instructions {
+                        match inst {
+                            Instruction.Assign(v, expr) if *v == var_id => {
+                                match expr {
+                                    Expression.VarRef(op) => worklist.push(*op),
+                                    Expression.BinOp(_, a, b) => {
+                                        worklist.push(*a);
+                                        worklist.push(*b);
+                                    },
+                                    Expression.UnaryOp(_, op) => worklist.push(*op),
+                                    Expression.FnCall(_, args) => {
+                                        for &arg in args { worklist.push(arg); }
+                                    },
+                                    Expression.Constant(_) => {},
+                                }
+                            },
+                            Instruction.Phi(v, entries) if *v == var_id => {
+                                for &(_, src_var) in entries {
+                                    worklist.push(src_var);
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                }
             }
         }
     }
-    reachable
-}
 
-fn eliminate_unreachable(func: &mut Function) -> u32 {
-    let reachable = find_reachable_blocks(func)
-    let before = func.blocks.len()
-    func.blocks.retain(|b| reachable.contains(&b.id))
-
-    // Update predecessor lists
-    let remaining: HashSet<BlockId> = func.blocks.iter().map(|b| b.id).collect()
-    for block in &mut func.blocks {
-        block.preds.retain(|p| remaining.contains(p))
-        block.succs.retain(|s| remaining.contains(s))
-    }
-
-    (before - func.blocks.len()) as u32
-}
-
-// ── Dead branch elimination ──────────────────────────────────────────────────
-fn eliminate_dead_branches(func: &mut Function) -> u32 {
-    let mut eliminated: u32 = 0
-
-    for block in &mut func.blocks {
-        let last = block.insts.last_mut()
-        if let some(IRInst.Branch { cond: IRValue.Const(val), true_blk, false_blk }) = last {
-            if *val != 0 {
-                let target = *true_blk
-                *last.unwrap() = IRInst.Jump(target)
-                block.succs = [target]
-            } else {
-                let target = *false_blk
-                *last.unwrap() = IRInst.Jump(target)
-                block.succs = [target]
+    fn eliminate_dead_code(mut self) {
+        // Remove unreachable blocks
+        let all_blocks: [usize] = self.blocks.keys().cloned().collect()
+        for block_id in all_blocks {
+            if !self.reachable_blocks.contains(&block_id) {
+                self.blocks.remove(&block_id)
+                self.eliminated_blocks += 1
             }
-            eliminated += 1
+        }
+
+        // Remove dead instructions in reachable blocks
+        for &block_id in &self.reachable_blocks {
+            if let some(block) = self.blocks.get_mut(&block_id) {
+                let mut live: [Instruction] = []
+                for inst in &block.instructions {
+                    let is_dead = match inst {
+                        Instruction.Assign(v, _) => !self.used_vars.contains(v),
+                        Instruction.Phi(v, _) => !self.used_vars.contains(v),
+                        Instruction.Nop => true,
+                        _ => false, // control flow, returns, calls kept
+                    };
+
+                    if is_dead {
+                        self.eliminated_instructions += 1
+                    } else {
+                        live.push(inst.clone())
+                    }
+                }
+                block.instructions = live
+            }
+        }
+
+        // Count eliminated variables
+        for (&var_id, _) in &self.variables {
+            if !self.used_vars.contains(&var_id) {
+                self.eliminated_vars += 1
+            }
         }
     }
-    eliminated
-}
 
-// ── Combined DCE pass ────────────────────────────────────────────────────────
-pub fn run_dce(func: &mut Function) -> DCEStats {
-    let dead_branches = eliminate_dead_branches(func)
-    let unreachable_blocks = eliminate_unreachable(func)
-    let dead_stores = eliminate_dead_stores(func)
+    fn is_reachable(self, block_id: usize) -> bool {
+        self.reachable_blocks.contains(&block_id)
+    }
 
-    DCEStats { dead_stores, unreachable_blocks, dead_branches }
-}
+    fn is_used(self, var_id: usize) -> bool {
+        self.used_vars.contains(&var_id)
+    }
 
-pub struct DCEStats {
-    pub dead_stores: u32,
-    pub unreachable_blocks: u32,
-    pub dead_branches: u32,
-}
-
-impl DCEStats {
-    fn total(self) -> u32 { self.dead_stores + self.unreachable_blocks + self.dead_branches }
+    fn stats(self) -> (usize, usize, usize) {
+        (self.eliminated_blocks, self.eliminated_instructions, self.eliminated_vars)
+    }
 }
 
 fn main() {
-    // Build a function with dead code
-    let mut func = Function {
-        name: "test".to_string(),
-        blocks: [
-            BasicBlock {
-                id: 0,
-                insts: [
-                    IRInst.Assign { dst: 1, value: IRValue.Const(42) },
-                    IRInst.Assign { dst: 2, value: IRValue.Const(10) },  // dead: v2 unused
-                    IRInst.Assign { dst: 3, value: IRValue.BinExpr {
-                        op: "add".to_string(),
-                        lhs: Box.new(IRValue.Var(1)),
-                        rhs: Box.new(IRValue.Const(8)),
-                    }},
-                    IRInst.Branch { cond: IRValue.Const(1), true_blk: 1, false_blk: 2 },
-                ],
-                succs: [1, 2], preds: [],
-            },
-            BasicBlock {
-                id: 1,
-                insts: [
-                    IRInst.Return(some(IRValue.Var(3))),
-                ],
-                succs: [], preds: [0],
-            },
-            BasicBlock {
-                id: 2,  // unreachable after branch folding
-                insts: [
-                    IRInst.Return(some(IRValue.Const(0))),
-                ],
-                succs: [], preds: [0],
-            },
-        ],
-    }
+    let mut pass = DCEPass.new(0)
 
-    let stats = run_dce(&mut func)
-    print("DCE results:")
-    print("  Dead stores removed:      ${stats.dead_stores}")
-    print("  Unreachable blocks removed: ${stats.unreachable_blocks}")
-    print("  Dead branches eliminated:  ${stats.dead_branches}")
-    print("  Total: ${stats.total()}")
+    // Variables
+    pass.add_variable(Variable { id: 0, name: "x".to_string(), defined_in: "main".to_string() })
+    pass.add_variable(Variable { id: 1, name: "y".to_string(), defined_in: "main".to_string() })
+    pass.add_variable(Variable { id: 2, name: "z".to_string(), defined_in: "main".to_string() })
+    pass.add_variable(Variable { id: 3, name: "unused".to_string(), defined_in: "main".to_string() })
+    pass.add_variable(Variable { id: 4, name: "dead".to_string(), defined_in: "main".to_string() })
 
-    assert(stats.dead_stores >= 1, "v2 should be eliminated")
-    assert(stats.dead_branches >= 1, "constant branch should be folded")
-    assert(stats.unreachable_blocks >= 1, "block 2 should be removed")
-    assert(func.blocks.len() == 2, "should have 2 blocks left")
+    // Block 0 (entry): x = 10; y = x + 1; unused = 42; branch(y > 0, block1, block2)
+    let mut b0 = BasicBlock.new(0)
+    b0.successors = [1, 2]
+    b0.add_instruction(Instruction.Assign(0, Expression.Constant(10)))
+    b0.add_instruction(Instruction.Assign(1, Expression.BinOp("+".to_string(), 0, 0))) // y = x + x
+    b0.add_instruction(Instruction.Assign(3, Expression.Constant(42))) // unused
+    b0.add_instruction(Instruction.Branch(1, 1, 2))
+    pass.add_block(b0)
 
-    print("Dead code elimination — all passed ✓")
+    // Block 1: z = y * 2; return z
+    let mut b1 = BasicBlock.new(1)
+    b1.predecessors = [0]
+    b1.successors = []
+    b1.add_instruction(Instruction.Assign(2, Expression.BinOp("*".to_string(), 1, 1)))
+    b1.add_instruction(Instruction.Return(some(2)))
+    pass.add_block(b1)
+
+    // Block 2: return y
+    let mut b2 = BasicBlock.new(2)
+    b2.predecessors = [0]
+    b2.successors = []
+    b2.add_instruction(Instruction.Return(some(1)))
+    pass.add_block(b2)
+
+    // Block 3: unreachable (no predecessor connecting to it)
+    let mut b3 = BasicBlock.new(3)
+    b3.add_instruction(Instruction.Assign(4, Expression.Constant(999)))
+    b3.add_instruction(Instruction.Return(some(4)))
+    pass.add_block(b3)
+
+    pass.run()
+
+    // Check reachability
+    assert(pass.is_reachable(0))
+    assert(pass.is_reachable(1))
+    assert(pass.is_reachable(2))
+    assert(!pass.is_reachable(3))
+    print("Reachability ✓")
+
+    // Check used variables
+    assert(pass.is_used(0)) // x used by y
+    assert(pass.is_used(1)) // y used by branch and return
+    assert(pass.is_used(2)) // z used by return in block 1
+    assert(!pass.is_used(3)) // unused not used
+    assert(!pass.is_used(4)) // dead in unreachable block
+    print("Used variables ✓")
+
+    // Check stats
+    let (elim_blocks, elim_insts, elim_vars) = pass.stats()
+    assert(elim_blocks == 1) // block 3
+    assert(elim_insts >= 1)  // unused = 42
+    assert(elim_vars >= 1)   // unused, dead
+    print("Elimination stats ✓")
+
+    // BasicBlock
+    let mut bb = BasicBlock.new(99)
+    assert(bb.is_empty())
+    bb.add_instruction(Instruction.Nop)
+    assert(bb.instruction_count() == 1)
+    print("BasicBlock ✓")
+
+    // Expression variants
+    let _e1 = Expression.Constant(0)
+    let _e2 = Expression.VarRef(0)
+    let _e3 = Expression.BinOp("+".to_string(), 0, 1)
+    let _e4 = Expression.UnaryOp("-".to_string(), 0)
+    let _e5 = Expression.FnCall("f".to_string(), [0, 1])
+    print("Expression variants ✓")
+
+    // Instruction variants
+    let _i1 = Instruction.Jump(0)
+    let _i2 = Instruction.Unreachable
+    let _i3 = Instruction.Phi(0, [(1, 2), (3, 4)])
+    print("Instruction variants ✓")
+
+    print("Dead Code Elimination complete ✓")
 }
