@@ -1,0 +1,268 @@
+// Compiler Pass - Auto-Vectorization
+// Transforms scalar loops into SIMD vector operations.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Debug)]
+enum ScalarOp {
+    Load(string, string, string),   // dest, base_ptr, index
+    Store(string, string, string),  // value, base_ptr, index
+    Add(string, string, string),    // dest, lhs, rhs
+    Sub(string, string, string),
+    Mul(string, string, string),
+    Div(string, string, string),
+    FAdd(string, string, string),
+    FSub(string, string, string),
+    FMul(string, string, string),
+    FDiv(string, string, string),
+    Cmp(string, string, string, CmpOp),
+    Phi(string, string, string),    // dest, if_val, else_val
+    Const(string, i64),
+    FConst(string, f64),
+    IndVar(string),                 // induction variable
+}
+
+#[derive(Clone, Debug)]
+enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge }
+
+#[derive(Clone, Debug)]
+enum VectorOp {
+    VLoad(string, string, usize),      // dest, base, width
+    VStore(string, string, usize),     // src, base, width
+    VAdd(string, string, string, usize),
+    VSub(string, string, string, usize),
+    VMul(string, string, string, usize),
+    VDiv(string, string, string, usize),
+    VSplat(string, string, usize),     // dest, scalar, width
+    VReduce(string, string, ReduceOp, usize),  // dest, vec, op, width
+}
+
+#[derive(Clone, Debug)]
+enum ReduceOp { Sum, Product, Min, Max }
+
+struct Loop {
+    header: usize,
+    body: [usize],
+    exit: usize,
+    induction_var: string,
+    start: i64,
+    end_expr: string,
+    step: i64,
+    ops: [ScalarOp],
+}
+
+struct VectorizationResult {
+    vector_width: usize,
+    prologue_ops: [ScalarOp],    // handle misalignment
+    vector_ops: [VectorOp],      // main vectorized body
+    epilogue_ops: [ScalarOp],    // handle remainder
+    speedup_estimate: f64,
+}
+
+struct Vectorizer {
+    target_width: usize,  // e.g., 4 for SSE, 8 for AVX
+    vectorized_count: usize,
+    skipped_count: usize,
+}
+
+impl Vectorizer {
+    fn new(target_width: usize) -> Vectorizer {
+        Vectorizer { target_width, vectorized_count: 0, skipped_count: 0 }
+    }
+
+    fn analyze_loop(self, loop_info: &Loop) -> bool {
+        // Check: no dependencies between iterations
+        if self.has_loop_carried_dependency(loop_info) { return false }
+        // Check: all ops are vectorizable
+        if !loop_info.ops.iter().all(|op| self.is_vectorizable(op)) { return false }
+        // Check: trip count is known or can be computed
+        if loop_info.step == 0 { return false }
+        true
+    }
+
+    fn has_loop_carried_dependency(self, loop_info: &Loop) -> bool {
+        let mut defs: HashSet<string> = HashSet.new()
+        let mut uses_before_def: HashSet<string> = HashSet.new()
+
+        for op in &loop_info.ops {
+            let (def, uses) = self.get_def_use(op)
+            for u in &uses {
+                if defs.contains(u) && u != &loop_info.induction_var {
+                    // Check if it's a reduction (allowed)
+                    if !self.is_reduction(op, u) {
+                        return true  // real dependency
+                    }
+                }
+            }
+            if let some(d) = def { defs.insert(d); }
+        }
+        false
+    }
+
+    fn is_vectorizable(self, op: &ScalarOp) -> bool {
+        match op {
+            ScalarOp.Load(_, _, _) | ScalarOp.Store(_, _, _) |
+            ScalarOp.Add(_, _, _) | ScalarOp.Sub(_, _, _) |
+            ScalarOp.Mul(_, _, _) | ScalarOp.FAdd(_, _, _) |
+            ScalarOp.FSub(_, _, _) | ScalarOp.FMul(_, _, _) |
+            ScalarOp.Const(_, _) | ScalarOp.FConst(_, _) |
+            ScalarOp.IndVar(_) => true,
+            ScalarOp.Div(_, _, _) | ScalarOp.FDiv(_, _, _) => true,
+            ScalarOp.Cmp(_, _, _, _) => true,
+            ScalarOp.Phi(_, _, _) => true,
+        }
+    }
+
+    fn is_reduction(self, op: &ScalarOp, var: &str) -> bool {
+        match op {
+            ScalarOp.Add(dest, lhs, rhs) | ScalarOp.FAdd(dest, lhs, rhs) =>
+                (dest == var) && (lhs == var || rhs == var),
+            ScalarOp.Mul(dest, lhs, rhs) | ScalarOp.FMul(dest, lhs, rhs) =>
+                (dest == var) && (lhs == var || rhs == var),
+            _ => false,
+        }
+    }
+
+    fn vectorize(mut self, loop_info: &Loop) -> Option<VectorizationResult> {
+        if !self.analyze_loop(loop_info) {
+            self.skipped_count += 1
+            return none
+        }
+
+        let width = self.target_width
+        let mut vector_ops: [VectorOp] = []
+
+        for op in &loop_info.ops {
+            match op {
+                ScalarOp.Load(dest, base, _idx) => {
+                    vector_ops.push(VectorOp.VLoad(format!("v_{}", dest), base.clone(), width))
+                },
+                ScalarOp.Store(val, base, _idx) => {
+                    vector_ops.push(VectorOp.VStore(format!("v_{}", val), base.clone(), width))
+                },
+                ScalarOp.Add(dest, lhs, rhs) | ScalarOp.FAdd(dest, lhs, rhs) => {
+                    vector_ops.push(VectorOp.VAdd(
+                        format!("v_{}", dest), format!("v_{}", lhs), format!("v_{}", rhs), width))
+                },
+                ScalarOp.Sub(dest, lhs, rhs) | ScalarOp.FSub(dest, lhs, rhs) => {
+                    vector_ops.push(VectorOp.VSub(
+                        format!("v_{}", dest), format!("v_{}", lhs), format!("v_{}", rhs), width))
+                },
+                ScalarOp.Mul(dest, lhs, rhs) | ScalarOp.FMul(dest, lhs, rhs) => {
+                    vector_ops.push(VectorOp.VMul(
+                        format!("v_{}", dest), format!("v_{}", lhs), format!("v_{}", rhs), width))
+                },
+                ScalarOp.Const(dest, val) => {
+                    vector_ops.push(VectorOp.VSplat(format!("v_{}", dest), dest.clone(), width))
+                },
+                _ => {},
+            }
+        }
+
+        self.vectorized_count += 1
+        some(VectorizationResult {
+            vector_width: width,
+            prologue_ops: [],
+            vector_ops,
+            epilogue_ops: loop_info.ops.clone(),  // fallback scalar
+            speedup_estimate: width as f64 * 0.8,  // accounting for overhead
+        })
+    }
+
+    fn get_def_use(self, op: &ScalarOp) -> (Option<string>, [string]) {
+        match op {
+            ScalarOp.Add(d, l, r) | ScalarOp.Sub(d, l, r) |
+            ScalarOp.Mul(d, l, r) | ScalarOp.Div(d, l, r) |
+            ScalarOp.FAdd(d, l, r) | ScalarOp.FSub(d, l, r) |
+            ScalarOp.FMul(d, l, r) | ScalarOp.FDiv(d, l, r) =>
+                (some(d.clone()), vec![l.clone(), r.clone()]),
+            ScalarOp.Load(d, b, i) => (some(d.clone()), vec![b.clone(), i.clone()]),
+            ScalarOp.Store(v, b, i) => (none, vec![v.clone(), b.clone(), i.clone()]),
+            ScalarOp.Const(d, _) | ScalarOp.FConst(d, _) => (some(d.clone()), []),
+            ScalarOp.IndVar(v) => (some(v.clone()), []),
+            ScalarOp.Cmp(d, l, r, _) => (some(d.clone()), vec![l.clone(), r.clone()]),
+            ScalarOp.Phi(d, a, b) => (some(d.clone()), vec![a.clone(), b.clone()]),
+        }
+    }
+
+    fn stats(self) -> (usize, usize) {
+        (self.vectorized_count, self.skipped_count)
+    }
+}
+
+fn main() {
+    // Simple vectorizable loop: for i in 0..n { c[i] = a[i] + b[i] }
+    let simple_loop = Loop {
+        header: 0, body: [1], exit: 2,
+        induction_var: "i".to_string(),
+        start: 0, end_expr: "n".to_string(), step: 1,
+        ops: vec![
+            ScalarOp.IndVar("i".to_string()),
+            ScalarOp.Load("a_i".to_string(), "a".to_string(), "i".to_string()),
+            ScalarOp.Load("b_i".to_string(), "b".to_string(), "i".to_string()),
+            ScalarOp.FAdd("c_i".to_string(), "a_i".to_string(), "b_i".to_string()),
+            ScalarOp.Store("c_i".to_string(), "c".to_string(), "i".to_string()),
+        ],
+    }
+
+    let mut vectorizer = Vectorizer.new(4)
+
+    // Analysis
+    assert(vectorizer.analyze_loop(&simple_loop))
+    print("Analyze vectorizable ✓")
+
+    // Vectorize
+    let result = vectorizer.vectorize(&simple_loop).unwrap()
+    assert(result.vector_width == 4)
+    assert(result.vector_ops.len() > 0)
+    assert(result.speedup_estimate > 1.0)
+    print("Vectorize ✓")
+
+    // Check generated vector ops
+    let has_vload = result.vector_ops.iter().any(|op| match op {
+        VectorOp.VLoad(_, _, _) => true, _ => false
+    })
+    assert(has_vload)
+    print("VLoad generated ✓")
+
+    let has_vadd = result.vector_ops.iter().any(|op| match op {
+        VectorOp.VAdd(_, _, _, w) => *w == 4, _ => false
+    })
+    assert(has_vadd)
+    print("VAdd generated ✓")
+
+    // Stats
+    let (v, s) = vectorizer.stats()
+    assert(v == 1)
+    assert(s == 0)
+    print("Stats ✓")
+
+    // Non-vectorizable (step=0)
+    let bad_loop = Loop {
+        header: 0, body: [1], exit: 2,
+        induction_var: "i".to_string(),
+        start: 0, end_expr: "n".to_string(), step: 0,
+        ops: [],
+    }
+    assert(!vectorizer.analyze_loop(&bad_loop))
+    print("Reject bad loop ✓")
+
+    // is_vectorizable
+    assert(vectorizer.is_vectorizable(&ScalarOp.FAdd("a".to_string(), "b".to_string(), "c".to_string())))
+    assert(vectorizer.is_vectorizable(&ScalarOp.Load("a".to_string(), "b".to_string(), "i".to_string())))
+    print("Op vectorizable ✓")
+
+    // Reduction detection
+    let add_op = ScalarOp.FAdd("sum".to_string(), "sum".to_string(), "x".to_string())
+    assert(vectorizer.is_reduction(&add_op, "sum"))
+    assert(!vectorizer.is_reduction(&add_op, "x"))
+    print("Reduction detection ✓")
+
+    // AVX width
+    let mut avx = Vectorizer.new(8)
+    let result2 = avx.vectorize(&simple_loop).unwrap()
+    assert(result2.vector_width == 8)
+    print("AVX width ✓")
+
+    print("Vectorization complete ✓")
+}
