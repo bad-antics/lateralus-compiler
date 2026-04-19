@@ -1,0 +1,385 @@
+// Compiler Pass — IR Printer / Pretty Printer
+// Serializes intermediate representation for debugging and visualization.
+
+use std.collections.HashMap
+use std.io.Write
+
+// ── IR Types (matching compiler IR) ──────────────────────────────────────────
+enum IrType {
+    Void,
+    Bool,
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F32, F64,
+    Ptr(Box<IrType>),
+    Array(Box<IrType>, usize),
+    Struct(string, [IrType]),
+    Function([IrType], Box<IrType>),
+    Generic(string),
+}
+
+impl IrType {
+    fn fmt(self) -> string {
+        match self {
+            IrType.Void => "void".to_string(),
+            IrType.Bool => "bool".to_string(),
+            IrType.I8 => "i8".to_string(),
+            IrType.I16 => "i16".to_string(),
+            IrType.I32 => "i32".to_string(),
+            IrType.I64 => "i64".to_string(),
+            IrType.U8 => "u8".to_string(),
+            IrType.U16 => "u16".to_string(),
+            IrType.U32 => "u32".to_string(),
+            IrType.U64 => "u64".to_string(),
+            IrType.F32 => "f32".to_string(),
+            IrType.F64 => "f64".to_string(),
+            IrType.Ptr(inner) => format!("*{}", inner.fmt()),
+            IrType.Array(elem, size) => format!("[{}; {}]", elem.fmt(), size),
+            IrType.Struct(name, _) => name.clone(),
+            IrType.Function(params, ret) => {
+                let ps = params.iter().map(|p| p.fmt()).collect::<[string]>().join(", ")
+                format!("fn({ps}) -> {}", ret.fmt())
+            }
+            IrType.Generic(name) => name.clone(),
+        }
+    }
+}
+
+// ── IR Values ────────────────────────────────────────────────────────────────
+struct IrValue {
+    id: u32,
+    ty: IrType,
+    name: Option<string>,
+}
+
+impl IrValue {
+    fn display(self) -> string {
+        match &self.name {
+            some(n) => format!("%{n}"), 
+            none => format!("%{}", self.id),
+        }
+    }
+}
+
+// ── IR Instructions ──────────────────────────────────────────────────────────
+enum IrInst {
+    // Arithmetic
+    Add(u32, u32, u32),    // dest, lhs, rhs
+    Sub(u32, u32, u32),
+    Mul(u32, u32, u32),
+    Div(u32, u32, u32),
+    Rem(u32, u32, u32),
+    Neg(u32, u32),
+
+    // Bitwise
+    And(u32, u32, u32),
+    Or(u32, u32, u32),
+    Xor(u32, u32, u32),
+    Shl(u32, u32, u32),
+    Shr(u32, u32, u32),
+
+    // Comparison
+    Eq(u32, u32, u32),
+    Ne(u32, u32, u32),
+    Lt(u32, u32, u32),
+    Le(u32, u32, u32),
+    Gt(u32, u32, u32),
+    Ge(u32, u32, u32),
+
+    // Memory
+    Alloca(u32, IrType),
+    Load(u32, u32),
+    Store(u32, u32),       // value, ptr
+    GetElementPtr(u32, u32, [u32]),
+
+    // Constants
+    ConstInt(u32, i64),
+    ConstFloat(u32, f64),
+    ConstBool(u32, bool),
+    ConstStr(u32, string),
+    ConstNull(u32, IrType),
+
+    // Control flow
+    Call(u32, string, [u32]),
+    IndirectCall(u32, u32, [u32]),
+    Ret(Option<u32>),
+    Br(string),              // unconditional branch
+    CondBr(u32, string, string),
+    Switch(u32, string, [(i64, string)]),
+
+    // Type conversion
+    Trunc(u32, u32, IrType),
+    ZExt(u32, u32, IrType),
+    SExt(u32, u32, IrType),
+    FpToInt(u32, u32, IrType),
+    IntToFp(u32, u32, IrType),
+    Bitcast(u32, u32, IrType),
+
+    // Aggregate
+    ExtractValue(u32, u32, usize),
+    InsertValue(u32, u32, u32, usize),
+
+    // SSA
+    Phi(u32, [(u32, string)]),
+
+    // Debug
+    Comment(string),
+}
+
+// ── Basic Block ──────────────────────────────────────────────────────────────
+struct BasicBlock {
+    label: string,
+    instructions: [IrInst],
+    predecessors: [string],
+    successors: [string],
+}
+
+// ── Function ─────────────────────────────────────────────────────────────────
+struct IrFunction {
+    name: string,
+    params: [(string, IrType)],
+    return_type: IrType,
+    blocks: [BasicBlock],
+    locals: HashMap<u32, IrType>,
+    is_extern: bool,
+    attributes: [string],
+}
+
+// ── Module ───────────────────────────────────────────────────────────────────
+struct IrModule {
+    name: string,
+    functions: [IrFunction],
+    globals: [(string, IrType, Option<string>)],
+    type_defs: [(string, IrType)],
+    extern_decls: [(string, [IrType], IrType)],
+}
+
+// ── Pretty Printer ───────────────────────────────────────────────────────────
+struct IrPrinter {
+    indent: usize,
+    use_color: bool,
+    show_types: bool,
+    show_block_params: bool,
+    values: HashMap<u32, string>,
+}
+
+impl IrPrinter {
+    fn new() -> IrPrinter {
+        IrPrinter { indent: 0, use_color: false, show_types: true, show_block_params: true, values: HashMap.new() }
+    }
+
+    fn with_color(mut self) -> IrPrinter { self.use_color = true; self }
+
+    fn indent_str(self) -> string { "  ".repeat(self.indent) }
+
+    fn val(self, id: u32) -> string {
+        self.values.get(&id).cloned().unwrap_or_else(|| format!("%{id}"))
+    }
+
+    fn color(self, text: &str, code: &str) -> string {
+        if self.use_color { format!("\x1b[{code}m{text}\x1b[0m") }
+        else { text.to_string() }
+    }
+
+    fn print_type(self, ty: &IrType) -> string {
+        if self.show_types { ty.fmt() } else { string.new() }
+    }
+
+    fn print_inst(self, inst: &IrInst) -> string {
+        let ind = self.indent_str()
+        match inst {
+            IrInst.Add(d, l, r) => format!("{ind}{} = add {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Sub(d, l, r) => format!("{ind}{} = sub {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Mul(d, l, r) => format!("{ind}{} = mul {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Div(d, l, r) => format!("{ind}{} = div {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Rem(d, l, r) => format!("{ind}{} = rem {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Neg(d, v) => format!("{ind}{} = neg {}", self.val(*d), self.val(*v)),
+
+            IrInst.And(d, l, r) => format!("{ind}{} = and {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Or(d, l, r) => format!("{ind}{} = or {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Xor(d, l, r) => format!("{ind}{} = xor {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Shl(d, l, r) => format!("{ind}{} = shl {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Shr(d, l, r) => format!("{ind}{} = shr {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+
+            IrInst.Eq(d, l, r) => format!("{ind}{} = eq {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Ne(d, l, r) => format!("{ind}{} = ne {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Lt(d, l, r) => format!("{ind}{} = lt {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Le(d, l, r) => format!("{ind}{} = le {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Gt(d, l, r) => format!("{ind}{} = gt {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+            IrInst.Ge(d, l, r) => format!("{ind}{} = ge {}, {}", self.val(*d), self.val(*l), self.val(*r)),
+
+            IrInst.Alloca(d, ty) => format!("{ind}{} = alloca {}", self.val(*d), ty.fmt()),
+            IrInst.Load(d, ptr) => format!("{ind}{} = load {}", self.val(*d), self.val(*ptr)),
+            IrInst.Store(v, ptr) => format!("{ind}store {}, {}", self.val(*v), self.val(*ptr)),
+            IrInst.GetElementPtr(d, base, indices) => {
+                let idx_str = indices.iter().map(|i| self.val(*i)).collect::<[string]>().join(", ")
+                format!("{ind}{} = gep {}, [{}]", self.val(*d), self.val(*base), idx_str)
+            }
+
+            IrInst.ConstInt(d, v) => format!("{ind}{} = const.i64 {v}", self.val(*d)),
+            IrInst.ConstFloat(d, v) => format!("{ind}{} = const.f64 {v}", self.val(*d)),
+            IrInst.ConstBool(d, v) => format!("{ind}{} = const.bool {v}", self.val(*d)),
+            IrInst.ConstStr(d, s) => format!("{ind}{} = const.str \"{s}\"", self.val(*d)),
+            IrInst.ConstNull(d, ty) => format!("{ind}{} = const.null {}", self.val(*d), ty.fmt()),
+
+            IrInst.Call(d, name, args) => {
+                let arg_str = args.iter().map(|a| self.val(*a)).collect::<[string]>().join(", ")
+                format!("{ind}{} = call @{name}({arg_str})", self.val(*d))
+            }
+            IrInst.IndirectCall(d, fn_ptr, args) => {
+                let arg_str = args.iter().map(|a| self.val(*a)).collect::<[string]>().join(", ")
+                format!("{ind}{} = call_indirect {}({arg_str})", self.val(*d), self.val(*fn_ptr))
+            }
+            IrInst.Ret(v) => match v {
+                some(val) => format!("{ind}ret {}", self.val(*val)),
+                none => format!("{ind}ret void"),
+            },
+            IrInst.Br(label) => format!("{ind}br @{label}"),
+            IrInst.CondBr(cond, t, f) => format!("{ind}br {}, @{t}, @{f}", self.val(*cond)),
+            IrInst.Switch(val, default, cases) => {
+                let cases_str = cases.iter().map(|(v, l)| format!("{v} => @{l}")).collect::<[string]>().join(", ")
+                format!("{ind}switch {}, default @{default}, [{cases_str}]", self.val(*val))
+            }
+
+            IrInst.Trunc(d, v, ty) => format!("{ind}{} = trunc {} to {}", self.val(*d), self.val(*v), ty.fmt()),
+            IrInst.ZExt(d, v, ty) => format!("{ind}{} = zext {} to {}", self.val(*d), self.val(*v), ty.fmt()),
+            IrInst.SExt(d, v, ty) => format!("{ind}{} = sext {} to {}", self.val(*d), self.val(*v), ty.fmt()),
+            IrInst.FpToInt(d, v, ty) => format!("{ind}{} = fptoint {} to {}", self.val(*d), self.val(*v), ty.fmt()),
+            IrInst.IntToFp(d, v, ty) => format!("{ind}{} = inttofp {} to {}", self.val(*d), self.val(*v), ty.fmt()),
+            IrInst.Bitcast(d, v, ty) => format!("{ind}{} = bitcast {} to {}", self.val(*d), self.val(*v), ty.fmt()),
+
+            IrInst.ExtractValue(d, agg, idx) => format!("{ind}{} = extractvalue {}, {idx}", self.val(*d), self.val(*agg)),
+            IrInst.InsertValue(d, agg, val, idx) => format!("{ind}{} = insertvalue {}, {}, {idx}", self.val(*d), self.val(*agg), self.val(*val)),
+
+            IrInst.Phi(d, incoming) => {
+                let pairs = incoming.iter().map(|(v, l)| format!("[@{l}: {}]", self.val(*v))).collect::<[string]>().join(", ")
+                format!("{ind}{} = phi {pairs}", self.val(*d))
+            }
+            IrInst.Comment(text) => format!("{ind}; {text}"),
+        }
+    }
+
+    fn print_block(mut self, block: &BasicBlock) -> string {
+        let mut lines: [string] = []
+        let label = self.color(&block.label, "1;33")
+        lines.push(format!("{}:", label))
+        self.indent += 1
+        for inst in &block.instructions {
+            lines.push(self.print_inst(inst))
+        }
+        self.indent -= 1
+        lines.join("\n")
+    }
+
+    fn print_function(mut self, func: &IrFunction) -> string {
+        let mut lines: [string] = []
+        let attrs = if func.attributes.is_empty() { string.new() }
+        else { format!(" #{}", func.attributes.join(" #")) }
+
+        let params = func.params.iter().map(|(name, ty)| format!("%{name}: {}", ty.fmt())).collect::<[string]>().join(", ")
+        let keyword = if func.is_extern { "declare" } else { "define" }
+        lines.push(format!("{keyword} @{}({params}) -> {}{attrs} {{", func.name, func.return_type.fmt()))
+
+        for block in &func.blocks { lines.push(self.print_block(block)) }
+        lines.push("}".to_string())
+        lines.join("\n")
+    }
+
+    fn print_module(mut self, module: &IrModule) -> string {
+        let mut lines: [string] = []
+        lines.push(format!("; module: {}", module.name))
+        lines.push(string.new())
+
+        if !module.type_defs.is_empty() {
+            lines.push("; type definitions".to_string())
+            for (name, ty) in &module.type_defs { lines.push(format!("type @{name} = {}", ty.fmt())) }
+            lines.push(string.new())
+        }
+
+        if !module.globals.is_empty() {
+            lines.push("; globals".to_string())
+            for (name, ty, init) in &module.globals {
+                let init_str = init.as_ref().map(|v| format!(" = {v}")).unwrap_or_default()
+                lines.push(format!("global @{name}: {}{init_str}", ty.fmt()))
+            }
+            lines.push(string.new())
+        }
+
+        for func in &module.functions {
+            lines.push(self.print_function(func))
+            lines.push(string.new())
+        }
+
+        lines.join("\n")
+    }
+}
+
+fn main() {
+    let printer = IrPrinter.new()
+
+    // Test type formatting
+    assert(IrType.I32.fmt() == "i32")
+    assert(IrType.Ptr(box IrType.I8).fmt() == "*i8")
+    assert(IrType.Array(box IrType.F64, 4).fmt() == "[f64; 4]")
+    print("Type formatting ✓")
+
+    // Test instruction printing
+    let inst = IrInst.Add(3, 1, 2)
+    let output = printer.print_inst(&inst)
+    assert(output.contains("add"))
+    print("Instruction printing ✓")
+
+    let inst = IrInst.Call(5, "puts".to_string(), [4])
+    let output = printer.print_inst(&inst)
+    assert(output.contains("call @puts"))
+    print("Call instruction ✓")
+
+    let inst = IrInst.Phi(7, [(5, "then".to_string()), (6, "else".to_string())])
+    let output = printer.print_inst(&inst)
+    assert(output.contains("phi"))
+    assert(output.contains("@then"))
+    print("Phi instruction ✓")
+
+    // Test block printing
+    let block = BasicBlock {
+        label: "entry".to_string(),
+        instructions: [
+            IrInst.ConstInt(1, 10),
+            IrInst.ConstInt(2, 20),
+            IrInst.Add(3, 1, 2),
+            IrInst.Ret(some(3)),
+        ],
+        predecessors: [],
+        successors: [],
+    }
+    let output = printer.print_block(&block)
+    assert(output.contains("entry:"))
+    assert(output.contains("const.i64 10"))
+    assert(output.contains("ret %3"))
+    print("Block printing ✓")
+
+    // Test full module
+    let module = IrModule {
+        name: "test".to_string(),
+        functions: [IrFunction {
+            name: "add".to_string(),
+            params: [("a".to_string(), IrType.I32), ("b".to_string(), IrType.I32)],
+            return_type: IrType.I32,
+            blocks: [block],
+            locals: HashMap.new(),
+            is_extern: false,
+            attributes: ["inline".to_string()],
+        }],
+        globals: [("counter".to_string(), IrType.I32, some("0".to_string()))],
+        type_defs: [("Point".to_string(), IrType.Struct("Point".to_string(), [IrType.F64, IrType.F64]))],
+        extern_decls: [],
+    }
+    let output = printer.print_module(&module)
+    assert(output.contains("; module: test"))
+    assert(output.contains("define @add"))
+    assert(output.contains("global @counter"))
+    assert(output.contains("type @Point"))
+    print("Module printing ✓")
+
+    print("IR Printer complete ✓")
+}
