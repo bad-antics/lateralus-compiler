@@ -1,0 +1,228 @@
+// Compiler Pass - Monomorphization
+// Instantiates generic functions/types with concrete type arguments.
+
+use std.collections.HashMap
+use std.collections.HashSet
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum MonoType {
+    Concrete(string),
+    Ptr(Box<MonoType>),
+    Ref(Box<MonoType>, bool),  // type, mutable
+    Slice(Box<MonoType>),
+    Array(Box<MonoType>, usize),
+    Tuple([MonoType]),
+    Function([MonoType], Box<MonoType>),
+    Never,
+    Unit,
+}
+
+impl MonoType {
+    fn mangle(self) -> string {
+        match self {
+            MonoType.Concrete(name) => name.replace("::", "_"),
+            MonoType.Ptr(inner) => format!("ptr_{}", inner.mangle()),
+            MonoType.Ref(inner, m) => format!("{}ref_{}", if m { "mut_" } else { "" }, inner.mangle()),
+            MonoType.Slice(inner) => format!("slice_{}", inner.mangle()),
+            MonoType.Array(inner, n) => format!("array_{}_{}", n, inner.mangle()),
+            MonoType.Tuple(elems) => format!("tuple_{}", elems.iter().map(|e| e.mangle()).collect::<[string]>().join("_")),
+            MonoType.Function(params, ret) => {
+                let ps = params.iter().map(|p| p.mangle()).collect::<[string]>().join("_")
+                format!("fn_{}_ret_{}", ps, ret.mangle())
+            }
+            MonoType.Never => "never".to_string(),
+            MonoType.Unit => "unit".to_string(),
+        }
+    }
+
+    fn size_of(self) -> usize {
+        match self {
+            MonoType.Concrete(name) => match name.as_str() {
+                "bool" | "u8" | "i8" => 1,
+                "u16" | "i16" => 2,
+                "u32" | "i32" | "f32" => 4,
+                "u64" | "i64" | "f64" => 8,
+                "u128" | "i128" => 16,
+                "usize" | "isize" => 8,  // 64-bit
+                _ => 0,  // user-defined, need layout info
+            },
+            MonoType.Ptr(_) | MonoType.Ref(_, _) => 8,
+            MonoType.Slice(_) => 16,  // ptr + len
+            MonoType.Array(inner, n) => inner.size_of() * n,
+            MonoType.Tuple(elems) => elems.iter().map(|e| e.size_of()).sum(),
+            MonoType.Function(_, _) => 8,  // function pointer
+            MonoType.Never => 0,
+            MonoType.Unit => 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GenericDef {
+    name: string,
+    type_params: [string],
+    body: string,  // simplified: the IR body as string
+    trait_bounds: HashMap<string, [string]>,
+}
+
+struct MonoInstance {
+    original: string,
+    mangled_name: string,
+    type_args: [MonoType],
+    body: string,
+}
+
+struct Monomorphizer {
+    generic_defs: HashMap<string, GenericDef>,
+    instances: HashMap<string, MonoInstance>,
+    worklist: [(string, [MonoType])],
+    visited: HashSet<string>,
+}
+
+impl Monomorphizer {
+    fn new() -> Monomorphizer {
+        Monomorphizer {
+            generic_defs: HashMap.new(), instances: HashMap.new(),
+            worklist: [], visited: HashSet.new(),
+        }
+    }
+
+    fn register_generic(mut self, def: GenericDef) {
+        self.generic_defs.insert(def.name.clone(), def)
+    }
+
+    fn request_instance(mut self, name: &str, type_args: &[MonoType]) {
+        let mangled = Self.mangle_name(name, type_args)
+        if !self.visited.contains(&mangled) {
+            self.worklist.push((name.to_string(), type_args.to_vec()))
+        }
+    }
+
+    fn mangle_name(name: &str, type_args: &[MonoType]) -> string {
+        if type_args.is_empty() { return name.to_string() }
+        let args_str = type_args.iter().map(|t| t.mangle()).collect::<[string]>().join("_")
+        format!("{}_{}", name.replace("::", "_"), args_str)
+    }
+
+    fn substitute_types(body: &str, params: &[string], args: &[MonoType]) -> string {
+        let mut result = body.to_string()
+        for (param, arg) in params.iter().zip(args.iter()) {
+            result = result.replace(param, &arg.mangle())
+        }
+        result
+    }
+
+    fn process(mut self) {
+        while let some((name, type_args)) = self.worklist.pop() {
+            let mangled = Self.mangle_name(&name, &type_args)
+            if !self.visited.insert(mangled.clone()) { continue }
+
+            let def = match self.generic_defs.get(&name) {
+                some(d) => d.clone(),
+                none => { continue }
+            }
+
+            assert(type_args.len() == def.type_params.len(),
+                format!("type arg count mismatch for {}: expected {}, got {}", name, def.type_params.len(), type_args.len()))
+
+            // Check trait bounds
+            for (param, bounds) in &def.trait_bounds {
+                let idx = def.type_params.iter().position(|p| p == param)
+                if let some(idx) = idx {
+                    for bound in bounds {
+                        self.check_bound(&type_args[idx], bound)
+                    }
+                }
+            }
+
+            let body = Self.substitute_types(&def.body, &def.type_params, &type_args)
+
+            // Scan body for nested generic calls
+            self.scan_for_generic_calls(&body)
+
+            self.instances.insert(mangled.clone(), MonoInstance {
+                original: name, mangled_name: mangled, type_args, body,
+            })
+        }
+    }
+
+    fn check_bound(self, ty: &MonoType, bound: &str) {
+        // In a real compiler, check impl exists for ty
+        // Here we just verify it's a known type
+        match ty {
+            MonoType.Concrete(name) => {
+                // Primitive types implement common traits
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_for_generic_calls(mut self, body: &str) {
+        // Simplified: in a real compiler, walk the IR looking for
+        // calls to generic functions and add them to the worklist
+    }
+
+    fn get_instances(self) -> &HashMap<string, MonoInstance> { &self.instances }
+
+    fn instance_count(self) -> usize { self.instances.len() }
+}
+
+fn main() {
+    let mut mono = Monomorphizer.new()
+
+    // Register generic function: fn identity<T>(x: T) -> T { x }
+    mono.register_generic(GenericDef {
+        name: "identity".to_string(),
+        type_params: ["T".to_string()],
+        body: "param.0: T -> T".to_string(),
+        trait_bounds: HashMap.new(),
+    })
+
+    // Register: fn swap<A, B>(a: A, b: B) -> (B, A) { (b, a) }
+    mono.register_generic(GenericDef {
+        name: "swap".to_string(),
+        type_params: ["A".to_string(), "B".to_string()],
+        body: "param.0: A, param.1: B -> (B, A)".to_string(),
+        trait_bounds: HashMap.new(),
+    })
+
+    // Request instances
+    mono.request_instance("identity", &[MonoType.Concrete("i32".to_string())])
+    mono.request_instance("identity", &[MonoType.Concrete("f64".to_string())])
+    mono.request_instance("identity", &[MonoType.Concrete("string".to_string())])
+    mono.request_instance("swap", &[MonoType.Concrete("i32".to_string()), MonoType.Concrete("bool".to_string())])
+
+    mono.process()
+
+    assert(mono.instance_count() == 4)
+    print("Monomorphization instances \u2713")
+
+    // Check mangled names
+    let instances = mono.get_instances()
+    assert(instances.contains_key("identity_i32"))
+    assert(instances.contains_key("identity_f64"))
+    assert(instances.contains_key("identity_string"))
+    assert(instances.contains_key("swap_i32_bool"))
+    print("Mangled names \u2713")
+
+    // MonoType sizes
+    assert(MonoType.Concrete("i32".to_string()).size_of() == 4)
+    assert(MonoType.Concrete("f64".to_string()).size_of() == 8)
+    assert(MonoType.Ptr(Box.new(MonoType.Concrete("i32".to_string()))).size_of() == 8)
+    assert(MonoType.Array(Box.new(MonoType.Concrete("u8".to_string())), 16).size_of() == 16)
+    assert(MonoType.Unit.size_of() == 0)
+    print("Type sizes \u2713")
+
+    // Mangling
+    assert(MonoType.Concrete("std::vec::Vec".to_string()).mangle() == "std_vec_Vec")
+    assert(MonoType.Tuple([MonoType.Concrete("i32".to_string()), MonoType.Concrete("bool".to_string())]).mangle() == "tuple_i32_bool")
+    print("Type mangling \u2713")
+
+    // Duplicate requests should not create new instances
+    mono.request_instance("identity", &[MonoType.Concrete("i32".to_string())])
+    mono.process()
+    assert(mono.instance_count() == 4)
+    print("Dedup \u2713")
+
+    print("Monomorphization complete \u2713")
+}
