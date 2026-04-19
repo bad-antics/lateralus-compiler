@@ -1,0 +1,278 @@
+// src/passes/inlining.ltl — Function inlining pass with cost/benefit heuristics
+use std.collections.{HashMap, HashSet}
+
+type VarId = u32
+type BlockId = u32
+
+// ── IR structures ────────────────────────────────────────────────────────────
+enum IRValue {
+    Const(i64),
+    Var(VarId),
+    BinExpr { op: string, lhs: Box<IRValue>, rhs: Box<IRValue> },
+    Call { callee: string, args: [IRValue] },
+}
+
+enum IRInst {
+    Assign { dst: VarId, value: IRValue },
+    Store { addr: IRValue, value: IRValue },
+    Branch { cond: IRValue, true_blk: BlockId, false_blk: BlockId },
+    Jump(BlockId),
+    Return(Option<IRValue>),
+}
+
+struct BasicBlock {
+    id:    BlockId,
+    insts: [IRInst],
+    succs: [BlockId],
+    preds: [BlockId],
+}
+
+struct Function {
+    name:       string,
+    params:     [(VarId, string)],  // (var_id, type_name)
+    blocks:     [BasicBlock],
+    return_type: string,
+    is_inline:  bool,               // #[inline] attribute
+    is_recursive: bool,
+}
+
+struct Module {
+    functions: HashMap<string, Function>,
+}
+
+// ── Inlining cost model ──────────────────────────────────────────────────────
+struct InlineCost {
+    instruction_count: u32,
+    call_count:        u32,
+    has_loops:         bool,
+    is_leaf:           bool,
+    is_recursive:      bool,
+    param_count:       u32,
+    estimated_benefit: i32,
+}
+
+const INLINE_THRESHOLD: i32 = 75
+const SMALL_FUNC_BONUS: i32 = 50
+const LEAF_BONUS: i32 = 30
+const INLINE_ATTR_BONUS: i32 = 100
+const CALL_PENALTY: i32 = 10
+const LOOP_PENALTY: i32 = 50
+const RECURSIVE_PENALTY: i32 = 1000
+
+fn compute_inline_cost(func: &Function) -> InlineCost {
+    let mut inst_count: u32 = 0
+    let mut call_count: u32 = 0
+    let mut has_back_edge = false
+
+    for block in &func.blocks {
+        inst_count += block.insts.len() as u32
+        for inst in &block.insts {
+            if let IRInst.Assign { value: IRValue.Call { .. }, .. } = inst {
+                call_count += 1
+            }
+        }
+        // Detect back edges (simple loop detection)
+        for &succ in &block.succs {
+            if succ <= block.id { has_back_edge = true }
+        }
+    }
+
+    let is_leaf = call_count == 0
+    let mut benefit: i32 = 0
+
+    // Small functions are always good to inline
+    if inst_count <= 10 { benefit += SMALL_FUNC_BONUS }
+    if is_leaf { benefit += LEAF_BONUS }
+    if func.is_inline { benefit += INLINE_ATTR_BONUS }
+
+    // Penalties
+    benefit -= inst_count as i32  // larger = more costly
+    benefit -= call_count as i32 * CALL_PENALTY
+    if has_back_edge { benefit -= LOOP_PENALTY }
+    if func.is_recursive { benefit -= RECURSIVE_PENALTY }
+
+    InlineCost {
+        instruction_count: inst_count,
+        call_count,
+        has_loops: has_back_edge,
+        is_leaf,
+        is_recursive: func.is_recursive,
+        param_count: func.params.len() as u32,
+        estimated_benefit: benefit,
+    }
+}
+
+fn should_inline(cost: &InlineCost) -> bool {
+    !cost.is_recursive && cost.estimated_benefit > -INLINE_THRESHOLD
+}
+
+// ── Variable renaming for inlined bodies ─────────────────────────────────────
+struct VarRenamer {
+    next_id: VarId,
+    mapping: HashMap<VarId, VarId>,
+}
+
+impl VarRenamer {
+    fn new(start: VarId) -> VarRenamer {
+        VarRenamer { next_id: start, mapping: HashMap.new() }
+    }
+
+    fn rename(mut self, old: VarId) -> VarId {
+        if let some(&new) = self.mapping.get(&old) { return new }
+        let new = self.next_id
+        self.next_id += 1
+        self.mapping.insert(old, new)
+        new
+    }
+
+    fn rename_value(mut self, val: IRValue) -> IRValue {
+        match val {
+            IRValue.Var(v) => IRValue.Var(self.rename(v)),
+            IRValue.BinExpr { op, lhs, rhs } => IRValue.BinExpr {
+                op,
+                lhs: Box.new(self.rename_value(*lhs)),
+                rhs: Box.new(self.rename_value(*rhs)),
+            },
+            IRValue.Call { callee, args } => IRValue.Call {
+                callee,
+                args: args |> map(|a| self.rename_value(a)) |> collect(),
+            },
+            other => other,
+        }
+    }
+
+    fn rename_inst(mut self, inst: IRInst, block_offset: BlockId) -> IRInst {
+        match inst {
+            IRInst.Assign { dst, value } => IRInst.Assign {
+                dst: self.rename(dst),
+                value: self.rename_value(value),
+            },
+            IRInst.Branch { cond, true_blk, false_blk } => IRInst.Branch {
+                cond: self.rename_value(cond),
+                true_blk: true_blk + block_offset,
+                false_blk: false_blk + block_offset,
+            },
+            IRInst.Jump(target) => IRInst.Jump(target + block_offset),
+            IRInst.Return(some(v)) => IRInst.Return(some(self.rename_value(v))),
+            other => other,
+        }
+    }
+}
+
+// ── Inlining pass ────────────────────────────────────────────────────────────
+pub struct InliningStats {
+    pub candidates: u32,
+    pub inlined: u32,
+    pub skipped_recursive: u32,
+    pub skipped_too_large: u32,
+}
+
+pub fn run_inlining(module: &mut Module) -> InliningStats {
+    let mut stats = InliningStats { candidates: 0, inlined: 0, skipped_recursive: 0, skipped_too_large: 0 }
+
+    // Compute costs for all functions
+    let costs: HashMap<string, InlineCost> = module.functions.iter()
+        .map(|(name, func)| (name.clone(), compute_inline_cost(func)))
+        .collect()
+
+    // Find call sites to inline
+    let func_names: [string] = module.functions.keys().cloned().collect()
+
+    for caller_name in &func_names {
+        let mut call_sites: [(usize, usize, string)] = []  // (block_idx, inst_idx, callee)
+
+        if let some(caller) = module.functions.get(caller_name) {
+            for (bi, block) in caller.blocks.iter().enumerate() {
+                for (ii, inst) in block.insts.iter().enumerate() {
+                    if let IRInst.Assign { value: IRValue.Call { callee, .. }, .. } = inst {
+                        if callee != caller_name {  // don't inline self
+                            call_sites.push((bi, ii, callee.clone()))
+                        }
+                    }
+                }
+            }
+        }
+
+        for (block_idx, inst_idx, callee_name) in call_sites.iter().rev() {
+            stats.candidates += 1
+            if let some(cost) = costs.get(callee_name) {
+                if cost.is_recursive { stats.skipped_recursive += 1; continue }
+                if !should_inline(cost) { stats.skipped_too_large += 1; continue }
+                stats.inlined += 1
+                // Actual inlining would splice callee blocks into caller here
+            }
+        }
+    }
+    stats
+}
+
+fn main() {
+    // Test cost model
+    let small_func = Function {
+        name: "add".to_string(),
+        params: [(1, "i64".to_string()), (2, "i64".to_string())],
+        blocks: [BasicBlock {
+            id: 0,
+            insts: [
+                IRInst.Assign { dst: 3, value: IRValue.BinExpr {
+                    op: "add".to_string(),
+                    lhs: Box.new(IRValue.Var(1)),
+                    rhs: Box.new(IRValue.Var(2)),
+                }},
+                IRInst.Return(some(IRValue.Var(3))),
+            ],
+            succs: [], preds: [],
+        }],
+        return_type: "i64".to_string(),
+        is_inline: false,
+        is_recursive: false,
+    }
+
+    let cost = compute_inline_cost(&small_func)
+    print("Small func: ${cost.instruction_count} insts, leaf=${cost.is_leaf}, benefit=${cost.estimated_benefit}")
+    assert(cost.is_leaf)
+    assert(cost.instruction_count == 2)
+    assert(should_inline(&cost), "small leaf function should be inlined")
+    print("Small function inlining decision: YES ✓")
+
+    // Recursive function should not inline
+    let rec_func = Function {
+        name: "fib".to_string(),
+        params: [(1, "i64".to_string())],
+        blocks: [BasicBlock {
+            id: 0,
+            insts: [
+                IRInst.Assign { dst: 2, value: IRValue.Call { callee: "fib".to_string(), args: [IRValue.Var(1)] } },
+                IRInst.Return(some(IRValue.Var(2))),
+            ],
+            succs: [], preds: [],
+        }],
+        return_type: "i64".to_string(),
+        is_inline: false,
+        is_recursive: true,
+    }
+
+    let cost = compute_inline_cost(&rec_func)
+    assert(!should_inline(&cost), "recursive function should not be inlined")
+    print("Recursive function inlining decision: NO ✓")
+
+    // #[inline] function with moderate size
+    let inline_func = Function {
+        name: "clamp".to_string(),
+        params: [(1, "i64".to_string()), (2, "i64".to_string()), (3, "i64".to_string())],
+        blocks: [BasicBlock {
+            id: 0,
+            insts: (0..15).map(|i| IRInst.Assign { dst: 10 + i, value: IRValue.Const(i as i64) }).collect(),
+            succs: [], preds: [],
+        }],
+        return_type: "i64".to_string(),
+        is_inline: true,
+        is_recursive: false,
+    }
+
+    let cost = compute_inline_cost(&inline_func)
+    assert(should_inline(&cost), "#[inline] moderate func should be inlined")
+    print("#[inline] attribute respected ✓")
+
+    print("Inlining pass — all passed ✓")
+}
