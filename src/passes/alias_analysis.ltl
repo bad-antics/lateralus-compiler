@@ -1,0 +1,315 @@
+// Compiler Pass - Alias Analysis
+// Points-to analysis for determining memory aliasing between pointers.
+
+use std.collections.{HashMap, HashSet, BTreeSet}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum Location {
+    Stack(string),         // Named stack allocation
+    Heap(usize),           // Heap allocation site ID
+    Global(string),        // Global variable
+    Null,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct Pointer {
+    name: string,
+    is_ref: bool,
+}
+
+#[derive(Clone, Debug)]
+enum AliasResult {
+    MustAlias,
+    MayAlias,
+    NoAlias,
+}
+
+struct PointsToSet {
+    locations: HashSet<Location>,
+}
+
+impl PointsToSet {
+    fn new() -> PointsToSet {
+        PointsToSet { locations: HashSet.new() }
+    }
+
+    fn singleton(loc: Location) -> PointsToSet {
+        let mut s = Self.new()
+        s.locations.insert(loc)
+        s
+    }
+
+    fn add(mut self, loc: Location) {
+        self.locations.insert(loc)
+    }
+
+    fn union(mut self, other: &PointsToSet) -> bool {
+        let old_len = self.locations.len()
+        for loc in &other.locations {
+            self.locations.insert(loc.clone())
+        }
+        self.locations.len() > old_len
+    }
+
+    fn contains(self, loc: &Location) -> bool {
+        self.locations.contains(loc)
+    }
+
+    fn len(self) -> usize {
+        self.locations.len()
+    }
+
+    fn is_empty(self) -> bool {
+        self.locations.is_empty()
+    }
+
+    fn intersects(self, other: &PointsToSet) -> bool {
+        self.locations.iter().any(|l| other.locations.contains(l))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Constraint {
+    AddressOf(string, Location),     // p = &x
+    Copy(string, string),            // p = q
+    Load(string, string),            // p = *q
+    Store(string, string),           // *p = q
+}
+
+struct AliasAnalysis {
+    points_to: HashMap<string, PointsToSet>,
+    constraints: [Constraint],
+    iterations: usize,
+}
+
+impl AliasAnalysis {
+    fn new() -> AliasAnalysis {
+        AliasAnalysis {
+            points_to: HashMap.new(),
+            constraints: [],
+            iterations: 0,
+        }
+    }
+
+    fn add_constraint(mut self, c: Constraint) {
+        self.constraints.push(c)
+    }
+
+    fn add_address_of(mut self, ptr: &str, loc: Location) {
+        self.constraints.push(Constraint.AddressOf(ptr.to_string(), loc))
+    }
+
+    fn add_copy(mut self, dst: &str, src: &str) {
+        self.constraints.push(Constraint.Copy(dst.to_string(), src.to_string()))
+    }
+
+    fn add_load(mut self, dst: &str, src: &str) {
+        self.constraints.push(Constraint.Load(dst.to_string(), src.to_string()))
+    }
+
+    fn add_store(mut self, dst: &str, src: &str) {
+        self.constraints.push(Constraint.Store(dst.to_string(), src.to_string()))
+    }
+
+    fn solve(mut self) {
+        // Initialize address-of constraints
+        for c in &self.constraints {
+            if let Constraint.AddressOf(ptr, loc) = c {
+                self.points_to.entry(ptr.clone())
+                    .or_insert_with(PointsToSet.new)
+                    .add(loc.clone())
+            }
+        }
+
+        // Fixed-point iteration
+        let mut changed = true
+        while changed {
+            changed = false
+            self.iterations += 1
+
+            for c in self.constraints.clone() {
+                match c {
+                    Constraint.Copy(dst, src) => {
+                        let src_pts = self.points_to.get(&src).cloned()
+                            .unwrap_or_else(PointsToSet.new)
+                        if self.points_to.entry(dst.clone())
+                            .or_insert_with(PointsToSet.new)
+                            .union(&src_pts) {
+                            changed = true
+                        }
+                    },
+                    Constraint.Load(dst, src) => {
+                        // dst = *src: for each location L in pts(src),
+                        // add pts(L) to pts(dst)
+                        let src_pts = self.points_to.get(&src).cloned()
+                            .unwrap_or_else(PointsToSet.new)
+                        for loc in &src_pts.locations {
+                            let loc_name = match loc {
+                                Location.Stack(name) => name.clone(),
+                                Location.Global(name) => name.clone(),
+                                _ => continue,
+                            }
+                            let loc_pts = self.points_to.get(&loc_name).cloned()
+                                .unwrap_or_else(PointsToSet.new)
+                            if self.points_to.entry(dst.clone())
+                                .or_insert_with(PointsToSet.new)
+                                .union(&loc_pts) {
+                                changed = true
+                            }
+                        }
+                    },
+                    Constraint.Store(dst, src) => {
+                        // *dst = src: for each location L in pts(dst),
+                        // add pts(src) to pts(L)
+                        let dst_pts = self.points_to.get(&dst).cloned()
+                            .unwrap_or_else(PointsToSet.new)
+                        let src_pts = self.points_to.get(&src).cloned()
+                            .unwrap_or_else(PointsToSet.new)
+                        for loc in &dst_pts.locations {
+                            let loc_name = match loc {
+                                Location.Stack(name) => name.clone(),
+                                Location.Global(name) => name.clone(),
+                                _ => continue,
+                            }
+                            if self.points_to.entry(loc_name)
+                                .or_insert_with(PointsToSet.new)
+                                .union(&src_pts) {
+                                changed = true
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    fn query(self, a: &str, b: &str) -> AliasResult {
+        let pts_a = match self.points_to.get(a) {
+            some(pts) => pts,
+            none => return AliasResult.NoAlias,
+        }
+        let pts_b = match self.points_to.get(b) {
+            some(pts) => pts,
+            none => return AliasResult.NoAlias,
+        }
+
+        if pts_a.locations.contains(&Location.Unknown) || pts_b.locations.contains(&Location.Unknown) {
+            return AliasResult.MayAlias
+        }
+
+        if pts_a.len() == 1 && pts_b.len() == 1 && pts_a.locations == pts_b.locations {
+            return AliasResult.MustAlias
+        }
+
+        if pts_a.intersects(pts_b) {
+            AliasResult.MayAlias
+        } else {
+            AliasResult.NoAlias
+        }
+    }
+
+    fn get_points_to(self, ptr: &str) -> Option<&PointsToSet> {
+        self.points_to.get(ptr)
+    }
+}
+
+fn main() {
+    // Basic points-to
+    let mut aa = AliasAnalysis.new()
+
+    // p = &x, q = &x
+    aa.add_address_of("p", Location.Stack("x".to_string()))
+    aa.add_address_of("q", Location.Stack("x".to_string()))
+
+    // r = &y
+    aa.add_address_of("r", Location.Stack("y".to_string()))
+
+    aa.solve()
+
+    // p and q must alias (both point to x)
+    match aa.query("p", "q") {
+        AliasResult.MustAlias => {},
+        _ => panic("Expected MustAlias"),
+    }
+    print("Must alias ✓")
+
+    // p and r don't alias
+    match aa.query("p", "r") {
+        AliasResult.NoAlias => {},
+        _ => panic("Expected NoAlias"),
+    }
+    print("No alias ✓")
+
+    // Copy constraint
+    let mut aa2 = AliasAnalysis.new()
+    aa2.add_address_of("p", Location.Stack("x".to_string()))
+    aa2.add_copy("q", "p")
+    aa2.solve()
+
+    match aa2.query("p", "q") {
+        AliasResult.MustAlias => {},
+        _ => panic("Expected MustAlias after copy"),
+    }
+    print("Copy alias ✓")
+
+    // May alias
+    let mut aa3 = AliasAnalysis.new()
+    aa3.add_address_of("p", Location.Stack("x".to_string()))
+    aa3.add_address_of("p", Location.Stack("y".to_string()))
+    aa3.add_address_of("q", Location.Stack("x".to_string()))
+    aa3.solve()
+
+    match aa3.query("p", "q") {
+        AliasResult.MayAlias => {},
+        _ => panic("Expected MayAlias"),
+    }
+    print("May alias ✓")
+
+    // Points-to set
+    let mut pts = PointsToSet.new()
+    assert(pts.is_empty())
+    pts.add(Location.Stack("a".to_string()))
+    pts.add(Location.Heap(1))
+    assert(pts.len() == 2)
+    assert(pts.contains(&Location.Stack("a".to_string())))
+    assert(!pts.contains(&Location.Null))
+    print("PointsToSet ✓")
+
+    // Union
+    let mut pts2 = PointsToSet.new()
+    pts2.add(Location.Stack("b".to_string()))
+    let changed = pts.union(&pts2)
+    assert(changed)
+    assert(pts.len() == 3)
+    print("Union ✓")
+
+    // Intersection
+    let mut pts3 = PointsToSet.singleton(Location.Stack("a".to_string()))
+    assert(pts.intersects(&pts3))
+    let pts4 = PointsToSet.singleton(Location.Global("g".to_string()))
+    assert(!pts.intersects(&pts4))
+    print("Intersects ✓")
+
+    // Location variants
+    let _s = Location.Stack("local".to_string())
+    let _h = Location.Heap(42)
+    let _g = Location.Global("GLOBAL".to_string())
+    let _n = Location.Null
+    let _u = Location.Unknown
+    print("Location variants ✓")
+
+    // Iterations
+    assert(aa.iterations >= 1)
+    print("Iterations ✓")
+
+    // Constraint types
+    let _c1 = Constraint.AddressOf("p".to_string(), Location.Stack("x".to_string()))
+    let _c2 = Constraint.Copy("q".to_string(), "p".to_string())
+    let _c3 = Constraint.Load("r".to_string(), "q".to_string())
+    let _c4 = Constraint.Store("p".to_string(), "r".to_string())
+    print("Constraint types ✓")
+
+    print("Alias Analysis complete ✓")
+}
