@@ -1,0 +1,281 @@
+// src/passes/loop_optimization.ltl — Loop-invariant code motion & strength reduction
+use std.collections.{HashMap, HashSet}
+
+type VarId = u32
+type BlockId = u32
+
+enum IRValue {
+    Const(i64),
+    Var(VarId),
+    BinExpr { op: string, lhs: Box<IRValue>, rhs: Box<IRValue> },
+    Load { addr: Box<IRValue> },
+}
+
+enum IRInst {
+    Assign { dst: VarId, value: IRValue },
+    Store { addr: IRValue, value: IRValue },
+    Branch { cond: IRValue, true_blk: BlockId, false_blk: BlockId },
+    Jump(BlockId),
+    Return(Option<IRValue>),
+}
+
+struct BasicBlock {
+    id:    BlockId,
+    insts: [IRInst],
+    succs: [BlockId],
+    preds: [BlockId],
+}
+
+struct Function {
+    blocks: [BasicBlock],
+}
+
+// ── Loop detection ───────────────────────────────────────────────────────────
+struct NaturalLoop {
+    header:  BlockId,
+    blocks:  HashSet<BlockId>,
+    back_edges: [(BlockId, BlockId)],  // (tail, header)
+    preheader: Option<BlockId>,
+    exit_blocks: [BlockId],
+    depth: u32,
+}
+
+fn find_back_edges(blocks: &[BasicBlock], dom: &HashMap<BlockId, HashSet<BlockId>>) -> [(BlockId, BlockId)] {
+    let mut back_edges: [(BlockId, BlockId)] = []
+    for block in blocks {
+        for &succ in &block.succs {
+            // Back edge: succ dominates block
+            if let some(dom_set) = dom.get(&block.id) {
+                if dom_set.contains(&succ) {
+                    back_edges.push((block.id, succ))
+                }
+            }
+        }
+    }
+    back_edges
+}
+
+fn find_natural_loop(blocks: &[BasicBlock], back_edge: (BlockId, BlockId)) -> NaturalLoop {
+    let (tail, header) = back_edge
+    let mut loop_blocks: HashSet<BlockId> = HashSet.new()
+    loop_blocks.insert(header)
+    loop_blocks.insert(tail)
+
+    // Walk backwards from tail, adding blocks until we reach header
+    let mut worklist: [BlockId] = [tail]
+    while let some(block_id) = worklist.pop() {
+        let block = blocks.iter().find(|b| b.id == block_id).unwrap()
+        for &pred in &block.preds {
+            if !loop_blocks.contains(&pred) {
+                loop_blocks.insert(pred)
+                worklist.push(pred)
+            }
+        }
+    }
+
+    // Find exit blocks
+    let exit_blocks: [BlockId] = blocks.iter()
+        .filter(|b| loop_blocks.contains(&b.id))
+        .flat_map(|b| b.succs.iter())
+        .filter(|s| !loop_blocks.contains(s))
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+
+    NaturalLoop {
+        header,
+        blocks: loop_blocks,
+        back_edges: [back_edge],
+        preheader: none,
+        exit_blocks,
+        depth: 1,
+    }
+}
+
+// ── Loop-invariant code motion (LICM) ────────────────────────────────────────
+fn is_loop_invariant(value: &IRValue, loop_defs: &HashSet<VarId>) -> bool {
+    match value {
+        IRValue.Const(_) => true,
+        IRValue.Var(v) => !loop_defs.contains(v),
+        IRValue.BinExpr { lhs, rhs, .. } => {
+            is_loop_invariant(lhs, loop_defs) && is_loop_invariant(rhs, loop_defs)
+        }
+        IRValue.Load { .. } => false,  // conservative: loads may alias
+    }
+}
+
+fn collect_loop_defs(func: &Function, lp: &NaturalLoop) -> HashSet<VarId> {
+    let mut defs: HashSet<VarId> = HashSet.new()
+    for block in &func.blocks {
+        if !lp.blocks.contains(&block.id) { continue }
+        for inst in &block.insts {
+            if let IRInst.Assign { dst, .. } = inst {
+                defs.insert(*dst)
+            }
+        }
+    }
+    defs
+}
+
+pub fn hoist_loop_invariants(func: &mut Function, lp: &NaturalLoop) -> u32 {
+    let loop_defs = collect_loop_defs(func, lp)
+    let mut hoisted: u32 = 0
+    let mut to_hoist: [IRInst] = []
+
+    for block in &mut func.blocks {
+        if !lp.blocks.contains(&block.id) { continue }
+        let mut remaining: [IRInst] = []
+
+        for inst in block.insts.drain(..) {
+            match &inst {
+                IRInst.Assign { value, .. } if is_loop_invariant(value, &loop_defs) => {
+                    to_hoist.push(inst)
+                    hoisted += 1
+                }
+                _ => remaining.push(inst),
+            }
+        }
+        block.insts = remaining
+    }
+
+    // Insert hoisted instructions into preheader (or just before header)
+    if let some(preheader_id) = lp.preheader {
+        if let some(preheader) = func.blocks.iter_mut().find(|b| b.id == preheader_id) {
+            let insert_pos = preheader.insts.len().saturating_sub(1)  // before terminator
+            for inst in to_hoist.into_iter().rev() {
+                preheader.insts.insert(insert_pos, inst)
+            }
+        }
+    }
+    hoisted
+}
+
+// ── Induction variable detection ─────────────────────────────────────────────
+struct InductionVar {
+    var:        VarId,
+    base:       IRValue,     // initial value
+    step:       IRValue,     // increment per iteration
+    is_primary: bool,
+}
+
+fn find_induction_vars(func: &Function, lp: &NaturalLoop) -> [InductionVar] {
+    let mut ivs: [InductionVar] = []
+
+    for block in &func.blocks {
+        if !lp.blocks.contains(&block.id) { continue }
+        for inst in &block.insts {
+            // Pattern: v = v + c  or  v = v - c
+            if let IRInst.Assign { dst, value: IRValue.BinExpr { op, lhs: box IRValue.Var(base), rhs } } = inst {
+                if *base == *dst && (op == "add" || op == "sub") {
+                    if is_loop_invariant(rhs, &collect_loop_defs(func, lp)) {
+                        ivs.push(InductionVar {
+                            var: *dst,
+                            base: IRValue.Var(*base),
+                            step: *rhs.clone(),
+                            is_primary: true,
+                        })
+                    }
+                }
+            }
+        }
+    }
+    ivs
+}
+
+// ── Loop strength reduction ──────────────────────────────────────────────────
+pub fn reduce_strength_in_loop(func: &mut Function, lp: &NaturalLoop) -> u32 {
+    let ivs = find_induction_vars(func, lp)
+    let mut reduced: u32 = 0
+
+    for block in &mut func.blocks {
+        if !lp.blocks.contains(&block.id) { continue }
+        for inst in &mut block.insts {
+            // Replace iv * constant with repeated addition
+            if let IRInst.Assign { dst, value: IRValue.BinExpr { op: ref op_str, lhs: box IRValue.Var(v), rhs: box IRValue.Const(c) } } = inst {
+                if op_str == "mul" {
+                    if let some(iv) = ivs.iter().find(|iv| iv.var == *v) {
+                        // Replace: result = iv * c  →  result += step * c each iteration
+                        *inst = IRInst.Assign {
+                            dst: *dst,
+                            value: IRValue.BinExpr {
+                                op: "add".to_string(),
+                                lhs: Box.new(IRValue.Var(*dst)),
+                                rhs: Box.new(iv.step.clone()),
+                            },
+                        }
+                        reduced += 1
+                    }
+                }
+            }
+        }
+    }
+    reduced
+}
+
+// ── Loop unrolling ───────────────────────────────────────────────────────────
+pub fn should_unroll(lp: &NaturalLoop, func: &Function) -> Option<u32> {
+    let inst_count: usize = func.blocks.iter()
+        .filter(|b| lp.blocks.contains(&b.id))
+        .map(|b| b.insts.len())
+        .sum()
+
+    // Only unroll small loops
+    if inst_count > 20 { return none }
+    if lp.blocks.len() > 3 { return none }
+
+    // Try to determine trip count from loop bound
+    // (simplified: return fixed factor)
+    some(4)  // unroll factor
+}
+
+fn main() {
+    // Test loop detection
+    let blocks = [
+        BasicBlock { id: 0, insts: [IRInst.Jump(1)], succs: [1], preds: [] },
+        BasicBlock { id: 1, insts: [
+            IRInst.Assign { dst: 1, value: IRValue.Const(100) },  // loop-invariant
+            IRInst.Assign { dst: 2, value: IRValue.BinExpr {
+                op: "add".to_string(),
+                lhs: Box.new(IRValue.Var(2)),
+                rhs: Box.new(IRValue.Const(1)),
+            }},
+            IRInst.Branch { cond: IRValue.Var(2), true_blk: 1, false_blk: 2 },
+        ], succs: [1, 2], preds: [0, 1] },
+        BasicBlock { id: 2, insts: [IRInst.Return(none)], succs: [], preds: [1] },
+    ]
+
+    // Build dominators (simplified)
+    let mut dom: HashMap<BlockId, HashSet<BlockId>> = HashMap.new()
+    dom.insert(0, HashSet.from([0]))
+    dom.insert(1, HashSet.from([0, 1]))
+    dom.insert(2, HashSet.from([0, 1, 2]))
+
+    let back_edges = find_back_edges(&blocks, &dom)
+    assert(back_edges.len() == 1, "should find one back edge (1→1)")
+    print("Back edge: ${back_edges[0].0} → ${back_edges[0].1} ✓")
+
+    let lp = find_natural_loop(&blocks, back_edges[0])
+    assert(lp.header == 1)
+    assert(lp.blocks.contains(&1))
+    print("Natural loop: header=${lp.header}, size=${lp.blocks.len()} ✓")
+
+    // LICM
+    let mut func = Function { blocks }
+    let loop_defs = collect_loop_defs(&func, &lp)
+    let invariant = is_loop_invariant(&IRValue.Const(100), &loop_defs)
+    assert(invariant, "constant is loop-invariant")
+    print("Loop-invariant detection ✓")
+
+    // Induction variables
+    let ivs = find_induction_vars(&func, &lp)
+    assert(ivs.len() >= 1, "should detect v2 as induction variable")
+    print("Induction variable v${ivs[0].var} detected ✓")
+
+    // Unrolling decision
+    let unroll = should_unroll(&lp, &func)
+    assert(unroll.is_some(), "small loop should be unrollable")
+    print("Unroll factor: ${unroll.unwrap()} ✓")
+
+    print("Loop optimization — all passed ✓")
+}
