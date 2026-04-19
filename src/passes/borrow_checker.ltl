@@ -1,0 +1,269 @@
+// Compiler Pass - Borrow Checker
+// Lifetime analysis, ownership tracking, mutable/immutable borrow validation.
+
+use std.collections.{HashMap, HashSet}
+
+enum BorrowKind { Shared, Mutable }
+
+struct Lifetime {
+    id: usize,
+    name: Option<string>,
+    start: usize,  // program point
+    end: usize,
+}
+
+impl Lifetime {
+    fn new(id: usize, start: usize, end: usize) -> Lifetime {
+        Lifetime { id, name: none, start, end }
+    }
+    fn named(id: usize, name: &str, start: usize, end: usize) -> Lifetime {
+        Lifetime { id, name: some(name.to_string()), start, end }
+    }
+    fn contains(self, point: usize) -> bool { point >= self.start && point <= self.end }
+    fn overlaps(self, other: &Lifetime) -> bool { self.start <= other.end && other.start <= self.end }
+}
+
+struct Borrow {
+    id: usize,
+    kind: BorrowKind,
+    place: Place,
+    lifetime: usize,
+    location: usize,
+}
+
+enum Place {
+    Local(usize),
+    Field(Box<Place>, string),
+    Index(Box<Place>, usize),
+    Deref(Box<Place>),
+}
+
+impl Place {
+    fn root_local(self) -> Option<usize> {
+        match self {
+            Place.Local(id) => some(*id),
+            Place.Field(base, _) | Place.Index(base, _) | Place.Deref(base) => base.root_local(),
+        }
+    }
+
+    fn conflicts_with(self, other: &Place) -> bool {
+        match (self, other) {
+            (Place.Local(a), Place.Local(b)) => a == b,
+            (Place.Field(a, fa), Place.Field(b, fb)) => fa == fb && a.conflicts_with(b),
+            _ => self.root_local() == other.root_local(),
+        }
+    }
+
+    fn to_string(self) -> string {
+        match self {
+            Place.Local(id) => format!("_{}", id),
+            Place.Field(base, field) => format!("{}.{}", base.to_string(), field),
+            Place.Index(base, idx) => format!("{}[{}]", base.to_string(), idx),
+            Place.Deref(base) => format!("*{}", base.to_string()),
+        }
+    }
+}
+
+enum Ownership { Owned, Moved, Borrowed(BorrowKind) }
+
+struct OwnershipState {
+    locals: HashMap<usize, Ownership>,
+}
+
+impl OwnershipState {
+    fn new() -> OwnershipState { OwnershipState { locals: HashMap.new() } }
+
+    fn declare(mut self, local: usize) { self.locals.insert(local, Ownership.Owned) }
+
+    fn move_out(mut self, local: usize) -> Result<(), string> {
+        match self.locals.get(&local) {
+            some(Ownership.Owned) => { self.locals.insert(local, Ownership.Moved); ok(()) }
+            some(Ownership.Moved) => err(format!("use of moved value _{}", local)),
+            some(Ownership.Borrowed(_)) => err(format!("cannot move _{} while borrowed", local)),
+            none => err(format!("unknown local _{}", local)),
+        }
+    }
+
+    fn borrow(mut self, local: usize, kind: BorrowKind) -> Result<(), string> {
+        match self.locals.get(&local) {
+            some(Ownership.Owned) => { self.locals.insert(local, Ownership.Borrowed(kind)); ok(()) }
+            some(Ownership.Moved) => err(format!("cannot borrow moved value _{}", local)),
+            some(Ownership.Borrowed(BorrowKind.Shared)) => {
+                match kind {
+                    BorrowKind.Shared => ok(()),
+                    BorrowKind.Mutable => err(format!("cannot borrow _{} mutably while shared borrow exists", local)),
+                }
+            }
+            some(Ownership.Borrowed(BorrowKind.Mutable)) => {
+                err(format!("cannot borrow _{} while mutable borrow exists", local))
+            }
+            none => err(format!("unknown local _{}", local)),
+        }
+    }
+
+    fn release(mut self, local: usize) {
+        if let some(Ownership.Borrowed(_)) = self.locals.get(&local) {
+            self.locals.insert(local, Ownership.Owned)
+        }
+    }
+}
+
+struct BorrowChecker {
+    lifetimes: [Lifetime],
+    borrows: [Borrow],
+    ownership: OwnershipState,
+    errors: [string],
+    next_id: usize,
+    current_point: usize,
+}
+
+impl BorrowChecker {
+    fn new() -> BorrowChecker {
+        BorrowChecker {
+            lifetimes: [], borrows: [], ownership: OwnershipState.new(),
+            errors: [], next_id: 0, current_point: 0,
+        }
+    }
+
+    fn fresh_id(mut self) -> usize { let id = self.next_id; self.next_id += 1; id }
+
+    fn declare_local(mut self, local: usize) { self.ownership.declare(local) }
+
+    fn check_move(mut self, place: &Place) {
+        if let some(local) = place.root_local() {
+            // Check no active borrows
+            for borrow in &self.borrows {
+                if borrow.place.conflicts_with(place) {
+                    let lt = &self.lifetimes[borrow.lifetime]
+                    if lt.contains(self.current_point) {
+                        self.errors.push(format!(
+                            "cannot move {} while it is borrowed (borrow at point {})",
+                            place.to_string(), borrow.location))
+                    }
+                }
+            }
+            if let err(e) = self.ownership.move_out(local) { self.errors.push(e) }
+        }
+    }
+
+    fn check_borrow(mut self, place: &Place, kind: BorrowKind, lifetime_end: usize) {
+        // Validate against existing borrows
+        for existing in &self.borrows {
+            if !existing.place.conflicts_with(place) { continue }
+            let lt = &self.lifetimes[existing.lifetime]
+            if !lt.contains(self.current_point) { continue }
+
+            match (&existing.kind, &kind) {
+                (BorrowKind.Shared, BorrowKind.Shared) => {}  // ok
+                (BorrowKind.Mutable, _) | (_, BorrowKind.Mutable) => {
+                    self.errors.push(format!(
+                        "conflicting borrow of {} at point {} (existing {:?} borrow at {})",
+                        place.to_string(), self.current_point,
+                        existing.kind, existing.location))
+                }
+            }
+        }
+
+        let lt_id = self.lifetimes.len()
+        self.lifetimes.push(Lifetime.new(lt_id, self.current_point, lifetime_end))
+        let borrow_id = self.fresh_id()
+        self.borrows.push(Borrow {
+            id: borrow_id, kind, place: place.clone(),
+            lifetime: lt_id, location: self.current_point,
+        })
+
+        if let some(local) = place.root_local() {
+            let _ = self.ownership.borrow(local, kind)
+        }
+    }
+
+    fn advance_point(mut self) {
+        self.current_point += 1
+        // Release expired borrows
+        let current = self.current_point
+        for borrow in &self.borrows {
+            let lt = &self.lifetimes[borrow.lifetime]
+            if lt.end < current {
+                if let some(local) = borrow.place.root_local() {
+                    self.ownership.release(local)
+                }
+            }
+        }
+    }
+
+    fn check_use(mut self, place: &Place) {
+        if let some(local) = place.root_local() {
+            match self.ownership.locals.get(&local) {
+                some(Ownership.Moved) => {
+                    self.errors.push(format!("use of moved value {}", place.to_string()))
+                }
+                none => {
+                    self.errors.push(format!("use of undeclared value {}", place.to_string()))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn has_errors(self) -> bool { !self.errors.is_empty() }
+    fn error_count(self) -> usize { self.errors.len() }
+}
+
+fn main() {
+    let mut bc = BorrowChecker.new()
+
+    // Declare locals
+    bc.declare_local(0)  // x
+    bc.declare_local(1)  // y
+
+    // Shared borrow of x is fine
+    bc.check_borrow(&Place.Local(0), BorrowKind.Shared, 3)
+    assert(!bc.has_errors())
+    print("Shared borrow \u2713")
+
+    // Two shared borrows = ok
+    bc.check_borrow(&Place.Local(0), BorrowKind.Shared, 3)
+    assert(!bc.has_errors())
+    print("Two shared borrows \u2713")
+
+    // Mutable borrow while shared = error
+    bc.check_borrow(&Place.Local(0), BorrowKind.Mutable, 2)
+    assert(bc.has_errors())
+    print("Conflicting borrow detected \u2713")
+
+    // Move after borrow = error
+    let mut bc2 = BorrowChecker.new()
+    bc2.declare_local(0)
+    bc2.check_borrow(&Place.Local(0), BorrowKind.Shared, 5)
+    bc2.check_move(&Place.Local(0))
+    assert(bc2.has_errors())
+    print("Move while borrowed \u2713")
+
+    // Use after move = error
+    let mut bc3 = BorrowChecker.new()
+    bc3.declare_local(0)
+    bc3.check_move(&Place.Local(0))
+    bc3.check_use(&Place.Local(0))
+    assert(bc3.error_count() == 1)
+    assert(bc3.errors[0].contains("moved"))
+    print("Use after move \u2713")
+
+    // Lifetime expiry
+    let mut bc4 = BorrowChecker.new()
+    bc4.declare_local(0)
+    bc4.check_borrow(&Place.Local(0), BorrowKind.Shared, 1)
+    bc4.advance_point()
+    bc4.advance_point()  // past lifetime end
+    bc4.check_borrow(&Place.Local(0), BorrowKind.Mutable, 4)
+    assert(!bc4.has_errors())
+    print("Lifetime expiry \u2713")
+
+    // Place conflict
+    let field_a = Place.Field(Box.new(Place.Local(0)), "a".into())
+    let field_b = Place.Field(Box.new(Place.Local(0)), "b".into())
+    assert(!field_a.conflicts_with(&field_b))
+    assert(field_a.conflicts_with(&Place.Local(0)))
+    print("Place conflicts \u2713")
+
+    print("Borrow Checker complete \u2713")
+}
