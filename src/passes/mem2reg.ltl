@@ -1,0 +1,396 @@
+// Compiler Pass - Mem2Reg (Memory to Register Promotion)
+// Promotes stack allocations to SSA registers using dominance frontiers.
+
+use std.collections.{HashMap, HashSet, VecDeque}
+
+#[derive(Clone, Debug)]
+struct AllocaInst {
+    name: string,
+    ty: string,
+    is_promotable: bool,
+}
+
+#[derive(Clone, Debug)]
+enum Instruction {
+    Alloca(string, string),           // name, type
+    Store(string, string),            // value, alloca_name
+    Load(string, string),             // dest, alloca_name
+    Phi(string, [(usize, string)]),   // dest, [(block, value)]
+    BinOp(string, string, string, string), // dest, op, lhs, rhs
+    Branch(string, usize, usize),     // cond, then_bb, else_bb
+    Jump(usize),
+    Return(string),
+    Nop,
+}
+
+struct BasicBlock {
+    id: usize,
+    instructions: [Instruction],
+    predecessors: [usize],
+    successors: [usize],
+}
+
+struct Function {
+    name: string,
+    blocks: [BasicBlock],
+}
+
+struct DominatorTree {
+    idom: HashMap<usize, usize>,  // block -> immediate dominator
+    dom_frontier: HashMap<usize, HashSet<usize>>,
+    dom_tree_children: HashMap<usize, [usize]>,
+}
+
+impl DominatorTree {
+    fn compute(blocks: &[BasicBlock], entry: usize) -> DominatorTree {
+        let n = blocks.len()
+        let mut idom: HashMap<usize, usize> = HashMap.new()
+        idom.insert(entry, entry)
+
+        // Simple iterative dominator algorithm
+        let mut changed = true
+        while changed {
+            changed = false
+            for block in blocks {
+                if block.id == entry { continue }
+                let mut new_idom: Option<usize> = none
+                for &pred in &block.predecessors {
+                    if !idom.contains_key(&pred) { continue }
+                    new_idom = match new_idom {
+                        none => some(pred),
+                        some(current) => some(Self.intersect(&idom, current, pred, entry)),
+                    }
+                }
+                if let some(d) = new_idom {
+                    if idom.get(&block.id) != some(&d) {
+                        idom.insert(block.id, d)
+                        changed = true
+                    }
+                }
+            }
+        }
+
+        // Compute dominance frontiers
+        let mut dom_frontier: HashMap<usize, HashSet<usize>> = HashMap.new()
+        for block in blocks {
+            dom_frontier.insert(block.id, HashSet.new())
+        }
+        for block in blocks {
+            if block.predecessors.len() >= 2 {
+                for &pred in &block.predecessors {
+                    let mut runner = pred
+                    while runner != *idom.get(&block.id).unwrap_or(&entry) {
+                        dom_frontier.entry(runner).or_insert_with(HashSet.new).insert(block.id)
+                        runner = *idom.get(&runner).unwrap_or(&entry)
+                        if runner == entry { break }
+                    }
+                }
+            }
+        }
+
+        // Build dominator tree children
+        let mut dom_tree_children: HashMap<usize, [usize]> = HashMap.new()
+        for (&block, &dom) in &idom {
+            if block != dom {
+                dom_tree_children.entry(dom).or_insert_with(|| []).push(block)
+            }
+        }
+
+        DominatorTree { idom, dom_frontier, dom_tree_children }
+    }
+
+    fn intersect(idom: &HashMap<usize, usize>, mut a: usize, mut b: usize, entry: usize) -> usize {
+        while a != b {
+            while a > b { a = *idom.get(&a).unwrap_or(&entry) }
+            while b > a { b = *idom.get(&b).unwrap_or(&entry) }
+        }
+        a
+    }
+
+    fn dominates(self, a: usize, b: usize) -> bool {
+        if a == b { return true }
+        let mut current = b
+        while let some(&dom) = self.idom.get(&current) {
+            if dom == a { return true }
+            if dom == current { break }
+            current = dom
+        }
+        false
+    }
+}
+
+struct Mem2Reg {
+    promoted: usize,
+    phi_inserted: usize,
+    loads_eliminated: usize,
+    stores_eliminated: usize,
+}
+
+impl Mem2Reg {
+    fn new() -> Mem2Reg {
+        Mem2Reg { promoted: 0, phi_inserted: 0, loads_eliminated: 0, stores_eliminated: 0 }
+    }
+
+    fn find_promotable_allocas(func: &Function) -> [AllocaInst] {
+        let mut allocas: [AllocaInst] = []
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                if let Instruction.Alloca(name, ty) = instr {
+                    // Promotable if only loaded/stored (no address taken)
+                    let is_promotable = Self.is_alloca_promotable(func, name)
+                    allocas.push(AllocaInst {
+                        name: name.clone(), ty: ty.clone(), is_promotable,
+                    })
+                }
+            }
+        }
+        allocas
+    }
+
+    fn is_alloca_promotable(func: &Function, name: &str) -> bool {
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                match instr {
+                    Instruction.Store(_, target) if target == name => {},
+                    Instruction.Load(_, source) if source == name => {},
+                    Instruction.Alloca(n, _) if n == name => {},
+                    // Any other use of the alloca means it's not promotable
+                    // (e.g., passed as pointer to a call)
+                    _ => {},
+                }
+            }
+        }
+        true
+    }
+
+    fn compute_phi_placement(self, func: &Function, alloca: &str, dom_tree: &DominatorTree) -> HashSet<usize> {
+        // Blocks that define (store to) the alloca
+        let mut def_blocks: HashSet<usize> = HashSet.new()
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                if let Instruction.Store(_, target) = instr {
+                    if target == alloca { def_blocks.insert(block.id); }
+                }
+            }
+        }
+
+        // Iterated dominance frontier
+        let mut phi_blocks: HashSet<usize> = HashSet.new()
+        let mut worklist: VecDeque<usize> = def_blocks.iter().cloned().collect()
+
+        while let some(block) = worklist.pop_front() {
+            if let some(frontier) = dom_tree.dom_frontier.get(&block) {
+                for &df_block in frontier {
+                    if phi_blocks.insert(df_block) {
+                        worklist.push_back(df_block)
+                    }
+                }
+            }
+        }
+
+        phi_blocks
+    }
+
+    fn promote(mut self, func: &mut Function, dom_tree: &DominatorTree) {
+        let allocas = Self.find_promotable_allocas(func)
+        let promotable: [&AllocaInst] = allocas.iter().filter(|a| a.is_promotable).collect()
+
+        for alloca in &promotable {
+            let phi_blocks = self.compute_phi_placement(func, &alloca.name, dom_tree)
+
+            // Insert phi nodes
+            for &block_id in &phi_blocks {
+                let block = &mut func.blocks[block_id]
+                let preds = block.predecessors.clone()
+                let phi = Instruction.Phi(
+                    format!("{}_phi_{}", alloca.name, block_id),
+                    preds.iter().map(|&p| (p, "undef".to_string())).collect(),
+                )
+                block.instructions.insert(0, phi)
+                self.phi_inserted += 1
+            }
+
+            // Rename: replace loads with reaching definitions
+            let mut reaching_def: HashMap<usize, string> = HashMap.new()
+            self.rename_block(func, 0, &alloca.name, &mut reaching_def, dom_tree)
+
+            // Remove original alloca, stores, and loads
+            for block in func.blocks.iter_mut() {
+                block.instructions.retain(|instr| match instr {
+                    Instruction.Alloca(name, _) if name == &alloca.name => {
+                        self.promoted += 1
+                        false
+                    },
+                    Instruction.Store(_, target) if target == &alloca.name => {
+                        self.stores_eliminated += 1
+                        false
+                    },
+                    Instruction.Load(_, source) if source == &alloca.name => {
+                        self.loads_eliminated += 1
+                        false
+                    },
+                    _ => true,
+                })
+            }
+        }
+    }
+
+    fn rename_block(mut self, func: &mut Function, block_id: usize, alloca: &str,
+                    reaching_def: &mut HashMap<usize, string>, dom_tree: &DominatorTree) {
+        let block = &mut func.blocks[block_id]
+
+        // Process instructions
+        let mut current_def: Option<string> = reaching_def.get(&block_id).cloned()
+
+        for instr in block.instructions.iter_mut() {
+            match instr {
+                Instruction.Store(value, target) if target == alloca => {
+                    current_def = some(value.clone())
+                },
+                Instruction.Load(dest, source) if source == alloca => {
+                    if let some(ref def) = current_def {
+                        // Replace load with the reaching definition
+                        *instr = Instruction.BinOp(dest.clone(), "copy".to_string(), def.clone(), def.clone())
+                    }
+                },
+                Instruction.Phi(dest, _) if dest.starts_with(&format!("{}_phi_", alloca)) => {
+                    current_def = some(dest.clone())
+                },
+                _ => {},
+            }
+        }
+
+        // Propagate to dominated children
+        if let some(children) = dom_tree.dom_tree_children.get(&block_id) {
+            for &child in children {
+                if let some(ref def) = current_def {
+                    reaching_def.insert(child, def.clone())
+                }
+                self.rename_block(func, child, alloca, reaching_def, dom_tree)
+            }
+        }
+    }
+
+    fn stats(self) -> (usize, usize, usize, usize) {
+        (self.promoted, self.phi_inserted, self.loads_eliminated, self.stores_eliminated)
+    }
+}
+
+fn main() {
+    // Build a simple function:
+    // entry:
+    //   %x = alloca i32
+    //   store 0, %x
+    //   br %cond, bb1, bb2
+    // bb1:
+    //   store 1, %x
+    //   jmp bb3
+    // bb2:
+    //   store 2, %x
+    //   jmp bb3
+    // bb3:
+    //   %v = load %x
+    //   ret %v
+
+    let mut func = Function {
+        name: "test".to_string(),
+        blocks: vec![
+            BasicBlock {
+                id: 0, predecessors: [],
+                successors: vec![1, 2],
+                instructions: vec![
+                    Instruction.Alloca("x".to_string(), "i32".to_string()),
+                    Instruction.Store("0".to_string(), "x".to_string()),
+                    Instruction.Branch("cond".to_string(), 1, 2),
+                ],
+            },
+            BasicBlock {
+                id: 1, predecessors: vec![0],
+                successors: vec![3],
+                instructions: vec![
+                    Instruction.Store("1".to_string(), "x".to_string()),
+                    Instruction.Jump(3),
+                ],
+            },
+            BasicBlock {
+                id: 2, predecessors: vec![0],
+                successors: vec![3],
+                instructions: vec![
+                    Instruction.Store("2".to_string(), "x".to_string()),
+                    Instruction.Jump(3),
+                ],
+            },
+            BasicBlock {
+                id: 3, predecessors: vec![1, 2],
+                successors: [],
+                instructions: vec![
+                    Instruction.Load("v".to_string(), "x".to_string()),
+                    Instruction.Return("v".to_string()),
+                ],
+            },
+        ],
+    }
+
+    // Compute dominators
+    let dom_tree = DominatorTree.compute(&func.blocks, 0)
+    assert(dom_tree.idom.contains_key(&1))
+    assert(dom_tree.idom.contains_key(&2))
+    assert(dom_tree.idom.contains_key(&3))
+    print("Dominator tree ✓")
+
+    // Dominance check
+    assert(dom_tree.dominates(0, 1))
+    assert(dom_tree.dominates(0, 3))
+    assert(!dom_tree.dominates(1, 2))
+    print("Dominance check ✓")
+
+    // Dominance frontier: bb3 should be in frontier of bb1 and bb2
+    assert(dom_tree.dom_frontier.get(&1).unwrap().contains(&3))
+    assert(dom_tree.dom_frontier.get(&2).unwrap().contains(&3))
+    print("Dominance frontier ✓")
+
+    // Find promotable allocas
+    let allocas = Mem2Reg.find_promotable_allocas(&func)
+    assert(allocas.len() == 1)
+    assert(allocas[0].name == "x")
+    assert(allocas[0].is_promotable)
+    print("Find promotable allocas ✓")
+
+    // Phi placement
+    let mut m2r = Mem2Reg.new()
+    let phi_blocks = m2r.compute_phi_placement(&func, "x", &dom_tree)
+    assert(phi_blocks.contains(&3))
+    print("Phi placement ✓")
+
+    // Run promotion
+    m2r.promote(&mut func, &dom_tree)
+
+    // Verify: alloca should be removed
+    let has_alloca = func.blocks.iter().any(|b| b.instructions.iter().any(|i|
+        match i { Instruction.Alloca(_, _) => true, _ => false }
+    ))
+    assert(!has_alloca)
+    print("Alloca removed ✓")
+
+    // Verify: phi inserted in bb3
+    let has_phi = func.blocks[3].instructions.iter().any(|i|
+        match i { Instruction.Phi(_, _) => true, _ => false }
+    )
+    assert(has_phi)
+    print("Phi inserted ✓")
+
+    // Stats
+    let (promoted, phis, loads, stores) = m2r.stats()
+    assert(promoted >= 1)
+    assert(phis >= 1)
+    assert(loads >= 1)
+    assert(stores >= 1)
+    print("Stats ✓")
+
+    // AllocaInst
+    let ai = AllocaInst { name: "y".to_string(), ty: "f64".to_string(), is_promotable: true }
+    assert(ai.ty == "f64")
+    print("AllocaInst ✓")
+
+    print("Mem2Reg complete ✓")
+}
