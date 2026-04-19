@@ -1,0 +1,309 @@
+// Compiler Pass - Constant Propagation
+// Replaces variables with their known constant values and evaluates constant expressions.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug, PartialEq)]
+enum ConstValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(string),
+    Unknown,
+    Overdefined,  // multiple possible values
+}
+
+impl ConstValue {
+    fn is_constant(self) -> bool {
+        match self {
+            ConstValue.Unknown | ConstValue.Overdefined => false,
+            _ => true,
+        }
+    }
+
+    fn meet(self, other: &ConstValue) -> ConstValue {
+        match (self, other) {
+            (ConstValue.Unknown, v) => v.clone(),
+            (v, ConstValue.Unknown) => v.clone(),
+            (a, b) if a == *b => a,
+            _ => ConstValue.Overdefined,
+        }
+    }
+
+    fn to_string(self) -> string {
+        match self {
+            ConstValue.Int(n) => n.to_string(),
+            ConstValue.Float(f) => f.to_string(),
+            ConstValue.Bool(b) => b.to_string(),
+            ConstValue.Str(s) => format!("\"{}\"", s),
+            ConstValue.Unknown => "unknown".to_string(),
+            ConstValue.Overdefined => "overdefined".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Instruction {
+    Assign(string, Expr),
+    Branch(Expr, usize, usize),
+    Return(Expr),
+    Call(string, string, [Expr]),  // dest, func, args
+    Phi(string, [(usize, Expr)]),  // dest, [(block, value)]
+}
+
+#[derive(Clone, Debug)]
+enum Expr {
+    Var(string),
+    IntLit(i64),
+    FloatLit(f64),
+    BoolLit(bool),
+    StrLit(string),
+    BinOp(Box<Expr>, BinOp, Box<Expr>),
+    UnaryOp(UnaryOp, Box<Expr>),
+}
+
+#[derive(Clone, Debug)]
+enum BinOp { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or }
+
+#[derive(Clone, Debug)]
+enum UnaryOp { Neg, Not }
+
+struct ConstPropagator {
+    lattice: HashMap<string, ConstValue>,
+    replacements: usize,
+    folds: usize,
+    dead_branches: usize,
+}
+
+impl ConstPropagator {
+    fn new() -> ConstPropagator {
+        ConstPropagator {
+            lattice: HashMap.new(), replacements: 0, folds: 0, dead_branches: 0,
+        }
+    }
+
+    fn set(mut self, var: &str, val: ConstValue) {
+        let existing = self.lattice.get(var).cloned().unwrap_or(ConstValue.Unknown)
+        let merged = existing.meet(&val)
+        self.lattice.insert(var.to_string(), merged)
+    }
+
+    fn get(self, var: &str) -> ConstValue {
+        self.lattice.get(var).cloned().unwrap_or(ConstValue.Unknown)
+    }
+
+    fn evaluate(self, expr: &Expr) -> ConstValue {
+        match expr {
+            Expr.IntLit(n) => ConstValue.Int(*n),
+            Expr.FloatLit(f) => ConstValue.Float(*f),
+            Expr.BoolLit(b) => ConstValue.Bool(*b),
+            Expr.StrLit(s) => ConstValue.Str(s.clone()),
+            Expr.Var(name) => self.get(name),
+            Expr.BinOp(lhs, op, rhs) => {
+                let l = self.evaluate(lhs)
+                let r = self.evaluate(rhs)
+                self.eval_binop(&l, op, &r)
+            },
+            Expr.UnaryOp(op, operand) => {
+                let v = self.evaluate(operand)
+                self.eval_unary(op, &v)
+            },
+        }
+    }
+
+    fn eval_binop(self, lhs: &ConstValue, op: &BinOp, rhs: &ConstValue) -> ConstValue {
+        match (lhs, op, rhs) {
+            (ConstValue.Int(a), BinOp.Add, ConstValue.Int(b)) => ConstValue.Int(a + b),
+            (ConstValue.Int(a), BinOp.Sub, ConstValue.Int(b)) => ConstValue.Int(a - b),
+            (ConstValue.Int(a), BinOp.Mul, ConstValue.Int(b)) => ConstValue.Int(a * b),
+            (ConstValue.Int(a), BinOp.Div, ConstValue.Int(b)) if *b != 0 => ConstValue.Int(a / b),
+            (ConstValue.Int(a), BinOp.Mod, ConstValue.Int(b)) if *b != 0 => ConstValue.Int(a % b),
+            (ConstValue.Int(a), BinOp.Eq, ConstValue.Int(b)) => ConstValue.Bool(a == b),
+            (ConstValue.Int(a), BinOp.Ne, ConstValue.Int(b)) => ConstValue.Bool(a != b),
+            (ConstValue.Int(a), BinOp.Lt, ConstValue.Int(b)) => ConstValue.Bool(a < b),
+            (ConstValue.Int(a), BinOp.Le, ConstValue.Int(b)) => ConstValue.Bool(a <= b),
+            (ConstValue.Int(a), BinOp.Gt, ConstValue.Int(b)) => ConstValue.Bool(a > b),
+            (ConstValue.Int(a), BinOp.Ge, ConstValue.Int(b)) => ConstValue.Bool(a >= b),
+            (ConstValue.Float(a), BinOp.Add, ConstValue.Float(b)) => ConstValue.Float(a + b),
+            (ConstValue.Float(a), BinOp.Sub, ConstValue.Float(b)) => ConstValue.Float(a - b),
+            (ConstValue.Float(a), BinOp.Mul, ConstValue.Float(b)) => ConstValue.Float(a * b),
+            (ConstValue.Float(a), BinOp.Div, ConstValue.Float(b)) if *b != 0.0 => ConstValue.Float(a / b),
+            (ConstValue.Bool(a), BinOp.And, ConstValue.Bool(b)) => ConstValue.Bool(*a && *b),
+            (ConstValue.Bool(a), BinOp.Or, ConstValue.Bool(b)) => ConstValue.Bool(*a || *b),
+            (ConstValue.Bool(a), BinOp.Eq, ConstValue.Bool(b)) => ConstValue.Bool(a == b),
+            (ConstValue.Str(a), BinOp.Eq, ConstValue.Str(b)) => ConstValue.Bool(a == b),
+            _ if !lhs.is_constant() || !rhs.is_constant() => ConstValue.Unknown,
+            _ => ConstValue.Overdefined,
+        }
+    }
+
+    fn eval_unary(self, op: &UnaryOp, val: &ConstValue) -> ConstValue {
+        match (op, val) {
+            (UnaryOp.Neg, ConstValue.Int(n)) => ConstValue.Int(-n),
+            (UnaryOp.Neg, ConstValue.Float(f)) => ConstValue.Float(-f),
+            (UnaryOp.Not, ConstValue.Bool(b)) => ConstValue.Bool(!b),
+            _ if !val.is_constant() => ConstValue.Unknown,
+            _ => ConstValue.Overdefined,
+        }
+    }
+
+    fn propagate(mut self, instr: &Instruction) -> Instruction {
+        match instr {
+            Instruction.Assign(dest, expr) => {
+                let val = self.evaluate(expr)
+                self.set(dest, val.clone())
+                if val.is_constant() {
+                    self.folds += 1
+                    let folded = match val {
+                        ConstValue.Int(n) => Expr.IntLit(n),
+                        ConstValue.Float(f) => Expr.FloatLit(f),
+                        ConstValue.Bool(b) => Expr.BoolLit(b),
+                        ConstValue.Str(s) => Expr.StrLit(s),
+                        _ => unreachable!(),
+                    }
+                    Instruction.Assign(dest.clone(), folded)
+                } else { instr.clone() }
+            },
+            Instruction.Branch(cond, then_bb, else_bb) => {
+                let val = self.evaluate(cond)
+                match val {
+                    ConstValue.Bool(true) => {
+                        self.dead_branches += 1
+                        Instruction.Branch(Expr.BoolLit(true), *then_bb, *then_bb)
+                    },
+                    ConstValue.Bool(false) => {
+                        self.dead_branches += 1
+                        Instruction.Branch(Expr.BoolLit(false), *else_bb, *else_bb)
+                    },
+                    _ => instr.clone(),
+                }
+            },
+            Instruction.Return(expr) => {
+                let val = self.evaluate(expr)
+                if val.is_constant() {
+                    self.replacements += 1
+                    match val {
+                        ConstValue.Int(n) => Instruction.Return(Expr.IntLit(n)),
+                        ConstValue.Float(f) => Instruction.Return(Expr.FloatLit(f)),
+                        ConstValue.Bool(b) => Instruction.Return(Expr.BoolLit(b)),
+                        _ => instr.clone(),
+                    }
+                } else { instr.clone() }
+            },
+            _ => instr.clone(),
+        }
+    }
+
+    fn stats(self) -> (usize, usize, usize) {
+        (self.replacements, self.folds, self.dead_branches)
+    }
+}
+
+fn main() {
+    let mut cp = ConstPropagator.new()
+
+    // Basic constant assignment
+    let instr = Instruction.Assign("x".to_string(),
+        Expr.BinOp(Box.new(Expr.IntLit(3)), BinOp.Add, Box.new(Expr.IntLit(4))))
+    let result = cp.propagate(&instr)
+    assert(cp.get("x") == ConstValue.Int(7))
+    print("Const fold 3+4=7 ✓")
+
+    // Propagate through variable
+    let instr2 = Instruction.Assign("y".to_string(),
+        Expr.BinOp(Box.new(Expr.Var("x".to_string())), BinOp.Mul, Box.new(Expr.IntLit(2))))
+    let result2 = cp.propagate(&instr2)
+    assert(cp.get("y") == ConstValue.Int(14))
+    print("Propagate x*2=14 ✓")
+
+    // Boolean fold
+    let bool_instr = Instruction.Assign("cond".to_string(),
+        Expr.BinOp(Box.new(Expr.IntLit(5)), BinOp.Lt, Box.new(Expr.IntLit(10))))
+    cp.propagate(&bool_instr)
+    assert(cp.get("cond") == ConstValue.Bool(true))
+    print("Bool fold 5<10=true ✓")
+
+    // Branch elimination
+    let branch = Instruction.Branch(Expr.Var("cond".to_string()), 1, 2)
+    let br_result = cp.propagate(&branch)
+    print("Dead branch eliminated ✓")
+
+    // Unknown propagation
+    cp.set("dyn", ConstValue.Unknown)
+    let dyn_instr = Instruction.Assign("r".to_string(),
+        Expr.BinOp(Box.new(Expr.Var("dyn".to_string())), BinOp.Add, Box.new(Expr.IntLit(1))))
+    cp.propagate(&dyn_instr)
+    assert(cp.get("r") == ConstValue.Unknown)
+    print("Unknown propagated ✓")
+
+    // Evaluate
+    assert(cp.evaluate(&Expr.IntLit(42)) == ConstValue.Int(42))
+    assert(cp.evaluate(&Expr.FloatLit(3.14)) == ConstValue.Float(3.14))
+    assert(cp.evaluate(&Expr.BoolLit(true)) == ConstValue.Bool(true))
+    print("Evaluate literals ✓")
+
+    // Unary ops
+    let neg = cp.eval_unary(&UnaryOp.Neg, &ConstValue.Int(5))
+    assert(neg == ConstValue.Int(-5))
+    let not = cp.eval_unary(&UnaryOp.Not, &ConstValue.Bool(true))
+    assert(not == ConstValue.Bool(false))
+    print("Unary ops ✓")
+
+    // String eq
+    let seq = cp.eval_binop(&ConstValue.Str("hi".to_string()), &BinOp.Eq, &ConstValue.Str("hi".to_string()))
+    assert(seq == ConstValue.Bool(true))
+    print("String eq ✓")
+
+    // Meet lattice
+    let m1 = ConstValue.Unknown.meet(&ConstValue.Int(5))
+    assert(m1 == ConstValue.Int(5))
+    let m2 = ConstValue.Int(5).meet(&ConstValue.Int(5))
+    assert(m2 == ConstValue.Int(5))
+    let m3 = ConstValue.Int(5).meet(&ConstValue.Int(6))
+    assert(m3 == ConstValue.Overdefined)
+    print("Meet lattice ✓")
+
+    // is_constant
+    assert(ConstValue.Int(1).is_constant())
+    assert(ConstValue.Float(1.0).is_constant())
+    assert(ConstValue.Bool(true).is_constant())
+    assert(!ConstValue.Unknown.is_constant())
+    assert(!ConstValue.Overdefined.is_constant())
+    print("is_constant ✓")
+
+    // to_string
+    assert(ConstValue.Int(42).to_string() == "42")
+    assert(ConstValue.Bool(true).to_string() == "true")
+    assert(ConstValue.Unknown.to_string() == "unknown")
+    print("to_string ✓")
+
+    // Stats
+    let (r, f, d) = cp.stats()
+    assert(f > 0)
+    assert(d > 0)
+    print("Stats ✓")
+
+    // Float ops
+    let fadd = cp.eval_binop(&ConstValue.Float(1.5), &BinOp.Add, &ConstValue.Float(2.5))
+    assert(fadd == ConstValue.Float(4.0))
+    print("Float add ✓")
+
+    // Bool ops
+    let band = cp.eval_binop(&ConstValue.Bool(true), &BinOp.And, &ConstValue.Bool(false))
+    assert(band == ConstValue.Bool(false))
+    let bor = cp.eval_binop(&ConstValue.Bool(false), &BinOp.Or, &ConstValue.Bool(true))
+    assert(bor == ConstValue.Bool(true))
+    print("Bool ops ✓")
+
+    // Div by zero
+    let dbz = cp.eval_binop(&ConstValue.Int(10), &BinOp.Div, &ConstValue.Int(0))
+    assert(!dbz.is_constant())
+    print("Div by zero safe ✓")
+
+    // Return folding
+    let ret = Instruction.Return(Expr.BinOp(Box.new(Expr.IntLit(10)), BinOp.Add, Box.new(Expr.IntLit(20))))
+    let ret_result = cp.propagate(&ret)
+    print("Return folded ✓")
+
+    print("Constant Propagation complete ✓")
+}
