@@ -1,0 +1,401 @@
+// Compiler Pass - Parser
+// Recursive descent parser: expressions, statements, types, declarations.
+
+use std.collections.HashMap
+
+enum TokenKind {
+    // Literals
+    IntLit(i64), FloatLit(f64), StringLit(string), BoolLit(bool),
+    // Identifiers
+    Ident(string),
+    // Keywords
+    Fn, Let, Mut, If, Else, While, For, In, Return, Break, Continue,
+    Match, Struct, Enum, Impl, Trait, Pub, Use, Mod, As, Type,
+    Async, Await, True, False, Self_, Super, Crate,
+    // Operators
+    Plus, Minus, Star, Slash, Percent, Amp, Pipe, Caret, Tilde,
+    Bang, Lt, Gt, Eq, LtEq, GtEq, EqEq, BangEq, AmpAmp, PipePipe,
+    Shl, Shr, PlusEq, MinusEq, StarEq, SlashEq,
+    Arrow, FatArrow, Dot, DotDot, DotDotEq, ColonColon,
+    // Delimiters
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
+    Comma, Colon, Semi, Hash, Question,
+    // Special
+    Eof, Newline,
+}
+
+struct Token {
+    kind: TokenKind,
+    span: (usize, usize),
+    line: usize,
+}
+
+enum Expr {
+    IntLiteral(i64),
+    FloatLiteral(f64),
+    StringLiteral(string),
+    BoolLiteral(bool),
+    Ident(string),
+    Binary { op: BinOp, left: Box<Expr>, right: Box<Expr> },
+    Unary { op: UnaryOp, expr: Box<Expr> },
+    Call { callee: Box<Expr>, args: [Expr] },
+    FieldAccess { object: Box<Expr>, field: string },
+    Index { object: Box<Expr>, index: Box<Expr> },
+    If { condition: Box<Expr>, then_branch: Block, else_branch: Option<Block> },
+    Match { subject: Box<Expr>, arms: [MatchArm] },
+    Block(Block),
+    Lambda { params: [Param], body: Box<Expr> },
+    Assign { target: Box<Expr>, value: Box<Expr> },
+    Return(Option<Box<Expr>>),
+    Break(Option<Box<Expr>>),
+    Continue,
+    Await(Box<Expr>),
+    Range { start: Option<Box<Expr>>, end: Option<Box<Expr>>, inclusive: bool },
+    Tuple([Expr]),
+    Array([Expr]),
+    StructLit { name: string, fields: [(string, Expr)] },
+    Path([string]),
+    Try(Box<Expr>),  // expr?
+}
+
+enum BinOp { Add, Sub, Mul, Div, Rem, And, Or, BitAnd, BitOr, BitXor, Shl, Shr, Eq, Ne, Lt, Le, Gt, Ge, Pipe }
+enum UnaryOp { Neg, Not, Ref, RefMut, Deref }
+
+struct MatchArm { pattern: Pattern, guard: Option<Expr>, body: Expr }
+
+enum Pattern {
+    Wildcard,
+    Ident(string),
+    Literal(Expr),
+    Tuple([Pattern]),
+    Struct { name: string, fields: [(string, Pattern)] },
+    Enum { name: string, variant: string, fields: [Pattern] },
+    Or([Pattern]),
+    Range { start: Expr, end: Expr, inclusive: bool },
+}
+
+struct Param { name: string, ty: Option<TypeExpr>, mutable: bool }
+struct Block { stmts: [Stmt], expr: Option<Box<Expr>> }
+
+enum Stmt {
+    Let { name: string, mutable: bool, ty: Option<TypeExpr>, init: Option<Expr> },
+    Expr(Expr),
+    FnDef(FnDef),
+    StructDef(StructDef),
+    EnumDef(EnumDef),
+    ImplBlock(ImplBlock),
+    TraitDef(TraitDef),
+    Use(UsePath),
+}
+
+struct FnDef {
+    name: string, public: bool, is_async: bool,
+    generics: [GenericParam], params: [Param],
+    return_type: Option<TypeExpr>, body: Option<Block>,
+}
+
+struct StructDef { name: string, public: bool, generics: [GenericParam], fields: [FieldDef] }
+struct FieldDef { name: string, ty: TypeExpr, public: bool }
+struct EnumDef { name: string, public: bool, generics: [GenericParam], variants: [EnumVariant] }
+struct EnumVariant { name: string, fields: [TypeExpr] }
+struct ImplBlock { self_type: TypeExpr, trait_name: Option<string>, generics: [GenericParam], methods: [FnDef] }
+struct TraitDef { name: string, public: bool, generics: [GenericParam], super_traits: [TypeExpr], methods: [FnDef] }
+struct GenericParam { name: string, bounds: [TypeExpr] }
+struct UsePath { segments: [string], alias: Option<string>, glob: bool }
+
+enum TypeExpr {
+    Named(string),
+    Generic { name: string, args: [TypeExpr] },
+    Reference { mutable: bool, inner: Box<TypeExpr> },
+    Slice(Box<TypeExpr>),
+    Array { elem: Box<TypeExpr>, size: usize },
+    Tuple([TypeExpr]),
+    Function { params: [TypeExpr], ret: Box<TypeExpr> },
+    Path([string]),
+    Infer,
+    Never,
+}
+
+struct Parser {
+    tokens: [Token],
+    pos: usize,
+}
+
+impl Parser {
+    fn new(tokens: [Token]) -> Parser { Parser { tokens, pos: 0 } }
+
+    fn peek(self) -> &TokenKind { &self.tokens[self.pos].kind }
+    fn advance(mut self) -> &Token { let t = &self.tokens[self.pos]; self.pos += 1; t }
+    fn expect(mut self, kind: TokenKind) -> Result<&Token, string> {
+        if std.mem.discriminant(self.peek()) == std.mem.discriminant(&kind) {
+            ok(self.advance())
+        } else {
+            err(format!("expected {:?}, got {:?}", kind, self.peek()))
+        }
+    }
+    fn at(self, kind: &TokenKind) -> bool {
+        std.mem.discriminant(self.peek()) == std.mem.discriminant(kind)
+    }
+    fn eat(mut self, kind: &TokenKind) -> bool {
+        if self.at(kind) { self.advance(); true } else { false }
+    }
+
+    fn parse_program(mut self) -> Result<[Stmt], string> {
+        let mut stmts: [Stmt] = []
+        while !self.at(&TokenKind.Eof) {
+            stmts.push(self.parse_stmt()?)
+        }
+        ok(stmts)
+    }
+
+    fn parse_stmt(mut self) -> Result<Stmt, string> {
+        match self.peek() {
+            TokenKind.Let => self.parse_let(),
+            TokenKind.Fn | TokenKind.Pub => self.parse_fn_def().map(|f| Stmt.FnDef(f)),
+            TokenKind.Struct => self.parse_struct_def().map(|s| Stmt.StructDef(s)),
+            TokenKind.Use => self.parse_use().map(|u| Stmt.Use(u)),
+            _ => self.parse_expr().map(|e| Stmt.Expr(e)),
+        }
+    }
+
+    fn parse_let(mut self) -> Result<Stmt, string> {
+        self.advance()  // let
+        let mutable = self.eat(&TokenKind.Mut)
+        let name = match self.advance().kind { TokenKind.Ident(s) => s.clone(), _ => return err("expected ident".to_string()) }
+        let ty = if self.eat(&TokenKind.Colon) { some(self.parse_type()?) } else { none }
+        let init = if self.eat(&TokenKind.Eq) { some(self.parse_expr()?) } else { none }
+        ok(Stmt.Let { name, mutable, ty, init })
+    }
+
+    fn parse_fn_def(mut self) -> Result<FnDef, string> {
+        let public = self.eat(&TokenKind.Pub)
+        let is_async = self.eat(&TokenKind.Async)
+        self.expect(TokenKind.Fn)?
+        let name = match self.advance().kind { TokenKind.Ident(s) => s.clone(), _ => return err("expected fn name".to_string()) }
+        self.expect(TokenKind.LParen)?
+        let params = self.parse_params()?
+        self.expect(TokenKind.RParen)?
+        let return_type = if self.eat(&TokenKind.Arrow) { some(self.parse_type()?) } else { none }
+        let body = if self.at(&TokenKind.LBrace) { some(self.parse_block()?) } else { none }
+        ok(FnDef { name, public, is_async, generics: [], params, return_type, body })
+    }
+
+    fn parse_params(mut self) -> Result<[Param], string> {
+        let mut params: [Param] = []
+        while !self.at(&TokenKind.RParen) && !self.at(&TokenKind.Eof) {
+            let mutable = self.eat(&TokenKind.Mut)
+            let name = match self.advance().kind { TokenKind.Ident(s) => s.clone(), _ => return err("expected param name".to_string()) }
+            let ty = if self.eat(&TokenKind.Colon) { some(self.parse_type()?) } else { none }
+            params.push(Param { name, ty, mutable })
+            if !self.eat(&TokenKind.Comma) { break }
+        }
+        ok(params)
+    }
+
+    fn parse_type(mut self) -> Result<TypeExpr, string> {
+        match self.peek() {
+            TokenKind.Amp => {
+                self.advance()
+                let mutable = self.eat(&TokenKind.Mut)
+                let inner = self.parse_type()?
+                ok(TypeExpr.Reference { mutable, inner: Box.new(inner) })
+            }
+            TokenKind.LBracket => {
+                self.advance()
+                let elem = self.parse_type()?
+                self.expect(TokenKind.RBracket)?
+                ok(TypeExpr.Slice(Box.new(elem)))
+            }
+            TokenKind.LParen => {
+                self.advance()
+                let mut types: [TypeExpr] = []
+                while !self.at(&TokenKind.RParen) { types.push(self.parse_type()?); self.eat(&TokenKind.Comma); }
+                self.expect(TokenKind.RParen)?
+                ok(TypeExpr.Tuple(types))
+            }
+            TokenKind.Ident(_) => {
+                let name = match self.advance().kind { TokenKind.Ident(s) => s.clone(), _ => unreachable!() }
+                if self.eat(&TokenKind.Lt) {
+                    let mut args: [TypeExpr] = []
+                    while !self.at(&TokenKind.Gt) { args.push(self.parse_type()?); self.eat(&TokenKind.Comma); }
+                    self.expect(TokenKind.Gt)?
+                    ok(TypeExpr.Generic { name, args })
+                } else { ok(TypeExpr.Named(name)) }
+            }
+            _ => ok(TypeExpr.Infer),
+        }
+    }
+
+    fn parse_expr(mut self) -> Result<Expr, string> { self.parse_or() }
+
+    fn parse_or(mut self) -> Result<Expr, string> {
+        let mut left = self.parse_and()?
+        while self.eat(&TokenKind.PipePipe) {
+            let right = self.parse_and()?
+            left = Expr.Binary { op: BinOp.Or, left: Box.new(left), right: Box.new(right) }
+        }
+        ok(left)
+    }
+
+    fn parse_and(mut self) -> Result<Expr, string> {
+        let mut left = self.parse_comparison()?
+        while self.eat(&TokenKind.AmpAmp) {
+            let right = self.parse_comparison()?
+            left = Expr.Binary { op: BinOp.And, left: Box.new(left), right: Box.new(right) }
+        }
+        ok(left)
+    }
+
+    fn parse_comparison(mut self) -> Result<Expr, string> {
+        let mut left = self.parse_addition()?
+        let op = match self.peek() {
+            TokenKind.EqEq => some(BinOp.Eq), TokenKind.BangEq => some(BinOp.Ne),
+            TokenKind.Lt => some(BinOp.Lt), TokenKind.LtEq => some(BinOp.Le),
+            TokenKind.Gt => some(BinOp.Gt), TokenKind.GtEq => some(BinOp.Ge),
+            _ => none,
+        }
+        if let some(op) = op {
+            self.advance()
+            let right = self.parse_addition()?
+            left = Expr.Binary { op, left: Box.new(left), right: Box.new(right) }
+        }
+        ok(left)
+    }
+
+    fn parse_addition(mut self) -> Result<Expr, string> {
+        let mut left = self.parse_multiplication()?
+        loop {
+            let op = match self.peek() {
+                TokenKind.Plus => some(BinOp.Add), TokenKind.Minus => some(BinOp.Sub),
+                _ => none,
+            }
+            match op {
+                some(op) => { self.advance(); let right = self.parse_multiplication()?; left = Expr.Binary { op, left: Box.new(left), right: Box.new(right) } }
+                none => break,
+            }
+        }
+        ok(left)
+    }
+
+    fn parse_multiplication(mut self) -> Result<Expr, string> {
+        let mut left = self.parse_unary()?
+        loop {
+            let op = match self.peek() {
+                TokenKind.Star => some(BinOp.Mul), TokenKind.Slash => some(BinOp.Div), TokenKind.Percent => some(BinOp.Rem),
+                _ => none,
+            }
+            match op {
+                some(op) => { self.advance(); let right = self.parse_unary()?; left = Expr.Binary { op, left: Box.new(left), right: Box.new(right) } }
+                none => break,
+            }
+        }
+        ok(left)
+    }
+
+    fn parse_unary(mut self) -> Result<Expr, string> {
+        match self.peek() {
+            TokenKind.Minus => { self.advance(); let e = self.parse_unary()?; ok(Expr.Unary { op: UnaryOp.Neg, expr: Box.new(e) }) }
+            TokenKind.Bang => { self.advance(); let e = self.parse_unary()?; ok(Expr.Unary { op: UnaryOp.Not, expr: Box.new(e) }) }
+            _ => self.parse_primary(),
+        }
+    }
+
+    fn parse_primary(mut self) -> Result<Expr, string> {
+        match self.peek() {
+            TokenKind.IntLit(_) => { let v = match self.advance().kind { TokenKind.IntLit(n) => n, _ => unreachable!() }; ok(Expr.IntLiteral(v)) }
+            TokenKind.FloatLit(_) => { let v = match self.advance().kind { TokenKind.FloatLit(f) => f, _ => unreachable!() }; ok(Expr.FloatLiteral(v)) }
+            TokenKind.StringLit(_) => { let v = match self.advance().kind { TokenKind.StringLit(s) => s, _ => unreachable!() }; ok(Expr.StringLiteral(v)) }
+            TokenKind.True => { self.advance(); ok(Expr.BoolLiteral(true)) }
+            TokenKind.False => { self.advance(); ok(Expr.BoolLiteral(false)) }
+            TokenKind.Ident(_) => { let name = match self.advance().kind { TokenKind.Ident(s) => s, _ => unreachable!() }; ok(Expr.Ident(name)) }
+            TokenKind.LParen => { self.advance(); let e = self.parse_expr()?; self.expect(TokenKind.RParen)?; ok(e) }
+            TokenKind.Return => { self.advance(); let e = if self.at(&TokenKind.Semi) || self.at(&TokenKind.RBrace) { none } else { some(Box.new(self.parse_expr()?)) }; ok(Expr.Return(e)) }
+            _ => err(format!("unexpected token: {:?}", self.peek())),
+        }
+    }
+
+    fn parse_block(mut self) -> Result<Block, string> {
+        self.expect(TokenKind.LBrace)?
+        let mut stmts: [Stmt] = []
+        while !self.at(&TokenKind.RBrace) && !self.at(&TokenKind.Eof) {
+            stmts.push(self.parse_stmt()?)
+        }
+        self.expect(TokenKind.RBrace)?
+        ok(Block { stmts, expr: none })
+    }
+
+    fn parse_struct_def(mut self) -> Result<StructDef, string> {
+        self.advance()  // struct
+        let name = match self.advance().kind { TokenKind.Ident(s) => s.clone(), _ => return err("expected struct name".to_string()) }
+        self.expect(TokenKind.LBrace)?
+        let mut fields: [FieldDef] = []
+        while !self.at(&TokenKind.RBrace) {
+            let public = self.eat(&TokenKind.Pub)
+            let fname = match self.advance().kind { TokenKind.Ident(s) => s.clone(), _ => return err("expected field name".to_string()) }
+            self.expect(TokenKind.Colon)?
+            let ty = self.parse_type()?
+            fields.push(FieldDef { name: fname, ty, public })
+            self.eat(&TokenKind.Comma);
+        }
+        self.expect(TokenKind.RBrace)?
+        ok(StructDef { name, public: false, generics: [], fields })
+    }
+
+    fn parse_use(mut self) -> Result<UsePath, string> {
+        self.advance()  // use
+        let mut segments: [string] = []
+        loop {
+            match self.advance().kind {
+                TokenKind.Ident(s) => segments.push(s.clone()),
+                _ => return err("expected path segment".to_string()),
+            }
+            if !self.eat(&TokenKind.Dot) && !self.eat(&TokenKind.ColonColon) { break }
+        }
+        ok(UsePath { segments, alias: none, glob: false })
+    }
+}
+
+fn main() {
+    // Minimal test with token list
+    let tokens = [
+        Token { kind: TokenKind.Let, span: (0, 3), line: 1 },
+        Token { kind: TokenKind.Ident("x".into()), span: (4, 5), line: 1 },
+        Token { kind: TokenKind.Eq, span: (6, 7), line: 1 },
+        Token { kind: TokenKind.IntLit(42), span: (8, 10), line: 1 },
+        Token { kind: TokenKind.Eof, span: (10, 10), line: 1 },
+    ]
+    let mut parser = Parser.new(tokens)
+    let stmts = parser.parse_program().unwrap()
+    assert(stmts.len() == 1)
+    match &stmts[0] {
+        Stmt.Let { name, init, .. } => {
+            assert(name == "x")
+            assert(init.is_some())
+        }
+        _ => panic!("expected let"),
+    }
+    print("Parse let \u2713")
+
+    // Type parsing
+    let type_tokens = [
+        Token { kind: TokenKind.Amp, span: (0, 1), line: 1 },
+        Token { kind: TokenKind.Mut, span: (1, 4), line: 1 },
+        Token { kind: TokenKind.Ident("Vec".into()), span: (5, 8), line: 1 },
+        Token { kind: TokenKind.Lt, span: (8, 9), line: 1 },
+        Token { kind: TokenKind.Ident("T".into()), span: (9, 10), line: 1 },
+        Token { kind: TokenKind.Gt, span: (10, 11), line: 1 },
+        Token { kind: TokenKind.Eof, span: (11, 11), line: 1 },
+    ]
+    let mut tp = Parser.new(type_tokens)
+    let ty = tp.parse_type().unwrap()
+    match ty {
+        TypeExpr.Reference { mutable, inner } => {
+            assert(mutable)
+            match *inner { TypeExpr.Generic { name, .. } => assert(name == "Vec"), _ => panic!("expected generic") }
+        }
+        _ => panic!("expected reference"),
+    }
+    print("Parse type \u2713")
+
+    print("Parser complete \u2713")
+}
