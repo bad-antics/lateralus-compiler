@@ -1,0 +1,198 @@
+// src/passes/peephole_optimizer.ltl — Machine-level peephole optimizations
+use std.collections.HashMap
+
+// ── Machine instruction representation ───────────────────────────────────────
+type Reg = u8
+
+enum Operand {
+    Register(Reg),
+    Immediate(i64),
+    Memory { base: Reg, offset: i32 },
+    Label(string),
+}
+
+enum MachineInst {
+    Mov   { dst: Operand, src: Operand },
+    Add   { dst: Reg, lhs: Reg, rhs: Operand },
+    Sub   { dst: Reg, lhs: Reg, rhs: Operand },
+    Mul   { dst: Reg, lhs: Reg, rhs: Operand },
+    Div   { dst: Reg, lhs: Reg, rhs: Operand },
+    And   { dst: Reg, lhs: Reg, rhs: Operand },
+    Or    { dst: Reg, lhs: Reg, rhs: Operand },
+    Xor   { dst: Reg, lhs: Reg, rhs: Operand },
+    Shl   { dst: Reg, src: Reg, amount: Operand },
+    Shr   { dst: Reg, src: Reg, amount: Operand },
+    Cmp   { lhs: Reg, rhs: Operand },
+    Test  { lhs: Reg, rhs: Operand },
+    Jmp   { target: string },
+    Jcc   { cond: CondCode, target: string },
+    Call  { target: string },
+    Ret,
+    Push  { src: Operand },
+    Pop   { dst: Reg },
+    Lea   { dst: Reg, base: Reg, index: Option<(Reg, u8)>, disp: i32 },
+    Nop,
+    Label(string),
+}
+
+enum CondCode { Eq, Ne, Lt, Le, Gt, Ge, Zero, NonZero }
+
+// ── Peephole patterns ────────────────────────────────────────────────────────
+struct PeepholeOptimizer {
+    patterns_applied: HashMap<string, u32>,
+    total_removed: u32,
+}
+
+impl PeepholeOptimizer {
+    fn new() -> PeepholeOptimizer {
+        PeepholeOptimizer { patterns_applied: HashMap.new(), total_removed: 0 }
+    }
+
+    fn record(mut self, name: &str, count: u32) {
+        *self.patterns_applied.entry(name.to_string()).or_insert(0) += count
+        self.total_removed += count
+    }
+
+    fn optimize(mut self, insts: &mut [MachineInst]) -> u32 {
+        let mut changed = true
+        let mut total: u32 = 0
+
+        while changed {
+            changed = false
+            let mut i = 0
+            while i < insts.len() {
+                // ── Single-instruction patterns ──────────────────────────
+                match &insts[i] {
+                    // mov rX, rX → nop
+                    MachineInst.Mov { dst: Operand.Register(d), src: Operand.Register(s) } if d == s => {
+                        insts[i] = MachineInst.Nop
+                        self.record("redundant_mov", 1)
+                        changed = true; total += 1
+                    }
+                    // add rX, rX, #0 → nop
+                    MachineInst.Add { dst, lhs, rhs: Operand.Immediate(0) } if dst == lhs => {
+                        insts[i] = MachineInst.Nop
+                        self.record("add_zero", 1)
+                        changed = true; total += 1
+                    }
+                    // sub rX, rX, #0 → nop
+                    MachineInst.Sub { dst, lhs, rhs: Operand.Immediate(0) } if dst == lhs => {
+                        insts[i] = MachineInst.Nop
+                        self.record("sub_zero", 1)
+                        changed = true; total += 1
+                    }
+                    // mul rX, rY, #1 → mov rX, rY
+                    MachineInst.Mul { dst, lhs, rhs: Operand.Immediate(1) } => {
+                        let d = *dst; let l = *lhs
+                        insts[i] = MachineInst.Mov { dst: Operand.Register(d), src: Operand.Register(l) }
+                        self.record("mul_one", 1)
+                        changed = true; total += 1
+                    }
+                    // mul rX, rY, #0 → mov rX, #0
+                    MachineInst.Mul { dst, rhs: Operand.Immediate(0), .. } => {
+                        let d = *dst
+                        insts[i] = MachineInst.Mov { dst: Operand.Register(d), src: Operand.Immediate(0) }
+                        self.record("mul_zero", 1)
+                        changed = true; total += 1
+                    }
+                    // mul rX, rY, #2^n → shl rX, rY, #n
+                    MachineInst.Mul { dst, lhs, rhs: Operand.Immediate(n) } if (*n > 0) && ((*n as u64) & (*n as u64 - 1)) == 0 => {
+                        let d = *dst; let l = *lhs
+                        let shift = (*n as u64).trailing_zeros() as i64
+                        insts[i] = MachineInst.Shl { dst: d, src: l, amount: Operand.Immediate(shift) }
+                        self.record("mul_power2_to_shl", 1)
+                        changed = true; total += 1
+                    }
+                    // xor rX, rX, rX → mov rX, #0  (already an idiom, but normalize)
+                    MachineInst.Xor { dst, lhs, rhs: Operand.Register(r) } if dst == lhs && lhs == r => {
+                        // This is already the zero idiom, keep it
+                    }
+                    _ => {}
+                }
+
+                // ── Two-instruction patterns ─────────────────────────────
+                if i + 1 < insts.len() {
+                    match (&insts[i], &insts[i+1]) {
+                        // push rX; pop rX → nop nop
+                        (MachineInst.Push { src: Operand.Register(s) }, MachineInst.Pop { dst: d }) if s == d => {
+                            insts[i] = MachineInst.Nop
+                            insts[i+1] = MachineInst.Nop
+                            self.record("push_pop_same", 2)
+                            changed = true; total += 2
+                        }
+                        // push rX; pop rY → mov rY, rX
+                        (MachineInst.Push { src: Operand.Register(s) }, MachineInst.Pop { dst: d }) => {
+                            let from = *s; let to = *d
+                            insts[i] = MachineInst.Mov { dst: Operand.Register(to), src: Operand.Register(from) }
+                            insts[i+1] = MachineInst.Nop
+                            self.record("push_pop_to_mov", 1)
+                            changed = true; total += 1
+                        }
+                        // mov rX, rY; mov rY, rX → mov rX, rY (remove second)
+                        (MachineInst.Mov { dst: Operand.Register(d1), src: Operand.Register(s1) },
+                         MachineInst.Mov { dst: Operand.Register(d2), src: Operand.Register(s2) })
+                        if d1 == s2 && s1 == d2 => {
+                            insts[i+1] = MachineInst.Nop
+                            self.record("redundant_swap_mov", 1)
+                            changed = true; total += 1
+                        }
+                        // jmp L; L: → nop (jump to next instruction)
+                        (MachineInst.Jmp { target }, MachineInst.Label(label)) if target == label => {
+                            insts[i] = MachineInst.Nop
+                            self.record("jmp_next", 1)
+                            changed = true; total += 1
+                        }
+                        _ => {}
+                    }
+                }
+
+                i += 1
+            }
+
+            // Remove nops
+            insts.retain(|i| !matches!(i, MachineInst.Nop))
+        }
+        total
+    }
+}
+
+fn main() {
+    let mut opt = PeepholeOptimizer.new()
+
+    // Test: redundant mov
+    let mut code = [
+        MachineInst.Mov { dst: Operand.Register(0), src: Operand.Register(0) },
+        MachineInst.Add { dst: 1, lhs: 1, rhs: Operand.Immediate(0) },
+        MachineInst.Mul { dst: 2, lhs: 3, rhs: Operand.Immediate(8) },  // *8 → <<3
+        MachineInst.Push { src: Operand.Register(5) },
+        MachineInst.Pop { dst: 5 },
+        MachineInst.Jmp { target: "next".to_string() },
+        MachineInst.Label("next".to_string()),
+        MachineInst.Ret,
+    ]
+
+    let before = code.len()
+    let removed = opt.optimize(&mut code)
+    print("Before: ${before} instructions")
+    print("After:  ${code.len()} instructions")
+    print("Removed: ${removed}")
+
+    for (pattern, count) in &opt.patterns_applied {
+        print("  ${pattern}: ${count}")
+    }
+
+    assert(code.len() < before, "should have fewer instructions")
+    assert(opt.patterns_applied.contains_key("redundant_mov"))
+    assert(opt.patterns_applied.contains_key("add_zero"))
+    assert(opt.patterns_applied.contains_key("mul_power2_to_shl"))
+    assert(opt.patterns_applied.contains_key("push_pop_same"))
+    assert(opt.patterns_applied.contains_key("jmp_next"))
+    print("All peephole patterns verified ✓")
+
+    // Verify mul *8 became shl 3
+    let has_shl = code.iter().any(|i| matches!(i, MachineInst.Shl { amount: Operand.Immediate(3), .. }))
+    assert(has_shl, "*8 should become <<3")
+    print("Strength reduction: mul 8 → shl 3 ✓")
+
+    print("Peephole optimizer — all passed ✓")
+}
