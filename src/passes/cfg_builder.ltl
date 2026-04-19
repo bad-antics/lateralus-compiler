@@ -1,0 +1,336 @@
+// src/passes/cfg_builder.ltl — Control flow graph construction from AST
+use std.collections.{HashMap, HashSet}
+
+type NodeId = u32
+
+// ── AST nodes ────────────────────────────────────────────────────────────────
+enum Expr {
+    IntLit(i64),
+    FloatLit(f64),
+    BoolLit(bool),
+    StringLit(string),
+    Ident(string),
+    Binary { op: string, lhs: Box<Expr>, rhs: Box<Expr> },
+    Unary { op: string, operand: Box<Expr> },
+    Call { func: string, args: [Expr] },
+    Index { base: Box<Expr>, index: Box<Expr> },
+    Field { base: Box<Expr>, name: string },
+}
+
+enum Stmt {
+    Let { name: string, ty: Option<string>, init: Option<Expr> },
+    Assign { target: Expr, value: Expr },
+    If { cond: Expr, then_body: [Stmt], else_body: Option<[Stmt]> },
+    While { cond: Expr, body: [Stmt] },
+    For { var: string, iter: Expr, body: [Stmt] },
+    Loop { body: [Stmt] },
+    Break,
+    Continue,
+    Return(Option<Expr>),
+    ExprStmt(Expr),
+    Match { scrutinee: Expr, arms: [(string, [Stmt])] },
+    Block([Stmt]),
+}
+
+// ── CFG structures ───────────────────────────────────────────────────────────
+struct CFGNode {
+    id:         NodeId,
+    label:      string,
+    stmts:      [Stmt],
+    successors: [NodeId],
+    predecessors: [NodeId],
+    is_entry:   bool,
+    is_exit:    bool,
+}
+
+struct CFG {
+    nodes:    HashMap<NodeId, CFGNode>,
+    entry:    NodeId,
+    exit:     NodeId,
+    next_id:  NodeId,
+}
+
+impl CFG {
+    fn new() -> CFG {
+        let entry_node = CFGNode {
+            id: 0, label: "entry".to_string(), stmts: [],
+            successors: [], predecessors: [], is_entry: true, is_exit: false,
+        }
+        let exit_node = CFGNode {
+            id: 1, label: "exit".to_string(), stmts: [],
+            successors: [], predecessors: [], is_entry: false, is_exit: true,
+        }
+        let mut nodes = HashMap.new()
+        nodes.insert(0, entry_node)
+        nodes.insert(1, exit_node)
+        CFG { nodes, entry: 0, exit: 1, next_id: 2 }
+    }
+
+    fn add_node(mut self, label: string) -> NodeId {
+        let id = self.next_id
+        self.next_id += 1
+        self.nodes.insert(id, CFGNode {
+            id, label, stmts: [],
+            successors: [], predecessors: [],
+            is_entry: false, is_exit: false,
+        })
+        id
+    }
+
+    fn add_edge(mut self, from: NodeId, to: NodeId) {
+        self.nodes.get_mut(&from).unwrap().successors.push(to)
+        self.nodes.get_mut(&to).unwrap().predecessors.push(from)
+    }
+
+    fn add_stmt(mut self, node: NodeId, stmt: Stmt) {
+        self.nodes.get_mut(&node).unwrap().stmts.push(stmt)
+    }
+
+    fn node_count(self) -> usize { self.nodes.len() }
+    fn edge_count(self) -> usize {
+        self.nodes.values().map(|n| n.successors.len()).sum()
+    }
+}
+
+// ── CFG builder ──────────────────────────────────────────────────────────────
+struct CFGBuilder {
+    cfg:          CFG,
+    loop_stack:   [(NodeId, NodeId)],  // (continue_target, break_target)
+}
+
+impl CFGBuilder {
+    fn new() -> CFGBuilder {
+        CFGBuilder { cfg: CFG.new(), loop_stack: [] }
+    }
+
+    fn build_stmts(mut self, stmts: &[Stmt], current: NodeId) -> NodeId {
+        let mut cur = current
+        for stmt in stmts {
+            cur = self.build_stmt(stmt, cur)
+        }
+        cur
+    }
+
+    fn build_stmt(mut self, stmt: &Stmt, current: NodeId) -> NodeId {
+        match stmt {
+            Stmt.Let { .. } | Stmt.Assign { .. } | Stmt.ExprStmt(_) => {
+                self.cfg.add_stmt(current, stmt.clone())
+                current
+            }
+
+            Stmt.If { cond, then_body, else_body } => {
+                let cond_node = self.cfg.add_node("if_cond".to_string())
+                self.cfg.add_edge(current, cond_node)
+                self.cfg.add_stmt(cond_node, Stmt.ExprStmt(cond.clone()))
+
+                let then_entry = self.cfg.add_node("then".to_string())
+                self.cfg.add_edge(cond_node, then_entry)
+                let then_exit = self.build_stmts(then_body, then_entry)
+
+                let merge = self.cfg.add_node("if_merge".to_string())
+                self.cfg.add_edge(then_exit, merge)
+
+                if let some(else_stmts) = else_body {
+                    let else_entry = self.cfg.add_node("else".to_string())
+                    self.cfg.add_edge(cond_node, else_entry)
+                    let else_exit = self.build_stmts(else_stmts, else_entry)
+                    self.cfg.add_edge(else_exit, merge)
+                } else {
+                    self.cfg.add_edge(cond_node, merge)
+                }
+                merge
+            }
+
+            Stmt.While { cond, body } => {
+                let cond_node = self.cfg.add_node("while_cond".to_string())
+                self.cfg.add_edge(current, cond_node)
+                self.cfg.add_stmt(cond_node, Stmt.ExprStmt(cond.clone()))
+
+                let body_entry = self.cfg.add_node("while_body".to_string())
+                let exit_node = self.cfg.add_node("while_exit".to_string())
+
+                self.cfg.add_edge(cond_node, body_entry)
+                self.cfg.add_edge(cond_node, exit_node)
+
+                self.loop_stack.push((cond_node, exit_node))
+                let body_exit = self.build_stmts(body, body_entry)
+                self.loop_stack.pop()
+
+                self.cfg.add_edge(body_exit, cond_node)  // back edge
+                exit_node
+            }
+
+            Stmt.For { var, iter, body } => {
+                let init_node = self.cfg.add_node("for_init".to_string())
+                self.cfg.add_edge(current, init_node)
+
+                let cond_node = self.cfg.add_node("for_cond".to_string())
+                self.cfg.add_edge(init_node, cond_node)
+
+                let body_entry = self.cfg.add_node("for_body".to_string())
+                let step_node = self.cfg.add_node("for_step".to_string())
+                let exit_node = self.cfg.add_node("for_exit".to_string())
+
+                self.cfg.add_edge(cond_node, body_entry)
+                self.cfg.add_edge(cond_node, exit_node)
+
+                self.loop_stack.push((step_node, exit_node))
+                let body_exit = self.build_stmts(body, body_entry)
+                self.loop_stack.pop()
+
+                self.cfg.add_edge(body_exit, step_node)
+                self.cfg.add_edge(step_node, cond_node)
+                exit_node
+            }
+
+            Stmt.Loop { body } => {
+                let loop_entry = self.cfg.add_node("loop".to_string())
+                let exit_node = self.cfg.add_node("loop_exit".to_string())
+                self.cfg.add_edge(current, loop_entry)
+
+                self.loop_stack.push((loop_entry, exit_node))
+                let body_exit = self.build_stmts(body, loop_entry)
+                self.loop_stack.pop()
+
+                self.cfg.add_edge(body_exit, loop_entry)  // back edge
+                exit_node
+            }
+
+            Stmt.Break => {
+                if let some(&(_, break_target)) = self.loop_stack.last() {
+                    self.cfg.add_edge(current, break_target)
+                }
+                self.cfg.add_node("unreachable_after_break".to_string())
+            }
+
+            Stmt.Continue => {
+                if let some(&(continue_target, _)) = self.loop_stack.last() {
+                    self.cfg.add_edge(current, continue_target)
+                }
+                self.cfg.add_node("unreachable_after_continue".to_string())
+            }
+
+            Stmt.Return(val) => {
+                self.cfg.add_stmt(current, stmt.clone())
+                self.cfg.add_edge(current, self.cfg.exit)
+                self.cfg.add_node("unreachable_after_return".to_string())
+            }
+
+            Stmt.Block(stmts) => self.build_stmts(stmts, current),
+
+            Stmt.Match { scrutinee, arms } => {
+                let match_node = self.cfg.add_node("match".to_string())
+                self.cfg.add_edge(current, match_node)
+
+                let merge = self.cfg.add_node("match_merge".to_string())
+                for (pattern, body) in arms {
+                    let arm_entry = self.cfg.add_node(format!("arm_{pattern}"))
+                    self.cfg.add_edge(match_node, arm_entry)
+                    let arm_exit = self.build_stmts(body, arm_entry)
+                    self.cfg.add_edge(arm_exit, merge)
+                }
+                merge
+            }
+        }
+    }
+
+    fn build(mut self, stmts: &[Stmt]) -> CFG {
+        let last = self.build_stmts(stmts, self.cfg.entry)
+        self.cfg.add_edge(last, self.cfg.exit)
+        self.cfg
+    }
+}
+
+// ── Dominance analysis ───────────────────────────────────────────────────────
+fn compute_dominators(cfg: &CFG) -> HashMap<NodeId, HashSet<NodeId>> {
+    let all_nodes: HashSet<NodeId> = cfg.nodes.keys().cloned().collect()
+    let mut dom: HashMap<NodeId, HashSet<NodeId>> = HashMap.new()
+
+    // Entry dominates only itself
+    let mut entry_set = HashSet.new()
+    entry_set.insert(cfg.entry)
+    dom.insert(cfg.entry, entry_set)
+
+    for &id in cfg.nodes.keys() {
+        if id != cfg.entry {
+            dom.insert(id, all_nodes.clone())
+        }
+    }
+
+    let mut changed = true
+    while changed {
+        changed = false
+        for (&id, node) in &cfg.nodes {
+            if id == cfg.entry { continue }
+            let mut new_dom = all_nodes.clone()
+            for &pred in &node.predecessors {
+                new_dom = new_dom.intersection(dom.get(&pred).unwrap()).cloned().collect()
+            }
+            new_dom.insert(id)
+            if new_dom != *dom.get(&id).unwrap() {
+                dom.insert(id, new_dom)
+                changed = true
+            }
+        }
+    }
+    dom
+}
+
+fn main() {
+    let mut builder = CFGBuilder.new()
+
+    // Build CFG for: if (x > 0) { y = x } else { y = -x }; return y
+    let stmts = [
+        Stmt.If {
+            cond: Expr.Binary { op: ">".to_string(), lhs: Box.new(Expr.Ident("x".to_string())), rhs: Box.new(Expr.IntLit(0)) },
+            then_body: [Stmt.Assign { target: Expr.Ident("y".to_string()), value: Expr.Ident("x".to_string()) }],
+            else_body: some([Stmt.Assign {
+                target: Expr.Ident("y".to_string()),
+                value: Expr.Unary { op: "-".to_string(), operand: Box.new(Expr.Ident("x".to_string())) },
+            }]),
+        },
+        Stmt.Return(some(Expr.Ident("y".to_string()))),
+    ]
+
+    let cfg = builder.build(&stmts)
+    print("CFG nodes: ${cfg.node_count()}, edges: ${cfg.edge_count()}")
+    assert(cfg.node_count() >= 6, "if/else should create multiple nodes")
+
+    // Print node labels
+    for (id, node) in &cfg.nodes {
+        let succs = node.successors |> map(|s| s.to_string()) |> join(", ")
+        print("  [${id}] ${node.label} → {${succs}}")
+    }
+
+    // Dominance
+    let dom = compute_dominators(&cfg)
+    assert(dom.get(&cfg.entry).unwrap().len() == 1, "entry dominated only by itself")
+    print("Dominators computed ✓")
+
+    // While loop CFG
+    let mut builder2 = CFGBuilder.new()
+    let loop_stmts = [
+        Stmt.While {
+            cond: Expr.Binary { op: "<".to_string(), lhs: Box.new(Expr.Ident("i".to_string())), rhs: Box.new(Expr.IntLit(10)) },
+            body: [
+                Stmt.Assign { target: Expr.Ident("i".to_string()), value: Expr.Binary {
+                    op: "+".to_string(), lhs: Box.new(Expr.Ident("i".to_string())), rhs: Box.new(Expr.IntLit(1)),
+                }},
+            ],
+        },
+    ]
+    let cfg2 = builder2.build(&loop_stmts)
+    print("While loop CFG: ${cfg2.node_count()} nodes, ${cfg2.edge_count()} edges")
+
+    // Check for back edge (loop)
+    let mut has_back_edge = false
+    for (_, node) in &cfg2.nodes {
+        for &succ in &node.successors {
+            if succ <= node.id && node.label.contains("while") { has_back_edge = true }
+        }
+    }
+    assert(has_back_edge, "while loop should have back edge")
+    print("Back edge detected ✓")
+
+    print("CFG builder — all passed ✓")
+}
