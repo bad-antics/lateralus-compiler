@@ -1,0 +1,240 @@
+// src/passes/register_allocator.ltl — Graph-coloring register allocator
+
+use std.collections.{HashMap, HashSet, BTreeSet}
+
+// ── Interference graph ───────────────────────────────────────────────────────
+struct InterferenceGraph {
+    nodes:    [VirtualReg],
+    adj:      HashMap<VirtualReg, HashSet<VirtualReg>>,
+    degree:   HashMap<VirtualReg, u32>,
+    move_list: [(VirtualReg, VirtualReg)],
+    colors:   HashMap<VirtualReg, PhysReg>,
+    spilled:  HashSet<VirtualReg>,
+}
+
+type VirtualReg = u32
+type PhysReg = u8
+
+const NUM_REGS: u32 = 16  // e.g., x86-64 GPRs
+
+impl InterferenceGraph {
+    fn new() -> InterferenceGraph {
+        InterferenceGraph {
+            nodes: [], adj: HashMap.new(), degree: HashMap.new(),
+            move_list: [], colors: HashMap.new(), spilled: HashSet.new(),
+        }
+    }
+
+    fn add_edge(mut self, u: VirtualReg, v: VirtualReg) {
+        if u == v { return }
+        self.adj.entry(u).or_insert(HashSet.new()).insert(v)
+        self.adj.entry(v).or_insert(HashSet.new()).insert(u)
+        *self.degree.entry(u).or_insert(0) += 1
+        *self.degree.entry(v).or_insert(0) += 1
+    }
+
+    fn neighbors(self, v: VirtualReg) -> HashSet<VirtualReg> {
+        self.adj.get(&v).cloned().unwrap_or(HashSet.new())
+    }
+}
+
+// ── Liveness analysis ────────────────────────────────────────────────────────
+struct LivenessInfo {
+    live_in:  HashMap<BlockId, HashSet<VirtualReg>>,
+    live_out: HashMap<BlockId, HashSet<VirtualReg>>,
+}
+
+type BlockId = u32
+
+struct BasicBlock {
+    id:    BlockId,
+    insts: [Instruction],
+    succs: [BlockId],
+    preds: [BlockId],
+}
+
+struct Instruction {
+    opcode:  string,
+    defs:    [VirtualReg],
+    uses:    [VirtualReg],
+    is_move: bool,
+}
+
+fn compute_liveness(blocks: &[BasicBlock]) -> LivenessInfo {
+    let mut live_in:  HashMap<BlockId, HashSet<VirtualReg>> = HashMap.new()
+    let mut live_out: HashMap<BlockId, HashSet<VirtualReg>> = HashMap.new()
+
+    for block in blocks {
+        live_in.insert(block.id, HashSet.new())
+        live_out.insert(block.id, HashSet.new())
+    }
+
+    let mut changed = true
+    while changed {
+        changed = false
+        for block in blocks.iter().rev() {
+            // live_out = union of live_in of successors
+            let mut new_out = HashSet.new()
+            for succ in &block.succs {
+                if let some(succ_in) = live_in.get(succ) {
+                    new_out = new_out.union(succ_in)
+                }
+            }
+
+            // live_in = use ∪ (live_out - def)
+            let mut new_in = new_out.clone()
+            for inst in block.insts.iter().rev() {
+                for d in &inst.defs { new_in.remove(d) }
+                for u in &inst.uses { new_in.insert(*u) }
+            }
+
+            if new_in != *live_in.get(&block.id).unwrap() || new_out != *live_out.get(&block.id).unwrap() {
+                changed = true
+                live_in.insert(block.id, new_in)
+                live_out.insert(block.id, new_out)
+            }
+        }
+    }
+    LivenessInfo { live_in, live_out }
+}
+
+// ── Build interference graph from liveness ───────────────────────────────────
+fn build_interference(blocks: &[BasicBlock], liveness: &LivenessInfo) -> InterferenceGraph {
+    let mut graph = InterferenceGraph.new()
+    let mut all_regs: HashSet<VirtualReg> = HashSet.new()
+
+    for block in blocks {
+        let mut live = liveness.live_out.get(&block.id).cloned().unwrap_or(HashSet.new())
+
+        for inst in block.insts.iter().rev() {
+            for d in &inst.defs {
+                all_regs.insert(*d)
+                for l in &live {
+                    if *l != *d { graph.add_edge(*d, *l) }
+                }
+            }
+            for d in &inst.defs { live.remove(d) }
+            for u in &inst.uses { live.insert(*u); all_regs.insert(*u) }
+
+            if inst.is_move && inst.defs.len() == 1 && inst.uses.len() == 1 {
+                graph.move_list.push((inst.defs[0], inst.uses[0]))
+            }
+        }
+    }
+    graph.nodes = all_regs.into_iter().collect()
+    graph
+}
+
+// ── Chaitin-Briggs graph coloring ────────────────────────────────────────────
+fn allocate_registers(mut graph: InterferenceGraph) -> HashMap<VirtualReg, PhysReg> {
+    let k = NUM_REGS
+
+    // Simplify: iteratively remove nodes with degree < k
+    let mut stack: [VirtualReg] = []
+    let mut removed: HashSet<VirtualReg> = HashSet.new()
+    let mut work = true
+
+    while work {
+        work = false
+        for &node in &graph.nodes {
+            if removed.contains(&node) { continue }
+            let deg = graph.degree.get(&node).copied().unwrap_or(0)
+            if deg < k {
+                stack.push(node)
+                removed.insert(node)
+                // Decrease neighbors' degrees
+                for &neighbor in graph.neighbors(node).iter() {
+                    if !removed.contains(&neighbor) {
+                        if let some(d) = graph.degree.get_mut(&neighbor) { *d -= 1 }
+                    }
+                }
+                work = true
+            }
+        }
+
+        // Potential spill: pick highest-degree node
+        if !work {
+            let mut spill_candidate: Option<(VirtualReg, u32)> = none
+            for &node in &graph.nodes {
+                if removed.contains(&node) { continue }
+                let deg = graph.degree.get(&node).copied().unwrap_or(0)
+                if spill_candidate.is_none() || deg > spill_candidate.unwrap().1 {
+                    spill_candidate = some((node, deg))
+                }
+            }
+            if let some((node, _)) = spill_candidate {
+                stack.push(node)
+                removed.insert(node)
+                for &neighbor in graph.neighbors(node).iter() {
+                    if !removed.contains(&neighbor) {
+                        if let some(d) = graph.degree.get_mut(&neighbor) { *d -= 1 }
+                    }
+                }
+                work = true
+            }
+        }
+    }
+
+    // Select: assign colors from stack
+    let mut coloring: HashMap<VirtualReg, PhysReg> = HashMap.new()
+    while let some(node) = stack.pop() {
+        let mut used_colors: HashSet<PhysReg> = HashSet.new()
+        for &neighbor in graph.neighbors(node).iter() {
+            if let some(&color) = coloring.get(&neighbor) {
+                used_colors.insert(color)
+            }
+        }
+        let mut assigned = false
+        for reg in range(0, k as u8) {
+            if !used_colors.contains(&reg) {
+                coloring.insert(node, reg)
+                assigned = true
+                break
+            }
+        }
+        if !assigned {
+            graph.spilled.insert(node)
+        }
+    }
+
+    graph.colors = coloring.clone()
+    coloring
+}
+
+fn main() {
+    // Create test CFG
+    let blocks = [
+        BasicBlock {
+            id: 0,
+            insts: [
+                Instruction { opcode: "mov".to_string(), defs: [1], uses: [], is_move: false },
+                Instruction { opcode: "mov".to_string(), defs: [2], uses: [], is_move: false },
+                Instruction { opcode: "add".to_string(), defs: [3], uses: [1, 2], is_move: false },
+                Instruction { opcode: "mov".to_string(), defs: [4], uses: [3], is_move: true },
+            ],
+            succs: [1], preds: [],
+        },
+        BasicBlock {
+            id: 1,
+            insts: [
+                Instruction { opcode: "mul".to_string(), defs: [5], uses: [4, 2], is_move: false },
+                Instruction { opcode: "ret".to_string(), defs: [], uses: [5], is_move: false },
+            ],
+            succs: [], preds: [0],
+        },
+    ]
+
+    let liveness = compute_liveness(&blocks)
+    print("Liveness computed for ${blocks.len()} blocks")
+
+    let graph = build_interference(&blocks, &liveness)
+    print("Interference graph: ${graph.nodes.len()} nodes, ${graph.move_list.len()} moves")
+
+    let allocation = allocate_registers(graph)
+    print("Register allocation:")
+    for (vreg, phys) in &allocation {
+        print("  v${vreg} → r${phys}")
+    }
+    assert(allocation.len() > 0)
+    print("Register allocator — all passed ✓")
+}
