@@ -1,0 +1,78 @@
+// wasm_codegen.ltl — Lower Lateralus IR to WebAssembly instructions
+use crate.ir.ir_nodes.{IrInstr, IrValue, IrType}
+use crate.wasm.wasm_builder.{WasmModule, Instr}
+use crate.wasm.wasm_types.{ValType, FuncType}
+
+fn ir_type_to_wasm(ty: IrType) -> ValType {
+    match ty {
+        IrType.I32 | IrType.Bool | IrType.Ptr => ValType.I32,
+        IrType.I64                             => ValType.I64,
+        IrType.F32                             => ValType.F32,
+        IrType.F64 | IrType.Float             => ValType.F64,
+        _                                      => ValType.I32,
+    }
+}
+
+struct WasmCodegen {
+    module:     WasmModule,
+    local_map:  dict<string, int>,
+    local_idx:  int,
+}
+
+impl WasmCodegen {
+    fn new() -> WasmCodegen {
+        WasmCodegen { module: WasmModule.new(), local_map: {}, local_idx: 0 }
+    }
+
+    fn alloc_local(mut self, name: string, ty: ValType) -> int {
+        let idx = self.local_idx
+        self.local_map[name] = idx
+        self.local_idx += 1
+        idx
+    }
+
+    fn lower_value(self, v: IrValue) -> [Instr] {
+        match v {
+            IrValue.ConstInt(n)   => [Instr.I32Const(n)],
+            IrValue.ConstFloat(f) => [Instr.F64Const(f)],
+            IrValue.ConstBool(b)  => [Instr.I32Const(if b { 1 } else { 0 })],
+            IrValue.Local(name)   => {
+                let idx = self.local_map.get(name) ?? 0
+                [Instr.LocalGet(idx)]
+            },
+            _ => [Instr.I32Const(0)],
+        }
+    }
+
+    fn lower_instr(mut self, instr: IrInstr) -> [Instr] {
+        match instr {
+            IrInstr.BinOp(op, dst, lhs, rhs) => {
+                let mut out = self.lower_value(lhs)
+                out.extend(self.lower_value(rhs))
+                out.push(match op.as_str() {
+                    "add" => Instr.I32Add,
+                    "sub" => Instr.I32Sub,
+                    "mul" => Instr.I32Mul,
+                    "div" => Instr.I32DivS,
+                    _     => Instr.I32Add,
+                })
+                let dst_idx = self.alloc_local(dst, ValType.I32)
+                out.push(Instr.LocalSet(dst_idx))
+                out
+            },
+            IrInstr.Return(v) => {
+                let mut out = self.lower_value(v)
+                out.push(Instr.Return)
+                out
+            },
+            IrInstr.Call(dst, func, args) => {
+                let mut out = args |> flat_map(|a| self.lower_value(a)) |> collect()
+                out.push(Instr.Call(0))  // function index resolved later
+                out
+            },
+            _ => [],
+        }
+    }
+
+    fn finish(self) -> WasmModule { self.module }
+}
