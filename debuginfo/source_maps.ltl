@@ -1,0 +1,98 @@
+// source_maps.ltl — Source map generation for debugging
+struct SourceLocation {
+    file:   string,
+    line:   int,
+    column: int,
+}
+
+struct MappingEntry {
+    generated_col: int,
+    source:        int,   // index into sources array
+    original_line: int,
+    original_col:  int,
+    name:          int?,  // index into names array
+}
+
+struct SourceMap {
+    version:   int,
+    file:      string,
+    sources:   [string],
+    names:     [string],
+    mappings:  [[MappingEntry]],   // per generated line
+}
+
+impl SourceMap {
+    fn new(output_file: string) -> SourceMap {
+        SourceMap { version: 3, file: output_file, sources: [], names: [], mappings: [] }
+    }
+
+    fn add_source(mut self, src: string) -> int {
+        let idx = self.sources.len()
+        self.sources.push(src)
+        idx
+    }
+
+    fn add_name(mut self, name: string) -> int {
+        let idx = self.names.len()
+        self.names.push(name)
+        idx
+    }
+
+    fn add_mapping(mut self, gen_line: int, entry: MappingEntry) {
+        while self.mappings.len() <= gen_line {
+            self.mappings.push([])
+        }
+        self.mappings[gen_line].push(entry)
+    }
+
+    fn encode_vlq(n: int) -> string {
+        const ALPHABET: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        let signed = if n < 0 { (-n) * 2 + 1 } else { n * 2 }
+        mut result = ""
+        mut v = signed
+        loop {
+            let digit = v & 0x1F
+            v >>= 5
+            let encoded = if v > 0 { digit | 0x20 } else { digit }
+            result += ALPHABET[encoded].to_string()
+            if v == 0 { break }
+        }
+        result
+    }
+
+    fn encode_mappings(self) -> string {
+        self.mappings |> map(|line_entries| {
+            let mut prev_col    = 0
+            let mut prev_source = 0
+            let mut prev_orig_line = 0
+            let mut prev_orig_col  = 0
+            line_entries |> map(|e| {
+                let col_delta    = e.generated_col - prev_col
+                let src_delta    = e.source - prev_source
+                let line_delta   = e.original_line - prev_orig_line
+                let oc_delta     = e.original_col  - prev_orig_col
+                prev_col         = e.generated_col
+                prev_source      = e.source
+                prev_orig_line   = e.original_line
+                prev_orig_col    = e.original_col
+                Self.encode_vlq(col_delta)
+                    + Self.encode_vlq(src_delta)
+                    + Self.encode_vlq(line_delta)
+                    + Self.encode_vlq(oc_delta)
+            }) |> join(",")
+        }) |> join(";")
+    }
+
+    fn to_json(self) -> string {
+        let src_json  = self.sources |> map(|s| json.quote(s)) |> join(",")
+        let name_json = self.names   |> map(|n| json.quote(n)) |> join(",")
+        let mappings  = self.encode_mappings()
+        json.object({
+            "version":  self.version,
+            "file":     self.file,
+            "sources":  "[${src_json}]",
+            "names":    "[${name_json}]",
+            "mappings": mappings,
+        }).to_string()
+    }
+}
