@@ -1,0 +1,260 @@
+// Compiler Pass - Trait Resolution
+// Resolves trait implementations, method dispatch, and coherence checking.
+
+use std.collections.HashMap
+use std.collections.HashSet
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TraitRef { trait_name: string, type_args: [Type] }
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Type {
+    Named(string),
+    Generic(string),
+    App(string, [Type]),    // e.g. Vec<i32>
+    Ref(Box<Type>, bool),
+    Tuple([Type]),
+    Fn([Type], Box<Type>),
+    Never,
+    Infer(usize),
+}
+
+impl Type {
+    fn display(self) -> string {
+        match self {
+            Type.Named(n) => n.clone(),
+            Type.Generic(n) => n.clone(),
+            Type.App(name, args) => format!("{}<{}>", name, args.iter().map(|a| a.display()).collect::<[string]>().join(", ")),
+            Type.Ref(inner, m) => format!("&{}{}", if m { "mut " } else { "" }, inner.display()),
+            Type.Tuple(ts) => format!("({})", ts.iter().map(|t| t.display()).collect::<[string]>().join(", ")),
+            Type.Fn(params, ret) => format!("fn({}) -> {}", params.iter().map(|p| p.display()).collect::<[string]>().join(", "), ret.display()),
+            Type.Never => "!".to_string(),
+            Type.Infer(id) => format!("?{}", id),
+        }
+    }
+
+    fn substitute(self, subst: &HashMap<string, Type>) -> Type {
+        match self {
+            Type.Generic(name) => subst.get(&name).cloned().unwrap_or(Type.Generic(name)),
+            Type.App(name, args) => Type.App(name, args.iter().map(|a| a.substitute(subst)).collect()),
+            Type.Ref(inner, m) => Type.Ref(Box.new(inner.substitute(subst)), m),
+            Type.Tuple(ts) => Type.Tuple(ts.iter().map(|t| t.substitute(subst)).collect()),
+            Type.Fn(params, ret) => Type.Fn(params.iter().map(|p| p.substitute(subst)).collect(), Box.new(ret.substitute(subst))),
+            other => other,
+        }
+    }
+
+    fn free_type_vars(self) -> HashSet<string> {
+        match self {
+            Type.Generic(name) => { let mut s = HashSet.new(); s.insert(name); s }
+            Type.App(_, args) => args.iter().flat_map(|a| a.free_type_vars()).collect(),
+            Type.Ref(inner, _) => inner.free_type_vars(),
+            Type.Tuple(ts) => ts.iter().flat_map(|t| t.free_type_vars()).collect(),
+            Type.Fn(params, ret) => {
+                let mut vars: HashSet<string> = params.iter().flat_map(|p| p.free_type_vars()).collect()
+                vars.extend(ret.free_type_vars())
+                vars
+            }
+            _ => HashSet.new(),
+        }
+    }
+}
+
+struct TraitDef {
+    name: string,
+    type_params: [string],
+    super_traits: [TraitRef],
+    methods: HashMap<string, MethodSig>,
+}
+
+struct MethodSig {
+    name: string,
+    params: [(string, Type)],
+    return_type: Type,
+    has_default: bool,
+}
+
+struct ImplDef {
+    trait_ref: TraitRef,
+    self_type: Type,
+    type_params: [string],
+    where_clauses: [WhereClause],
+    methods: HashMap<string, ()>,
+}
+
+struct WhereClause { ty: Type, bounds: [TraitRef] }
+
+struct TraitResolver {
+    traits: HashMap<string, TraitDef>,
+    impls: [ImplDef],
+    impl_cache: HashMap<(string, Type), usize>,
+}
+
+impl TraitResolver {
+    fn new() -> TraitResolver {
+        TraitResolver { traits: HashMap.new(), impls: [], impl_cache: HashMap.new() }
+    }
+
+    fn register_trait(mut self, def: TraitDef) { self.traits.insert(def.name.clone(), def); }
+
+    fn register_impl(mut self, impl_def: ImplDef) { self.impls.push(impl_def) }
+
+    fn resolve(self, trait_name: &str, self_type: &Type) -> Option<&ImplDef> {
+        let mut candidates: [&ImplDef] = []
+        for impl_def in &self.impls {
+            if impl_def.trait_ref.trait_name == trait_name {
+                if self.types_match(&impl_def.self_type, self_type) {
+                    candidates.push(impl_def)
+                }
+            }
+        }
+        match candidates.len() {
+            0 => none,
+            1 => some(candidates[0]),
+            _ => {
+                // Prefer more specific impl
+                self.most_specific(&candidates)
+            }
+        }
+    }
+
+    fn types_match(self, pattern: &Type, concrete: &Type) -> bool {
+        match (pattern, concrete) {
+            (Type.Generic(_), _) => true,
+            (Type.Named(a), Type.Named(b)) => a == b,
+            (Type.App(a, a_args), Type.App(b, b_args)) => {
+                a == b && a_args.len() == b_args.len() && a_args.iter().zip(b_args.iter()).all(|(x, y)| self.types_match(x, y))
+            }
+            (Type.Ref(a, am), Type.Ref(b, bm)) => am == bm && self.types_match(a, b),
+            (Type.Tuple(a), Type.Tuple(b)) => a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| self.types_match(x, y)),
+            _ => false,
+        }
+    }
+
+    fn most_specific(self, candidates: &[&ImplDef]) -> Option<&ImplDef> {
+        // Simple heuristic: prefer impls with fewer generic params
+        candidates.iter().min_by_key(|c| c.type_params.len()).copied()
+    }
+
+    fn check_coherence(self) -> [string] {
+        let mut errors: [string] = []
+        for i in 0..self.impls.len() {
+            for j in (i+1)..self.impls.len() {
+                let a = &self.impls[i]; let b = &self.impls[j]
+                if a.trait_ref.trait_name == b.trait_ref.trait_name {
+                    if self.impls_overlap(a, b) {
+                        errors.push(format!("overlapping impls of {} for {} and {}",
+                            a.trait_ref.trait_name, a.self_type.display(), b.self_type.display()))
+                    }
+                }
+            }
+        }
+        errors
+    }
+
+    fn impls_overlap(self, a: &ImplDef, b: &ImplDef) -> bool {
+        // Two impls overlap if there exists a type that matches both
+        if a.type_params.is_empty() && b.type_params.is_empty() {
+            return self.types_match(&a.self_type, &b.self_type)
+        }
+        // If either is fully generic, they overlap
+        match (&a.self_type, &b.self_type) {
+            (Type.Generic(_), _) | (_, Type.Generic(_)) => true,
+            _ => self.types_match(&a.self_type, &b.self_type),
+        }
+    }
+
+    fn resolve_method(self, trait_name: &str, method_name: &str, self_type: &Type) -> Option<(&ImplDef, &MethodSig)> {
+        let impl_def = self.resolve(trait_name, self_type)?
+        let trait_def = self.traits.get(trait_name)?
+        let method = trait_def.methods.get(method_name)?
+        some((impl_def, method))
+    }
+
+    fn check_impl_completeness(self, impl_def: &ImplDef) -> [string] {
+        let mut missing: [string] = []
+        let trait_def = match self.traits.get(&impl_def.trait_ref.trait_name) {
+            some(t) => t, none => return ["unknown trait".to_string()],
+        }
+        for (name, sig) in &trait_def.methods {
+            if !sig.has_default && !impl_def.methods.contains_key(name) {
+                missing.push(format!("missing method: {}", name))
+            }
+        }
+        missing
+    }
+}
+
+fn main() {
+    let mut resolver = TraitResolver.new()
+
+    // Register Display trait
+    let mut display_methods = HashMap.new()
+    display_methods.insert("fmt".to_string(), MethodSig {
+        name: "fmt".to_string(),
+        params: [("self".to_string(), Type.Generic("Self".to_string()))],
+        return_type: Type.Named("Result".to_string()),
+        has_default: false,
+    })
+    resolver.register_trait(TraitDef {
+        name: "Display".to_string(), type_params: [], super_traits: [],
+        methods: display_methods,
+    })
+
+    // Register impl Display for i32
+    let mut i32_methods = HashMap.new()
+    i32_methods.insert("fmt".to_string(), ())
+    resolver.register_impl(ImplDef {
+        trait_ref: TraitRef { trait_name: "Display".to_string(), type_args: [] },
+        self_type: Type.Named("i32".to_string()),
+        type_params: [], where_clauses: [], methods: i32_methods,
+    })
+
+    // Register impl Display for String
+    let mut str_methods = HashMap.new()
+    str_methods.insert("fmt".to_string(), ())
+    resolver.register_impl(ImplDef {
+        trait_ref: TraitRef { trait_name: "Display".to_string(), type_args: [] },
+        self_type: Type.Named("String".to_string()),
+        type_params: [], where_clauses: [], methods: str_methods,
+    })
+
+    // Resolve
+    let i32_impl = resolver.resolve("Display", &Type.Named("i32".to_string()))
+    assert(i32_impl.is_some())
+    let bool_impl = resolver.resolve("Display", &Type.Named("bool".to_string()))
+    assert(bool_impl.is_none())
+    print("Trait resolution \u2713")
+
+    // Coherence
+    let errors = resolver.check_coherence()
+    assert(errors.is_empty())
+    print("Coherence check \u2713")
+
+    // Completeness
+    let mut incomplete = HashMap.new()  // no fmt method
+    resolver.register_impl(ImplDef {
+        trait_ref: TraitRef { trait_name: "Display".to_string(), type_args: [] },
+        self_type: Type.Named("f64".to_string()),
+        type_params: [], where_clauses: [], methods: incomplete,
+    })
+    let missing = resolver.check_impl_completeness(&resolver.impls[2])
+    assert(missing.len() == 1)
+    assert(missing[0].contains("fmt"))
+    print("Completeness check \u2713")
+
+    // Type display
+    let t = Type.App("Vec".to_string(), [Type.Named("i32".to_string())])
+    assert(t.display() == "Vec<i32>")
+    print("Type display \u2713")
+
+    // Substitution
+    let generic = Type.App("Option".to_string(), [Type.Generic("T".to_string())])
+    let mut subst = HashMap.new()
+    subst.insert("T".to_string(), Type.Named("i32".to_string()))
+    let concrete = generic.substitute(&subst)
+    assert(concrete.display() == "Option<i32>")
+    print("Type substitution \u2713")
+
+    print("Trait Resolution complete \u2713")
+}
