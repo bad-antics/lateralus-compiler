@@ -1,0 +1,75 @@
+// lint_passes.ltl — Compiler lint / warning passes
+use crate.ast.ast_nodes.{Expr, Stmt, FnDef}
+use crate.ast.ast_visitor.AstVisitor
+use crate.diagnostics.error_reporter.{Diagnostic, DiagEngine}
+
+/// Warn about unused variables
+struct UnusedVarLint {
+    engine:  DiagEngine,
+    defined: dict<string, SourceSpan>,
+    used:    set<string>,
+}
+
+impl AstVisitor for UnusedVarLint {
+    fn visit_let(mut self, name: string, span: SourceSpan, _: Expr) {
+        self.defined[name] = span
+    }
+
+    fn visit_ident(mut self, name: string) {
+        self.used.insert(name)
+    }
+
+    fn finish(self) -> DiagEngine {
+        for (name, span) in self.defined {
+            if !self.used.contains(name) && !name.starts_with("_") {
+                self.engine.emit(
+                    Diagnostic.warning("W001", "unused variable `${name}`", span)
+                        .with_note("prefix with `_` to suppress this warning")
+                )
+            }
+        }
+        self.engine
+    }
+}
+
+/// Warn about unreachable code after return/break/continue
+struct UnreachableLint {
+    engine: DiagEngine,
+}
+
+impl AstVisitor for UnreachableLint {
+    fn visit_block(mut self, stmts: [Stmt]) {
+        let mut seen_terminator = false
+        for stmt in stmts {
+            if seen_terminator {
+                self.engine.emit(
+                    Diagnostic.warning("W002", "unreachable statement", stmt.span())
+                )
+            }
+            if matches!(stmt, Stmt.Return(_) | Stmt.Break | Stmt.Continue) {
+                seen_terminator = true
+            }
+        }
+    }
+}
+
+/// Error on integer overflow in literals
+struct LiteralOverflowLint {
+    engine: DiagEngine,
+}
+
+impl AstVisitor for LiteralOverflowLint {
+    fn visit_int_literal(mut self, value: string, ty: string, span: SourceSpan) {
+        let overflows = match ty.as_str() {
+            "i8"  => value.parse_i64().map(|v| v > 127 || v < -128).unwrap_or(true),
+            "u8"  => value.parse_i64().map(|v| v > 255 || v < 0).unwrap_or(true),
+            "i32" => value.parse_i64().map(|v| v > 2147483647 || v < -2147483648).unwrap_or(true),
+            _     => false,
+        }
+        if overflows {
+            self.engine.emit(
+                Diagnostic.error("E010", "literal out of range for `${ty}`", span)
+            )
+        }
+    }
+}
