@@ -1,0 +1,76 @@
+// dwarf_writer.ltl — Generate DWARF debug information
+use crate.ast.source_span.SourceSpan
+
+const DW_TAG_compile_unit: int = 0x11
+const DW_TAG_subprogram:   int = 0x2E
+const DW_TAG_variable:     int = 0x34
+const DW_TAG_base_type:    int = 0x24
+const DW_AT_name:          int = 0x03
+const DW_AT_language:      int = 0x13
+const DW_AT_low_pc:        int = 0x11
+const DW_AT_high_pc:       int = 0x12
+const DW_AT_type:          int = 0x49
+const DW_FORM_string:      int = 0x08
+const DW_FORM_addr:        int = 0x01
+const DW_FORM_ref4:        int = 0x13
+const DW_LANG_Other:       int = 0x0001
+
+struct DieAttrib {
+    name:  int,
+    form:  int,
+    value: DwarfValue,
+}
+
+enum DwarfValue {
+    Addr(int),
+    Str(string),
+    Ref(int),
+    Uint(int),
+    Bytes([u8]),
+}
+
+struct Die {
+    tag:      int,
+    children: [Die],
+    attribs:  [DieAttrib],
+}
+
+impl Die {
+    fn new(tag: int) -> Die { Die { tag, children: [], attribs: [] } }
+
+    fn set(mut self, name: int, form: int, value: DwarfValue) -> Die {
+        self.attribs.push(DieAttrib { name, form, value })
+        self
+    }
+
+    fn child(mut self, child: Die) -> Die {
+        self.children.push(child)
+        self
+    }
+}
+
+fn compile_unit_die(source_file: string, low_pc: int, high_pc: int) -> Die {
+    Die.new(DW_TAG_compile_unit)
+        .set(DW_AT_name,     DW_FORM_string, DwarfValue.Str(source_file))
+        .set(DW_AT_language, DW_FORM_ref4,   DwarfValue.Uint(DW_LANG_Other))
+        .set(DW_AT_low_pc,   DW_FORM_addr,   DwarfValue.Addr(low_pc))
+        .set(DW_AT_high_pc,  DW_FORM_addr,   DwarfValue.Addr(high_pc))
+}
+
+fn subprogram_die(name: string, low_pc: int, high_pc: int) -> Die {
+    Die.new(DW_TAG_subprogram)
+        .set(DW_AT_name,    DW_FORM_string, DwarfValue.Str(name))
+        .set(DW_AT_low_pc,  DW_FORM_addr,   DwarfValue.Addr(low_pc))
+        .set(DW_AT_high_pc, DW_FORM_addr,   DwarfValue.Addr(high_pc))
+}
+
+fn encode_uleb128(mut v: int) -> [u8] {
+    mut out = []
+    loop {
+        let byte = (v & 0x7F) as u8
+        v >>= 7
+        out.push(if v != 0 { byte | 0x80 } else { byte })
+        if v == 0 { break }
+    }
+    out
+}
