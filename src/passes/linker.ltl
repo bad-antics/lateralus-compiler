@@ -1,0 +1,419 @@
+// Compiler Pass — Linker
+// Resolves symbols across modules, performs relocation, emits final binary.
+
+use std.collections.HashMap
+
+// ── Object Section ───────────────────────────────────────────────────────────
+enum SectionKind { Text, Data, Rodata, Bss, SymTab, StrTab, RelText, RelData }
+
+struct ObjectSection {
+    name: string,
+    kind: SectionKind,
+    data: [u8],
+    align: usize,
+    flags: u32,
+}
+
+impl ObjectSection {
+    fn new(name: &str, kind: SectionKind) -> ObjectSection {
+        ObjectSection { name: name.to_string(), kind, data: [], align: 1, flags: 0 }
+    }
+    fn size(self) -> usize { self.data.len() }
+    fn is_executable(self) -> bool { self.flags & 0x4 != 0 }
+    fn is_writable(self) -> bool { self.flags & 0x1 != 0 }
+    fn is_alloc(self) -> bool { self.flags & 0x2 != 0 }
+}
+
+// ── Symbol ───────────────────────────────────────────────────────────────────
+enum SymbolBinding { Local, Global, Weak }
+enum SymbolKind { NoType, Function, Object, Section, File }
+
+struct Symbol {
+    name: string,
+    value: u64,
+    size: u64,
+    binding: SymbolBinding,
+    kind: SymbolKind,
+    section_index: Option<usize>,
+    resolved_address: Option<u64>,
+}
+
+impl Symbol {
+    fn new(name: &str, binding: SymbolBinding, kind: SymbolKind) -> Symbol {
+        Symbol {
+            name: name.to_string(), value: 0, size: 0,
+            binding, kind, section_index: none, resolved_address: none,
+        }
+    }
+
+    fn is_defined(self) -> bool { self.section_index.is_some() }
+    fn is_undefined(self) -> bool { self.section_index.is_none() }
+    fn is_global(self) -> bool { match self.binding { SymbolBinding.Global => true, _ => false } }
+    fn is_weak(self) -> bool { match self.binding { SymbolBinding.Weak => true, _ => false } }
+}
+
+// ── Relocation ───────────────────────────────────────────────────────────────
+enum RelocationType {
+    R_X86_64_64,        // Absolute 64-bit
+    R_X86_64_PC32,      // PC-relative 32-bit
+    R_X86_64_PLT32,     // PLT-relative 32-bit
+    R_X86_64_GOTPCREL,  // GOT PC-relative
+    R_X86_64_32,        // Absolute 32-bit
+    R_X86_64_32S,       // Signed 32-bit
+}
+
+struct Relocation {
+    offset: u64,
+    reloc_type: RelocationType,
+    symbol_name: string,
+    addend: i64,
+}
+
+impl Relocation {
+    fn new(offset: u64, reloc_type: RelocationType, symbol_name: &str, addend: i64) -> Relocation {
+        Relocation { offset, reloc_type, symbol_name: symbol_name.to_string(), addend }
+    }
+}
+
+// ── Object File ──────────────────────────────────────────────────────────────
+struct ObjectFile {
+    name: string,
+    sections: [ObjectSection],
+    symbols: [Symbol],
+    relocations: [Relocation],
+}
+
+impl ObjectFile {
+    fn new(name: &str) -> ObjectFile {
+        ObjectFile { name: name.to_string(), sections: [], symbols: [], relocations: [] }
+    }
+
+    fn add_section(mut self, section: ObjectSection) -> usize {
+        let idx = self.sections.len()
+        self.sections.push(section)
+        idx
+    }
+
+    fn add_symbol(mut self, symbol: Symbol) { self.symbols.push(symbol) }
+    fn add_relocation(mut self, reloc: Relocation) { self.relocations.push(reloc) }
+
+    fn global_symbols(self) -> [&Symbol] {
+        self.symbols.iter().filter(|s| s.is_global()).collect()
+    }
+
+    fn undefined_symbols(self) -> [&Symbol] {
+        self.symbols.iter().filter(|s| s.is_undefined() && s.is_global()).collect()
+    }
+}
+
+// ── Linker ───────────────────────────────────────────────────────────────────
+struct LinkerConfig {
+    entry_point: string,
+    text_base: u64,
+    data_base: u64,
+    bss_base: u64,
+    page_size: u64,
+    output_name: string,
+}
+
+impl LinkerConfig {
+    fn default() -> LinkerConfig {
+        LinkerConfig {
+            entry_point: "_start".to_string(),
+            text_base: 0x400000,
+            data_base: 0x600000,
+            bss_base: 0x800000,
+            page_size: 4096,
+            output_name: "a.out".to_string(),
+        }
+    }
+}
+
+struct Linker {
+    config: LinkerConfig,
+    objects: [ObjectFile],
+    global_symbols: HashMap<string, (usize, usize)>,  // name -> (obj_idx, sym_idx)
+    errors: [string],
+}
+
+impl Linker {
+    fn new(config: LinkerConfig) -> Linker {
+        Linker { config, objects: [], global_symbols: HashMap.new(), errors: [] }
+    }
+
+    fn add_object(mut self, obj: ObjectFile) { self.objects.push(obj) }
+
+    fn collect_symbols(mut self) -> Result<(), string> {
+        for obj_idx in 0..self.objects.len() {
+            for sym_idx in 0..self.objects[obj_idx].symbols.len() {
+                let sym = &self.objects[obj_idx].symbols[sym_idx]
+                if !sym.is_global() || sym.is_undefined() { continue }
+
+                let name = sym.name.clone()
+                if let some(existing) = self.global_symbols.get(&name) {
+                    let (eo, es) = *existing
+                    let existing_sym = &self.objects[eo].symbols[es]
+                    // Weak symbols can be overridden
+                    if existing_sym.is_weak() {
+                        self.global_symbols.insert(name, (obj_idx, sym_idx))
+                    } else if !sym.is_weak() {
+                        self.errors.push(format!("duplicate symbol: {}", sym.name))
+                    }
+                } else {
+                    self.global_symbols.insert(name, (obj_idx, sym_idx))
+                }
+            }
+        }
+        if self.errors.is_empty() { ok(()) }
+        else { err(self.errors.join("\n")) }
+    }
+
+    fn resolve_symbols(mut self) -> Result<(), string> {
+        let mut unresolved: [string] = []
+        for obj in &self.objects {
+            for sym in &obj.symbols {
+                if sym.is_undefined() && sym.is_global() {
+                    if !self.global_symbols.contains_key(&sym.name) {
+                        unresolved.push(sym.name.clone())
+                    }
+                }
+            }
+        }
+        if !unresolved.is_empty() {
+            err(format!("undefined symbols: {}", unresolved.join(", ")))
+        } else { ok(()) }
+    }
+
+    fn layout_sections(mut self) -> SectionLayout {
+        let mut text_offset = self.config.text_base
+        let mut data_offset = self.config.data_base
+        let mut bss_offset = self.config.bss_base
+        let mut layout = SectionLayout.new()
+
+        for obj_idx in 0..self.objects.len() {
+            for sec_idx in 0..self.objects[obj_idx].sections.len() {
+                let section = &self.objects[obj_idx].sections[sec_idx]
+                match section.kind {
+                    SectionKind.Text => {
+                        text_offset = align_up(text_offset, section.align as u64)
+                        layout.add(obj_idx, sec_idx, text_offset)
+                        text_offset += section.size() as u64
+                    }
+                    SectionKind.Data | SectionKind.Rodata => {
+                        data_offset = align_up(data_offset, section.align as u64)
+                        layout.add(obj_idx, sec_idx, data_offset)
+                        data_offset += section.size() as u64
+                    }
+                    SectionKind.Bss => {
+                        bss_offset = align_up(bss_offset, section.align as u64)
+                        layout.add(obj_idx, sec_idx, bss_offset)
+                        bss_offset += section.size() as u64
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        layout.text_end = text_offset
+        layout.data_end = data_offset
+        layout.bss_end = bss_offset
+        layout
+    }
+
+    fn apply_relocations(mut self, layout: &SectionLayout) -> Result<[u8], string> {
+        // Calculate total output size
+        let total_size = layout.data_end.max(layout.bss_end) as usize
+        let mut output = vec![0u8; total_size]
+
+        // Copy section data
+        for obj_idx in 0..self.objects.len() {
+            for sec_idx in 0..self.objects[obj_idx].sections.len() {
+                if let some(addr) = layout.get(obj_idx, sec_idx) {
+                    let section = &self.objects[obj_idx].sections[sec_idx]
+                    let start = addr as usize
+                    let end = start + section.data.len()
+                    if end <= output.len() {
+                        output[start..end].copy_from_slice(&section.data)
+                    }
+                }
+            }
+        }
+
+        // Apply relocations
+        for obj_idx in 0..self.objects.len() {
+            for reloc in &self.objects[obj_idx].relocations {
+                let sym_addr = self.resolve_symbol_address(&reloc.symbol_name, layout)
+                    .ok_or_else(|| format!("cannot resolve: {}", reloc.symbol_name))?
+
+                let reloc_site = layout.get(obj_idx, 0).unwrap_or(0) + reloc.offset
+
+                match reloc.reloc_type {
+                    RelocationType.R_X86_64_64 => {
+                        let val = (sym_addr as i64 + reloc.addend) as u64
+                        write_u64_le(&mut output, reloc_site as usize, val)
+                    }
+                    RelocationType.R_X86_64_PC32 | RelocationType.R_X86_64_PLT32 => {
+                        let val = (sym_addr as i64 - reloc_site as i64 + reloc.addend) as i32
+                        write_i32_le(&mut output, reloc_site as usize, val)
+                    }
+                    RelocationType.R_X86_64_32 => {
+                        let val = (sym_addr as i64 + reloc.addend) as u32
+                        write_u32_le(&mut output, reloc_site as usize, val)
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        ok(output)
+    }
+
+    fn resolve_symbol_address(self, name: &str, layout: &SectionLayout) -> Option<u64> {
+        let (obj_idx, sym_idx) = self.global_symbols.get(name)?
+        let sym = &self.objects[*obj_idx].symbols[*sym_idx]
+        let section_base = layout.get(*obj_idx, sym.section_index?)?
+        some(section_base + sym.value)
+    }
+
+    fn find_entry_point(self, layout: &SectionLayout) -> Option<u64> {
+        self.resolve_symbol_address(&self.config.entry_point, layout)
+    }
+
+    fn link(mut self) -> Result<LinkedBinary, string> {
+        self.collect_symbols()?
+        self.resolve_symbols()?
+        let layout = self.layout_sections()
+        let binary = self.apply_relocations(&layout)?
+        let entry = self.find_entry_point(&layout).unwrap_or(self.config.text_base)
+
+        ok(LinkedBinary { data: binary, entry_point: entry, layout })
+    }
+}
+
+// ── Section Layout ───────────────────────────────────────────────────────────
+struct SectionLayout {
+    addresses: HashMap<(usize, usize), u64>,
+    text_end: u64,
+    data_end: u64,
+    bss_end: u64,
+}
+
+impl SectionLayout {
+    fn new() -> SectionLayout {
+        SectionLayout { addresses: HashMap.new(), text_end: 0, data_end: 0, bss_end: 0 }
+    }
+
+    fn add(mut self, obj_idx: usize, sec_idx: usize, addr: u64) {
+        self.addresses.insert((obj_idx, sec_idx), addr)
+    }
+
+    fn get(self, obj_idx: usize, sec_idx: usize) -> Option<u64> {
+        self.addresses.get(&(obj_idx, sec_idx)).copied()
+    }
+}
+
+struct LinkedBinary {
+    data: [u8],
+    entry_point: u64,
+    layout: SectionLayout,
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+fn align_up(value: u64, align: u64) -> u64 {
+    if align == 0 { return value }
+    (value + align - 1) & !(align - 1)
+}
+
+fn write_u32_le(buf: &mut [u8], offset: usize, val: u32) {
+    let bytes = val.to_le_bytes()
+    for i in 0..4 { if offset + i < buf.len() { buf[offset + i] = bytes[i] } }
+}
+
+fn write_u64_le(buf: &mut [u8], offset: usize, val: u64) {
+    let bytes = val.to_le_bytes()
+    for i in 0..8 { if offset + i < buf.len() { buf[offset + i] = bytes[i] } }
+}
+
+fn write_i32_le(buf: &mut [u8], offset: usize, val: i32) {
+    write_u32_le(buf, offset, val as u32)
+}
+
+fn main() {
+    // Create object files
+    let mut obj1 = ObjectFile.new("main.o")
+    let text_idx = obj1.add_section({
+        let mut s = ObjectSection.new(".text", SectionKind.Text)
+        s.data = vec![0x48, 0x89, 0xe5, 0xe8, 0x00, 0x00, 0x00, 0x00]  // mov rbp,rsp; call target
+        s.align = 16
+        s.flags = 0x6  // alloc | exec
+        s
+    })
+
+    let mut start_sym = Symbol.new("_start", SymbolBinding.Global, SymbolKind.Function)
+    start_sym.section_index = some(text_idx)
+    start_sym.value = 0
+    obj1.add_symbol(start_sym)
+
+    // Undefined reference to 'foo'
+    obj1.add_symbol(Symbol.new("foo", SymbolBinding.Global, SymbolKind.NoType))
+    obj1.add_relocation(Relocation.new(4, RelocationType.R_X86_64_PC32, "foo", -4))
+
+    let mut obj2 = ObjectFile.new("lib.o")
+    let text_idx2 = obj2.add_section({
+        let mut s = ObjectSection.new(".text", SectionKind.Text)
+        s.data = vec![0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3]  // mov eax, 42; ret
+        s.align = 16
+        s
+    })
+    let mut foo_sym = Symbol.new("foo", SymbolBinding.Global, SymbolKind.Function)
+    foo_sym.section_index = some(text_idx2)
+    foo_sym.value = 0
+    obj2.add_symbol(foo_sym)
+
+    // Link
+    let mut linker = Linker.new(LinkerConfig.default())
+    linker.add_object(obj1)
+    linker.add_object(obj2)
+
+    linker.collect_symbols().unwrap()
+    assert(linker.global_symbols.len() == 2)
+    print("Symbol collection ✓")
+
+    linker.resolve_symbols().unwrap()
+    print("Symbol resolution ✓")
+
+    let layout = linker.layout_sections()
+    assert(layout.text_end > 0x400000)
+    print("Section layout ✓")
+
+    let entry = linker.find_entry_point(&layout).unwrap()
+    assert(entry == 0x400000)
+    print("Entry point: 0x{:x} ✓", entry)
+
+    // Test alignment
+    assert(align_up(0x401, 16) == 0x410)
+    assert(align_up(0x400, 16) == 0x400)
+    assert(align_up(1, 4096) == 4096)
+    print("Alignment ✓")
+
+    // Weak symbol test
+    let mut obj_weak = ObjectFile.new("weak.o")
+    let mut weak_sym = Symbol.new("handler", SymbolBinding.Weak, SymbolKind.Function)
+    weak_sym.section_index = some(0)
+    obj_weak.add_section(ObjectSection.new(".text", SectionKind.Text))
+    obj_weak.add_symbol(weak_sym)
+    assert(obj_weak.symbols[0].is_weak())
+    print("Weak symbols ✓")
+
+    // Undefined symbol detection
+    let mut obj_undef = ObjectFile.new("bad.o")
+    obj_undef.add_symbol(Symbol.new("missing_fn", SymbolBinding.Global, SymbolKind.NoType))
+    let mut linker2 = Linker.new(LinkerConfig.default())
+    linker2.add_object(obj_undef)
+    linker2.collect_symbols().unwrap()
+    let result = linker2.resolve_symbols()
+    assert(result.is_err())
+    print("Undefined symbol detection ✓")
+
+    print("Linker complete ✓")
+}
