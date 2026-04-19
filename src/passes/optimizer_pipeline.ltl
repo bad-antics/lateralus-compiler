@@ -1,0 +1,227 @@
+// Compiler Pass - Optimizer Pipeline Manager
+// Orchestrates optimization passes: ordering, dependencies, iteration limits.
+
+use std.collections.HashMap
+
+enum PassKind {
+    Analysis, Transform, Cleanup,
+}
+
+struct PassInfo {
+    name: string,
+    kind: PassKind,
+    dependencies: [string],
+    invalidates: [string],
+    enabled: bool,
+    priority: i32,
+}
+
+impl PassInfo {
+    fn new(name: &str, kind: PassKind) -> PassInfo {
+        PassInfo { name: name.to_string(), kind, dependencies: [], invalidates: [],
+            enabled: true, priority: 0 }
+    }
+    fn depends_on(mut self, dep: &str) -> PassInfo { self.dependencies.push(dep.to_string()); self }
+    fn invalidates_pass(mut self, pass: &str) -> PassInfo { self.invalidates.push(pass.to_string()); self }
+    fn with_priority(mut self, p: i32) -> PassInfo { self.priority = p; self }
+}
+
+enum OptLevel { O0, O1, O2, O3, Os, Oz }
+
+struct PassRegistry {
+    passes: HashMap<string, PassInfo>,
+}
+
+impl PassRegistry {
+    fn new() -> PassRegistry { PassRegistry { passes: HashMap.new() } }
+
+    fn register(mut self, info: PassInfo) { self.passes.insert(info.name.clone(), info) }
+
+    fn get(self, name: &str) -> Option<&PassInfo> { self.passes.get(name) }
+
+    fn default_pipeline(self, level: OptLevel) -> [string] {
+        let mut pipeline: [string] = []
+        let base = ["constant_folding", "dead_code_elimination", "cfg_simplify"]
+        let o1 = ["inlining", "loop_invariant_motion", "common_subexpr_elimination"]
+        let o2 = ["loop_unrolling", "vectorization", "tail_call_optimization"]
+        let o3 = ["aggressive_inlining", "polyhedral_optimization"]
+        let size = ["function_merging", "code_size_reduction"]
+
+        match level {
+            OptLevel.O0 => {}
+            OptLevel.O1 => { pipeline.extend(base.iter().map(|s| s.to_string())); pipeline.extend(o1.iter().map(|s| s.to_string())) }
+            OptLevel.O2 => { pipeline.extend(base.iter().map(|s| s.to_string())); pipeline.extend(o1.iter().map(|s| s.to_string())); pipeline.extend(o2.iter().map(|s| s.to_string())) }
+            OptLevel.O3 => { pipeline.extend(base.iter().map(|s| s.to_string())); pipeline.extend(o1.iter().map(|s| s.to_string())); pipeline.extend(o2.iter().map(|s| s.to_string())); pipeline.extend(o3.iter().map(|s| s.to_string())) }
+            OptLevel.Os | OptLevel.Oz => { pipeline.extend(base.iter().map(|s| s.to_string())); pipeline.extend(size.iter().map(|s| s.to_string())) }
+        }
+        pipeline
+    }
+}
+
+struct PassResult {
+    name: string,
+    changed: bool,
+    duration_us: u64,
+    stats: HashMap<string, usize>,
+}
+
+struct PipelineRunner {
+    registry: PassRegistry,
+    max_iterations: usize,
+    verbose: bool,
+    results: [PassResult],
+}
+
+impl PipelineRunner {
+    fn new(registry: PassRegistry) -> PipelineRunner {
+        PipelineRunner { registry, max_iterations: 10, verbose: false, results: [] }
+    }
+
+    fn with_max_iterations(mut self, n: usize) -> PipelineRunner { self.max_iterations = n; self }
+    fn with_verbose(mut self) -> PipelineRunner { self.verbose = true; self }
+
+    fn validate_pipeline(self, pipeline: &[string]) -> Result<(), string> {
+        let available: HashSet<string> = self.registry.passes.keys().cloned().collect()
+        for pass_name in pipeline {
+            if !available.contains(pass_name) {
+                return err(format!("unknown pass: {}", pass_name))
+            }
+            if let some(info) = self.registry.get(pass_name) {
+                for dep in &info.dependencies {
+                    if !available.contains(dep) {
+                        return err(format!("pass '{}' depends on '{}' which is not registered", pass_name, dep))
+                    }
+                }
+            }
+        }
+        ok(())
+    }
+
+    fn topological_order(self, pipeline: &[string]) -> Result<[string], string> {
+        let mut in_degree: HashMap<string, usize> = HashMap.new()
+        let mut graph: HashMap<string, [string]> = HashMap.new()
+        for name in pipeline {
+            in_degree.entry(name.clone()).or_insert(0);
+            graph.entry(name.clone()).or_insert_with(|| []);
+            if let some(info) = self.registry.get(name) {
+                for dep in &info.dependencies {
+                    if pipeline.contains(dep) {
+                        graph.entry(dep.clone()).or_insert_with(|| []).push(name.clone())
+                        *in_degree.entry(name.clone()).or_insert(0) += 1
+                    }
+                }
+            }
+        }
+
+        let mut queue: [string] = in_degree.iter()
+            .filter(|(_, &d)| d == 0).map(|(n, _)| n.clone()).collect()
+        queue.sort_by(|a, b| {
+            let pa = self.registry.get(a).map(|i| i.priority).unwrap_or(0)
+            let pb = self.registry.get(b).map(|i| i.priority).unwrap_or(0)
+            pb.cmp(&pa)
+        })
+
+        let mut result: [string] = []
+        while !queue.is_empty() {
+            let node = queue.remove(0)
+            result.push(node.clone())
+            if let some(neighbors) = graph.get(&node) {
+                for n in neighbors {
+                    let d = in_degree.get_mut(n).unwrap()
+                    *d -= 1
+                    if *d == 0 { queue.push(n.clone()) }
+                }
+            }
+        }
+
+        if result.len() != pipeline.len() { err("cycle in pass dependencies".to_string()) }
+        else { ok(result) }
+    }
+
+    fn run(mut self, pipeline: &[string]) -> Result<PipelineStats, string> {
+        self.validate_pipeline(pipeline)?
+        let ordered = self.topological_order(pipeline)?
+        let mut total_changes = 0usize
+        let mut iteration = 0
+
+        loop {
+            iteration += 1
+            if iteration > self.max_iterations { break }
+            let mut changed = false
+
+            for pass_name in &ordered {
+                if let some(info) = self.registry.get(pass_name) {
+                    if !info.enabled { continue }
+                }
+                // Simulate running pass
+                let result = PassResult {
+                    name: pass_name.clone(), changed: iteration == 1,
+                    duration_us: 100, stats: HashMap.new(),
+                }
+                if result.changed { changed = true; total_changes += 1 }
+                self.results.push(result)
+            }
+
+            if !changed { break }
+        }
+
+        ok(PipelineStats { iterations: iteration, total_passes_run: self.results.len(), total_changes })
+    }
+
+    fn report(self) -> string {
+        let mut out = string.new()
+        out.push_str("=== Optimization Pipeline Report ===\n")
+        for result in &self.results {
+            out.push_str(&format!("  {} - changed={} ({}us)\n", result.name, result.changed, result.duration_us))
+        }
+        out
+    }
+}
+
+struct PipelineStats {
+    iterations: usize,
+    total_passes_run: usize,
+    total_changes: usize,
+}
+
+fn main() {
+    let mut registry = PassRegistry.new()
+    registry.register(PassInfo.new("constant_folding", PassKind.Transform).with_priority(10))
+    registry.register(PassInfo.new("dead_code_elimination", PassKind.Cleanup).depends_on("constant_folding").with_priority(5))
+    registry.register(PassInfo.new("cfg_simplify", PassKind.Cleanup).with_priority(3))
+    registry.register(PassInfo.new("inlining", PassKind.Transform).with_priority(8))
+    registry.register(PassInfo.new("loop_unrolling", PassKind.Transform).depends_on("inlining"))
+    print("Registry \u2713")
+
+    let pipeline = ["constant_folding".into(), "dead_code_elimination".into(), "inlining".into()]
+    let mut runner = PipelineRunner.new(registry)
+    runner.validate_pipeline(&pipeline).unwrap()
+    print("Validation \u2713")
+
+    let ordered = runner.topological_order(&pipeline).unwrap()
+    // constant_folding must come before dead_code_elimination
+    let cf_pos = ordered.iter().position(|n| n == "constant_folding").unwrap()
+    let dce_pos = ordered.iter().position(|n| n == "dead_code_elimination").unwrap()
+    assert(cf_pos < dce_pos)
+    print("Topological order \u2713")
+
+    let stats = runner.run(&pipeline).unwrap()
+    assert(stats.iterations >= 1)
+    assert(stats.total_passes_run >= 3)
+    print("Pipeline run \u2713")
+
+    let report = runner.report()
+    assert(report.contains("constant_folding"))
+    print("Report \u2713")
+
+    // Default pipelines
+    let mut reg2 = PassRegistry.new()
+    let o0 = reg2.default_pipeline(OptLevel.O0)
+    assert(o0.is_empty())
+    let o2 = reg2.default_pipeline(OptLevel.O2)
+    assert(o2.contains(&"constant_folding".to_string()))
+    assert(o2.contains(&"loop_unrolling".to_string()))
+    print("Default pipelines \u2713")
+
+    print("Optimizer Pipeline complete \u2713")
+}
