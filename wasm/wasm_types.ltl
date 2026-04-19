@@ -1,0 +1,70 @@
+// wasm_types.ltl — WebAssembly type system representation
+enum ValType { I32, I64, F32, F64, V128, FuncRef, ExternRef }
+
+impl ValType {
+    fn encode(self) -> u8 {
+        match self {
+            ValType.I32       => 0x7F,
+            ValType.I64       => 0x7E,
+            ValType.F32       => 0x7D,
+            ValType.F64       => 0x7C,
+            ValType.V128      => 0x7B,
+            ValType.FuncRef   => 0x70,
+            ValType.ExternRef => 0x6F,
+        }
+    }
+}
+
+struct FuncType {
+    params:  [ValType],
+    results: [ValType],
+}
+
+impl FuncType {
+    fn encode(self) -> [u8] {
+        let mut out = [0x60u8]
+        out.extend(encode_vec(self.params |> map(|t| t.encode()) |> collect()))
+        out.extend(encode_vec(self.results |> map(|t| t.encode()) |> collect()))
+        out
+    }
+}
+
+enum RefType { FuncRef, ExternRef }
+
+struct TableType  { element: RefType, limits: Limits }
+struct MemType    { limits: Limits }
+struct GlobalType { val_type: ValType, mutable: bool }
+
+struct Limits {
+    min: int,
+    max: int?,
+}
+
+impl Limits {
+    fn encode(self) -> [u8] {
+        match self.max {
+            none    => [0x00, ...encode_leb128_u(self.min)],
+            some(m) => [0x01, ...encode_leb128_u(self.min), ...encode_leb128_u(m)],
+        }
+    }
+}
+
+fn encode_leb128_u(mut v: int) -> [u8] {
+    mut out = []
+    loop {
+        let byte = (v & 0x7F) as u8
+        v >>= 7
+        if v == 0 {
+            out.push(byte)
+            break
+        }
+        out.push(byte | 0x80)
+    }
+    out
+}
+
+fn encode_vec(items: [[u8]]) -> [u8] {
+    let mut out = encode_leb128_u(items.len())
+    for item in items { out.extend(item) }
+    out
+}
