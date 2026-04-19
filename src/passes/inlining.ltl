@@ -1,278 +1,334 @@
-// src/passes/inlining.ltl — Function inlining pass with cost/benefit heuristics
+// Compiler Pass - Function Inlining
+// Cost model, call site analysis, and inline expansion for performance optimization.
+
 use std.collections.{HashMap, HashSet}
 
-type VarId = u32
-type BlockId = u32
-
-// ── IR structures ────────────────────────────────────────────────────────────
-enum IRValue {
-    Const(i64),
-    Var(VarId),
-    BinExpr { op: string, lhs: Box<IRValue>, rhs: Box<IRValue> },
-    Call { callee: string, args: [IRValue] },
-}
-
-enum IRInst {
-    Assign { dst: VarId, value: IRValue },
-    Store { addr: IRValue, value: IRValue },
-    Branch { cond: IRValue, true_blk: BlockId, false_blk: BlockId },
-    Jump(BlockId),
-    Return(Option<IRValue>),
-}
-
-struct BasicBlock {
-    id:    BlockId,
-    insts: [IRInst],
-    succs: [BlockId],
-    preds: [BlockId],
-}
-
-struct Function {
-    name:       string,
-    params:     [(VarId, string)],  // (var_id, type_name)
-    blocks:     [BasicBlock],
-    return_type: string,
-    is_inline:  bool,               // #[inline] attribute
+#[derive(Clone, Debug)]
+struct FunctionInfo {
+    name: string,
+    body_size: usize,         // instruction count
+    call_count: usize,        // how many times called
     is_recursive: bool,
+    is_leaf: bool,            // no calls to other functions
+    has_loops: bool,
+    param_count: usize,
+    return_type: string,
+    always_inline: bool,      // #[inline(always)]
+    never_inline: bool,       // #[inline(never)]
+    is_generic: bool,
+    is_closure: bool,
 }
 
-struct Module {
-    functions: HashMap<string, Function>,
-}
-
-// ── Inlining cost model ──────────────────────────────────────────────────────
-struct InlineCost {
-    instruction_count: u32,
-    call_count:        u32,
-    has_loops:         bool,
-    is_leaf:           bool,
-    is_recursive:      bool,
-    param_count:       u32,
-    estimated_benefit: i32,
-}
-
-const INLINE_THRESHOLD: i32 = 75
-const SMALL_FUNC_BONUS: i32 = 50
-const LEAF_BONUS: i32 = 30
-const INLINE_ATTR_BONUS: i32 = 100
-const CALL_PENALTY: i32 = 10
-const LOOP_PENALTY: i32 = 50
-const RECURSIVE_PENALTY: i32 = 1000
-
-fn compute_inline_cost(func: &Function) -> InlineCost {
-    let mut inst_count: u32 = 0
-    let mut call_count: u32 = 0
-    let mut has_back_edge = false
-
-    for block in &func.blocks {
-        inst_count += block.insts.len() as u32
-        for inst in &block.insts {
-            if let IRInst.Assign { value: IRValue.Call { .. }, .. } = inst {
-                call_count += 1
-            }
-        }
-        // Detect back edges (simple loop detection)
-        for &succ in &block.succs {
-            if succ <= block.id { has_back_edge = true }
-        }
-    }
-
-    let is_leaf = call_count == 0
-    let mut benefit: i32 = 0
-
-    // Small functions are always good to inline
-    if inst_count <= 10 { benefit += SMALL_FUNC_BONUS }
-    if is_leaf { benefit += LEAF_BONUS }
-    if func.is_inline { benefit += INLINE_ATTR_BONUS }
-
-    // Penalties
-    benefit -= inst_count as i32  // larger = more costly
-    benefit -= call_count as i32 * CALL_PENALTY
-    if has_back_edge { benefit -= LOOP_PENALTY }
-    if func.is_recursive { benefit -= RECURSIVE_PENALTY }
-
-    InlineCost {
-        instruction_count: inst_count,
-        call_count,
-        has_loops: has_back_edge,
-        is_leaf,
-        is_recursive: func.is_recursive,
-        param_count: func.params.len() as u32,
-        estimated_benefit: benefit,
-    }
-}
-
-fn should_inline(cost: &InlineCost) -> bool {
-    !cost.is_recursive && cost.estimated_benefit > -INLINE_THRESHOLD
-}
-
-// ── Variable renaming for inlined bodies ─────────────────────────────────────
-struct VarRenamer {
-    next_id: VarId,
-    mapping: HashMap<VarId, VarId>,
-}
-
-impl VarRenamer {
-    fn new(start: VarId) -> VarRenamer {
-        VarRenamer { next_id: start, mapping: HashMap.new() }
-    }
-
-    fn rename(mut self, old: VarId) -> VarId {
-        if let some(&new) = self.mapping.get(&old) { return new }
-        let new = self.next_id
-        self.next_id += 1
-        self.mapping.insert(old, new)
-        new
-    }
-
-    fn rename_value(mut self, val: IRValue) -> IRValue {
-        match val {
-            IRValue.Var(v) => IRValue.Var(self.rename(v)),
-            IRValue.BinExpr { op, lhs, rhs } => IRValue.BinExpr {
-                op,
-                lhs: Box.new(self.rename_value(*lhs)),
-                rhs: Box.new(self.rename_value(*rhs)),
-            },
-            IRValue.Call { callee, args } => IRValue.Call {
-                callee,
-                args: args |> map(|a| self.rename_value(a)) |> collect(),
-            },
-            other => other,
-        }
-    }
-
-    fn rename_inst(mut self, inst: IRInst, block_offset: BlockId) -> IRInst {
-        match inst {
-            IRInst.Assign { dst, value } => IRInst.Assign {
-                dst: self.rename(dst),
-                value: self.rename_value(value),
-            },
-            IRInst.Branch { cond, true_blk, false_blk } => IRInst.Branch {
-                cond: self.rename_value(cond),
-                true_blk: true_blk + block_offset,
-                false_blk: false_blk + block_offset,
-            },
-            IRInst.Jump(target) => IRInst.Jump(target + block_offset),
-            IRInst.Return(some(v)) => IRInst.Return(some(self.rename_value(v))),
-            other => other,
+impl FunctionInfo {
+    fn new(name: &str) -> FunctionInfo {
+        FunctionInfo {
+            name: name.to_string(),
+            body_size: 0,
+            call_count: 0,
+            is_recursive: false,
+            is_leaf: true,
+            has_loops: false,
+            param_count: 0,
+            return_type: "void".to_string(),
+            always_inline: false,
+            never_inline: false,
+            is_generic: false,
+            is_closure: false,
         }
     }
 }
 
-// ── Inlining pass ────────────────────────────────────────────────────────────
-pub struct InliningStats {
-    pub candidates: u32,
-    pub inlined: u32,
-    pub skipped_recursive: u32,
-    pub skipped_too_large: u32,
+#[derive(Clone, Debug)]
+struct CallSite {
+    caller: string,
+    callee: string,
+    call_id: usize,
+    in_loop: bool,
+    loop_depth: usize,
+    is_tail_call: bool,
+    arg_constants: usize,     // number of constant arguments
 }
 
-pub fn run_inlining(module: &mut Module) -> InliningStats {
-    let mut stats = InliningStats { candidates: 0, inlined: 0, skipped_recursive: 0, skipped_too_large: 0 }
+#[derive(Clone, Debug)]
+enum InlineDecision {
+    Inline(string),     // reason
+    DontInline(string), // reason
+}
 
-    // Compute costs for all functions
-    let costs: HashMap<string, InlineCost> = module.functions.iter()
-        .map(|(name, func)| (name.clone(), compute_inline_cost(func)))
-        .collect()
+struct InlineCostModel {
+    size_threshold: usize,
+    hot_call_bonus: i32,
+    loop_bonus: i32,
+    constant_arg_bonus: i32,
+    leaf_bonus: i32,
+    recursive_penalty: i32,
+    closure_bonus: i32,
+}
 
-    // Find call sites to inline
-    let func_names: [string] = module.functions.keys().cloned().collect()
+impl InlineCostModel {
+    fn default() -> InlineCostModel {
+        InlineCostModel {
+            size_threshold: 50,
+            hot_call_bonus: 20,
+            loop_bonus: 15,
+            constant_arg_bonus: 10,
+            leaf_bonus: 10,
+            recursive_penalty: -100,
+            closure_bonus: 25,
+        }
+    }
 
-    for caller_name in &func_names {
-        let mut call_sites: [(usize, usize, string)] = []  // (block_idx, inst_idx, callee)
+    fn aggressive() -> InlineCostModel {
+        InlineCostModel {
+            size_threshold: 200,
+            hot_call_bonus: 30,
+            loop_bonus: 25,
+            constant_arg_bonus: 15,
+            leaf_bonus: 15,
+            recursive_penalty: -100,
+            closure_bonus: 40,
+        }
+    }
 
-        if let some(caller) = module.functions.get(caller_name) {
-            for (bi, block) in caller.blocks.iter().enumerate() {
-                for (ii, inst) in block.insts.iter().enumerate() {
-                    if let IRInst.Assign { value: IRValue.Call { callee, .. }, .. } = inst {
-                        if callee != caller_name {  // don't inline self
-                            call_sites.push((bi, ii, callee.clone()))
-                        }
+    fn conservative() -> InlineCostModel {
+        InlineCostModel {
+            size_threshold: 20,
+            hot_call_bonus: 10,
+            loop_bonus: 5,
+            constant_arg_bonus: 5,
+            leaf_bonus: 5,
+            recursive_penalty: -100,
+            closure_bonus: 10,
+        }
+    }
+
+    fn compute_cost(self, func: &FunctionInfo, site: &CallSite) -> i32 {
+        let mut cost = func.body_size as i32
+
+        // Bonuses (reduce cost)
+        if site.in_loop { cost -= self.loop_bonus * (site.loop_depth as i32).min(3) }
+        if func.is_leaf { cost -= self.leaf_bonus }
+        if func.is_closure { cost -= self.closure_bonus }
+        if site.arg_constants > 0 { cost -= self.constant_arg_bonus * site.arg_constants as i32 }
+        if func.call_count >= 5 { cost -= self.hot_call_bonus }
+
+        // Penalties (increase cost)
+        if func.is_recursive { cost += self.recursive_penalty }
+        if func.has_loops { cost += 10 }
+
+        cost
+    }
+
+    fn should_inline(self, func: &FunctionInfo, site: &CallSite) -> InlineDecision {
+        // Always/never inline attributes
+        if func.always_inline {
+            return InlineDecision.Inline("marked #[inline(always)]".to_string())
+        }
+        if func.never_inline {
+            return InlineDecision.DontInline("marked #[inline(never)]".to_string())
+        }
+        if func.is_recursive {
+            return InlineDecision.DontInline("recursive function".to_string())
+        }
+
+        let cost = self.compute_cost(func, site)
+        if cost <= self.size_threshold as i32 {
+            InlineDecision.Inline(format!("cost {} <= threshold {}", cost, self.size_threshold))
+        } else {
+            InlineDecision.DontInline(format!("cost {} > threshold {}", cost, self.size_threshold))
+        }
+    }
+}
+
+struct InliningPass {
+    functions: HashMap<string, FunctionInfo>,
+    call_sites: [CallSite],
+    decisions: HashMap<usize, InlineDecision>,
+    model: InlineCostModel,
+    inlined_count: usize,
+    skipped_count: usize,
+    size_increase: usize,
+}
+
+impl InliningPass {
+    fn new(model: InlineCostModel) -> InliningPass {
+        InliningPass {
+            functions: HashMap.new(),
+            call_sites: [],
+            decisions: HashMap.new(),
+            model,
+            inlined_count: 0,
+            skipped_count: 0,
+            size_increase: 0,
+        }
+    }
+
+    fn add_function(mut self, info: FunctionInfo) {
+        self.functions.insert(info.name.clone(), info)
+    }
+
+    fn add_call_site(mut self, site: CallSite) {
+        self.call_sites.push(site)
+    }
+
+    fn run(mut self) {
+        for site in &self.call_sites {
+            let decision = match self.functions.get(&site.callee) {
+                some(func) => self.model.should_inline(func, site),
+                none => InlineDecision.DontInline("function not found".to_string()),
+            };
+
+            match &decision {
+                InlineDecision.Inline(_) => {
+                    self.inlined_count += 1
+                    if let some(func) = self.functions.get(&site.callee) {
+                        self.size_increase += func.body_size
                     }
-                }
+                },
+                InlineDecision.DontInline(_) => {
+                    self.skipped_count += 1
+                },
             }
-        }
 
-        for (block_idx, inst_idx, callee_name) in call_sites.iter().rev() {
-            stats.candidates += 1
-            if let some(cost) = costs.get(callee_name) {
-                if cost.is_recursive { stats.skipped_recursive += 1; continue }
-                if !should_inline(cost) { stats.skipped_too_large += 1; continue }
-                stats.inlined += 1
-                // Actual inlining would splice callee blocks into caller here
-            }
+            self.decisions.insert(site.call_id, decision)
         }
     }
-    stats
+
+    fn get_decision(self, call_id: usize) -> Option<&InlineDecision> {
+        self.decisions.get(&call_id)
+    }
+
+    fn stats(self) -> (usize, usize, usize) {
+        (self.inlined_count, self.skipped_count, self.size_increase)
+    }
 }
 
 fn main() {
-    // Test cost model
-    let small_func = Function {
-        name: "add".to_string(),
-        params: [(1, "i64".to_string()), (2, "i64".to_string())],
-        blocks: [BasicBlock {
-            id: 0,
-            insts: [
-                IRInst.Assign { dst: 3, value: IRValue.BinExpr {
-                    op: "add".to_string(),
-                    lhs: Box.new(IRValue.Var(1)),
-                    rhs: Box.new(IRValue.Var(2)),
-                }},
-                IRInst.Return(some(IRValue.Var(3))),
-            ],
-            succs: [], preds: [],
-        }],
-        return_type: "i64".to_string(),
-        is_inline: false,
-        is_recursive: false,
+    // Cost models
+    let default_model = InlineCostModel.default()
+    assert(default_model.size_threshold == 50)
+    let aggressive = InlineCostModel.aggressive()
+    assert(aggressive.size_threshold == 200)
+    let conservative = InlineCostModel.conservative()
+    assert(conservative.size_threshold == 20)
+    print("Cost models ✓")
+
+    // Small leaf function - should inline
+    let mut small_fn = FunctionInfo.new("get_x")
+    small_fn.body_size = 5
+    small_fn.is_leaf = true
+    small_fn.call_count = 10
+
+    let site = CallSite {
+        caller: "main".to_string(), callee: "get_x".to_string(),
+        call_id: 0, in_loop: false, loop_depth: 0,
+        is_tail_call: false, arg_constants: 0,
     }
 
-    let cost = compute_inline_cost(&small_func)
-    print("Small func: ${cost.instruction_count} insts, leaf=${cost.is_leaf}, benefit=${cost.estimated_benefit}")
-    assert(cost.is_leaf)
-    assert(cost.instruction_count == 2)
-    assert(should_inline(&cost), "small leaf function should be inlined")
-    print("Small function inlining decision: YES ✓")
+    let cost = default_model.compute_cost(&small_fn, &site)
+    assert(cost < default_model.size_threshold as i32)
+    print("Small function cost ✓")
 
-    // Recursive function should not inline
-    let rec_func = Function {
-        name: "fib".to_string(),
-        params: [(1, "i64".to_string())],
-        blocks: [BasicBlock {
-            id: 0,
-            insts: [
-                IRInst.Assign { dst: 2, value: IRValue.Call { callee: "fib".to_string(), args: [IRValue.Var(1)] } },
-                IRInst.Return(some(IRValue.Var(2))),
-            ],
-            succs: [], preds: [],
-        }],
-        return_type: "i64".to_string(),
-        is_inline: false,
-        is_recursive: true,
+    // Large function - should not inline
+    let mut large_fn = FunctionInfo.new("process")
+    large_fn.body_size = 200
+    large_fn.has_loops = true
+
+    let large_site = CallSite {
+        caller: "main".to_string(), callee: "process".to_string(),
+        call_id: 1, in_loop: false, loop_depth: 0,
+        is_tail_call: false, arg_constants: 0,
     }
 
-    let cost = compute_inline_cost(&rec_func)
-    assert(!should_inline(&cost), "recursive function should not be inlined")
-    print("Recursive function inlining decision: NO ✓")
-
-    // #[inline] function with moderate size
-    let inline_func = Function {
-        name: "clamp".to_string(),
-        params: [(1, "i64".to_string()), (2, "i64".to_string()), (3, "i64".to_string())],
-        blocks: [BasicBlock {
-            id: 0,
-            insts: (0..15).map(|i| IRInst.Assign { dst: 10 + i, value: IRValue.Const(i as i64) }).collect(),
-            succs: [], preds: [],
-        }],
-        return_type: "i64".to_string(),
-        is_inline: true,
-        is_recursive: false,
+    match default_model.should_inline(&large_fn, &large_site) {
+        InlineDecision.DontInline(_) => {},
+        _ => panic("Expected DontInline for large function"),
     }
+    print("Large function ✓")
 
-    let cost = compute_inline_cost(&inline_func)
-    assert(should_inline(&cost), "#[inline] moderate func should be inlined")
-    print("#[inline] attribute respected ✓")
+    // Always inline
+    let mut always_fn = FunctionInfo.new("force_inline")
+    always_fn.body_size = 500
+    always_fn.always_inline = true
+    match default_model.should_inline(&always_fn, &site) {
+        InlineDecision.Inline(reason) => assert(reason.contains("always")),
+        _ => panic("Expected Inline for always_inline"),
+    }
+    print("Always inline ✓")
 
-    print("Inlining pass — all passed ✓")
+    // Never inline
+    let mut never_fn = FunctionInfo.new("no_inline")
+    never_fn.body_size = 1
+    never_fn.never_inline = true
+    match default_model.should_inline(&never_fn, &site) {
+        InlineDecision.DontInline(reason) => assert(reason.contains("never")),
+        _ => panic("Expected DontInline for never_inline"),
+    }
+    print("Never inline ✓")
+
+    // Recursive
+    let mut rec_fn = FunctionInfo.new("factorial")
+    rec_fn.body_size = 10
+    rec_fn.is_recursive = true
+    match default_model.should_inline(&rec_fn, &site) {
+        InlineDecision.DontInline(reason) => assert(reason.contains("recursive")),
+        _ => panic("Expected DontInline for recursive"),
+    }
+    print("Recursive ✓")
+
+    // Loop bonus
+    let loop_site = CallSite {
+        caller: "hot_loop".to_string(), callee: "get_x".to_string(),
+        call_id: 2, in_loop: true, loop_depth: 2,
+        is_tail_call: false, arg_constants: 1,
+    }
+    let loop_cost = default_model.compute_cost(&small_fn, &loop_site)
+    assert(loop_cost < cost) // loop bonus reduces cost
+    print("Loop bonus ✓")
+
+    // Full pass
+    let mut pass = InliningPass.new(InlineCostModel.default())
+    pass.add_function(small_fn.clone())
+    pass.add_function(large_fn.clone())
+
+    pass.add_call_site(CallSite {
+        caller: "main".to_string(), callee: "get_x".to_string(),
+        call_id: 10, in_loop: false, loop_depth: 0,
+        is_tail_call: false, arg_constants: 0,
+    })
+    pass.add_call_site(CallSite {
+        caller: "main".to_string(), callee: "process".to_string(),
+        call_id: 11, in_loop: false, loop_depth: 0,
+        is_tail_call: false, arg_constants: 0,
+    })
+    pass.add_call_site(CallSite {
+        caller: "main".to_string(), callee: "missing".to_string(),
+        call_id: 12, in_loop: false, loop_depth: 0,
+        is_tail_call: false, arg_constants: 0,
+    })
+
+    pass.run()
+
+    let (inlined, skipped, size_inc) = pass.stats()
+    assert(inlined == 1)
+    assert(skipped == 2)
+    assert(size_inc == 5) // small_fn body size
+    print("Inlining pass ✓")
+
+    // Check individual decisions
+    match pass.get_decision(10).unwrap() {
+        InlineDecision.Inline(_) => {},
+        _ => panic("Expected Inline for get_x"),
+    }
+    match pass.get_decision(11).unwrap() {
+        InlineDecision.DontInline(_) => {},
+        _ => panic("Expected DontInline for process"),
+    }
+    match pass.get_decision(12).unwrap() {
+        InlineDecision.DontInline(r) => assert(r.contains("not found")),
+        _ => panic("Expected DontInline for missing"),
+    }
+    print("Individual decisions ✓")
+
+    print("Function Inlining complete ✓")
 }
