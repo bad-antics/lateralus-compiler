@@ -1,0 +1,278 @@
+// Compiler Pass - Devirtualization
+// Converts virtual/dynamic dispatch calls to direct calls when the concrete type is known.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Debug)]
+struct TypeInfo {
+    name: string,
+    is_concrete: bool,
+    impls: [string],  // trait implementations
+    methods: HashMap<string, MethodInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct MethodInfo {
+    name: string,
+    trait_name: Option<string>,
+    is_virtual: bool,
+    signature: string,
+}
+
+#[derive(Clone, Debug)]
+enum CallSite {
+    Virtual {
+        receiver: string,      // variable
+        trait_name: string,
+        method: string,
+        args: [string],
+    },
+    Direct {
+        receiver: Option<string>,
+        type_name: string,
+        method: string,
+        args: [string],
+    },
+}
+
+impl CallSite {
+    fn method_name(self) -> &str {
+        match self {
+            CallSite.Virtual { ref method, .. } => method.as_str(),
+            CallSite.Direct { ref method, .. } => method.as_str(),
+        }
+    }
+
+    fn is_virtual(self) -> bool {
+        match self { CallSite.Virtual { .. } => true, _ => false }
+    }
+}
+
+struct TypeAnalysis {
+    types: HashMap<string, TypeInfo>,
+    // var -> known concrete type
+    concrete_types: HashMap<string, string>,
+    // trait -> set of concrete implementors
+    implementors: HashMap<string, HashSet<string>>,
+}
+
+impl TypeAnalysis {
+    fn new() -> TypeAnalysis {
+        TypeAnalysis {
+            types: HashMap.new(),
+            concrete_types: HashMap.new(),
+            implementors: HashMap.new(),
+        }
+    }
+
+    fn register_type(mut self, info: TypeInfo) {
+        let name = info.name.clone()
+        for impl_trait in &info.impls {
+            self.implementors.entry(impl_trait.clone())
+                .or_insert_with(HashSet.new)
+                .insert(name.clone())
+        }
+        self.types.insert(name, info)
+    }
+
+    fn set_concrete_type(mut self, var: &str, type_name: &str) {
+        self.concrete_types.insert(var.to_string(), type_name.to_string())
+    }
+
+    fn resolve_type(self, var: &str) -> Option<&str> {
+        self.concrete_types.get(var).map(|s| s.as_str())
+    }
+
+    fn has_single_implementor(self, trait_name: &str) -> Option<&str> {
+        self.implementors.get(trait_name)
+            .filter(|s| s.len() == 1)
+            .and_then(|s| s.iter().next())
+            .map(|s| s.as_str())
+    }
+
+    fn type_implements(self, type_name: &str, trait_name: &str) -> bool {
+        self.types.get(type_name)
+            .map(|t| t.impls.contains(&trait_name.to_string()))
+            .unwrap_or(false)
+    }
+}
+
+struct Devirtualizer {
+    analysis: TypeAnalysis,
+    devirtualized: usize,
+    speculated: usize,
+    unchanged: usize,
+}
+
+impl Devirtualizer {
+    fn new(analysis: TypeAnalysis) -> Devirtualizer {
+        Devirtualizer { analysis, devirtualized: 0, speculated: 0, unchanged: 0 }
+    }
+
+    fn devirtualize(mut self, call: &CallSite) -> CallSite {
+        match call {
+            CallSite.Virtual { receiver, trait_name, method, args } => {
+                // Strategy 1: Known concrete type from analysis
+                if let some(concrete) = self.analysis.resolve_type(receiver) {
+                    if self.analysis.type_implements(concrete, trait_name) {
+                        self.devirtualized += 1
+                        return CallSite.Direct {
+                            receiver: some(receiver.clone()),
+                            type_name: concrete.to_string(),
+                            method: method.clone(),
+                            args: args.clone(),
+                        }
+                    }
+                }
+
+                // Strategy 2: Single implementor (whole-program devirtualization)
+                if let some(sole) = self.analysis.has_single_implementor(trait_name) {
+                    self.devirtualized += 1
+                    return CallSite.Direct {
+                        receiver: some(receiver.clone()),
+                        type_name: sole.to_string(),
+                        method: method.clone(),
+                        args: args.clone(),
+                    }
+                }
+
+                self.unchanged += 1
+                call.clone()
+            },
+            _ => {
+                self.unchanged += 1
+                call.clone()
+            },
+        }
+    }
+
+    fn devirtualize_all(mut self, calls: &[CallSite]) -> [CallSite] {
+        calls.iter().map(|c| self.devirtualize(c)).collect()
+    }
+
+    fn stats(self) -> (usize, usize, usize) {
+        (self.devirtualized, self.speculated, self.unchanged)
+    }
+}
+
+fn main() {
+    let mut analysis = TypeAnalysis.new()
+
+    // Register types
+    let dog_type = TypeInfo {
+        name: "Dog".to_string(), is_concrete: true,
+        impls: vec!["Animal".to_string(), "Debug".to_string()],
+        methods: HashMap.from([
+            ("speak".to_string(), MethodInfo { name: "speak".to_string(), trait_name: some("Animal".to_string()), is_virtual: true, signature: "fn() -> string".to_string() }),
+        ]),
+    }
+    analysis.register_type(dog_type)
+
+    let cat_type = TypeInfo {
+        name: "Cat".to_string(), is_concrete: true,
+        impls: vec!["Animal".to_string()],
+        methods: HashMap.from([
+            ("speak".to_string(), MethodInfo { name: "speak".to_string(), trait_name: some("Animal".to_string()), is_virtual: true, signature: "fn() -> string".to_string() }),
+        ]),
+    }
+    analysis.register_type(cat_type)
+
+    let fish_type = TypeInfo {
+        name: "Fish".to_string(), is_concrete: true,
+        impls: vec!["Swimmer".to_string()],
+        methods: HashMap.new(),
+    }
+    analysis.register_type(fish_type)
+
+    // Set known types
+    analysis.set_concrete_type("my_dog", "Dog")
+    analysis.set_concrete_type("my_cat", "Cat")
+
+    // Resolve
+    assert(analysis.resolve_type("my_dog") == some("Dog"))
+    assert(analysis.resolve_type("unknown").is_none())
+    print("Type resolution ✓")
+
+    // Implementors
+    let animal_impls = analysis.implementors.get("Animal").unwrap()
+    assert(animal_impls.len() == 2)  // Dog, Cat
+    assert(animal_impls.contains("Dog"))
+    assert(animal_impls.contains("Cat"))
+    print("Implementors tracked ✓")
+
+    // Single implementor
+    assert(analysis.has_single_implementor("Swimmer") == some("Fish"))
+    assert(analysis.has_single_implementor("Animal").is_none())  // 2 implementors
+    print("Single implementor ✓")
+
+    // type_implements
+    assert(analysis.type_implements("Dog", "Animal"))
+    assert(analysis.type_implements("Dog", "Debug"))
+    assert(!analysis.type_implements("Cat", "Debug"))
+    assert(!analysis.type_implements("Fish", "Animal"))
+    print("type_implements ✓")
+
+    // Devirtualize known type
+    let mut devirt = Devirtualizer.new(analysis)
+    let virtual_call = CallSite.Virtual {
+        receiver: "my_dog".to_string(), trait_name: "Animal".to_string(),
+        method: "speak".to_string(), args: [],
+    }
+    assert(virtual_call.is_virtual())
+    assert(virtual_call.method_name() == "speak")
+
+    let result = devirt.devirtualize(&virtual_call)
+    match &result {
+        CallSite.Direct { type_name, method, .. } => {
+            assert(type_name == "Dog")
+            assert(method == "speak")
+        },
+        _ => panic!("should be direct"),
+    }
+    assert(!result.is_virtual())
+    print("Devirtualize known type ✓")
+
+    // Devirtualize single implementor (Swimmer)
+    let swim_call = CallSite.Virtual {
+        receiver: "some_fish".to_string(), trait_name: "Swimmer".to_string(),
+        method: "swim".to_string(), args: [],
+    }
+    let swim_result = devirt.devirtualize(&swim_call)
+    match &swim_result {
+        CallSite.Direct { type_name, .. } => assert(type_name == "Fish"),
+        _ => panic!("should be devirtualized"),
+    }
+    print("Devirtualize single implementor ✓")
+
+    // Cannot devirtualize unknown receiver with multiple implementors
+    let unknown_call = CallSite.Virtual {
+        receiver: "unknown_animal".to_string(), trait_name: "Animal".to_string(),
+        method: "speak".to_string(), args: [],
+    }
+    let unknown_result = devirt.devirtualize(&unknown_call)
+    assert(unknown_result.is_virtual())
+    print("Skip unknown multi-impl ✓")
+
+    // Already direct stays direct
+    let direct = CallSite.Direct {
+        receiver: some("x".to_string()), type_name: "Dog".to_string(),
+        method: "bark".to_string(), args: [],
+    }
+    let direct_result = devirt.devirtualize(&direct)
+    assert(!direct_result.is_virtual())
+    print("Direct unchanged ✓")
+
+    // Stats
+    let (d, s, u) = devirt.stats()
+    assert(d == 2)  // dog + fish
+    assert(u == 2)  // unknown + direct
+    print("Stats ✓")
+
+    // devirtualize_all
+    let calls = vec![virtual_call.clone(), swim_call.clone(), unknown_call.clone()]
+    let results = devirt.devirtualize_all(&calls)
+    assert(results.len() == 3)
+    print("devirtualize_all ✓")
+
+    print("Devirtualization complete ✓")
+}
