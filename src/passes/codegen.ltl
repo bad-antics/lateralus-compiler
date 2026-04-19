@@ -1,0 +1,353 @@
+// Compiler Pass — Code Generation Backend
+// Emits x86-64 assembly from IR, with register allocation and instruction selection.
+
+use std.collections.HashMap
+use std.io.Write
+
+// ── x86-64 Registers ────────────────────────────────────────────────────────
+enum Reg64 {
+    Rax, Rbx, Rcx, Rdx, Rsi, Rdi, Rsp, Rbp,
+    R8, R9, R10, R11, R12, R13, R14, R15,
+}
+
+impl Reg64 {
+    fn name(self) -> &str {
+        match self {
+            Reg64.Rax => "rax", Reg64.Rbx => "rbx", Reg64.Rcx => "rcx", Reg64.Rdx => "rdx",
+            Reg64.Rsi => "rsi", Reg64.Rdi => "rdi", Reg64.Rsp => "rsp", Reg64.Rbp => "rbp",
+            Reg64.R8 => "r8", Reg64.R9 => "r9", Reg64.R10 => "r10", Reg64.R11 => "r11",
+            Reg64.R12 => "r12", Reg64.R13 => "r13", Reg64.R14 => "r14", Reg64.R15 => "r15",
+        }
+    }
+}
+
+// System V AMD64 ABI: rdi, rsi, rdx, rcx, r8, r9 for args
+const ARG_REGS: [Reg64] = [Reg64.Rdi, Reg64.Rsi, Reg64.Rdx, Reg64.Rcx, Reg64.R8, Reg64.R9]
+const CALLEE_SAVED: [Reg64] = [Reg64.Rbx, Reg64.R12, Reg64.R13, Reg64.R14, Reg64.R15]
+const CALLER_SAVED: [Reg64] = [Reg64.Rax, Reg64.Rcx, Reg64.Rdx, Reg64.Rsi, Reg64.Rdi, Reg64.R8, Reg64.R9, Reg64.R10, Reg64.R11]
+
+// ── Operand ──────────────────────────────────────────────────────────────────
+enum Operand {
+    Reg(Reg64),
+    Imm(i64),
+    Mem(Reg64, i32),      // [reg + offset]
+    Label(string),
+    RipRelative(string),  // [rip + label]
+}
+
+impl Operand {
+    fn fmt(self) -> string {
+        match self {
+            Operand.Reg(r) => r.name().to_string(),
+            Operand.Imm(v) => v.to_string(),
+            Operand.Mem(base, 0) => format!("[{}]", base.name()),
+            Operand.Mem(base, off) => format!("[{} + {}]", base.name(), off),
+            Operand.Label(l) => l.clone(),
+            Operand.RipRelative(l) => format!("[rip + {l}]"),
+        }
+    }
+}
+
+// ── Assembly Instruction ─────────────────────────────────────────────────────
+enum AsmInst {
+    Label(string),
+    Mov(Operand, Operand),
+    Lea(Operand, Operand),
+    Add(Operand, Operand),
+    Sub(Operand, Operand),
+    Imul(Operand, Operand),
+    Idiv(Operand),
+    Xor(Operand, Operand),
+    And(Operand, Operand),
+    Or(Operand, Operand),
+    Shl(Operand, Operand),
+    Shr(Operand, Operand),
+    Neg(Operand),
+    Not(Operand),
+    Cmp(Operand, Operand),
+    Test(Operand, Operand),
+    Jmp(string),
+    Je(string),
+    Jne(string),
+    Jl(string),
+    Jle(string),
+    Jg(string),
+    Jge(string),
+    Call(string),
+    Ret,
+    Push(Operand),
+    Pop(Operand),
+    Cqo,
+    Syscall,
+    Comment(string),
+    Directive(string),
+}
+
+impl AsmInst {
+    fn fmt(self) -> string {
+        match self {
+            AsmInst.Label(l) => format!("{l}:"),
+            AsmInst.Mov(d, s) => format!("    mov {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Lea(d, s) => format!("    lea {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Add(d, s) => format!("    add {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Sub(d, s) => format!("    sub {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Imul(d, s) => format!("    imul {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Idiv(s) => format!("    idiv {}", s.fmt()),
+            AsmInst.Xor(d, s) => format!("    xor {}, {}", d.fmt(), s.fmt()),
+            AsmInst.And(d, s) => format!("    and {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Or(d, s) => format!("    or {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Shl(d, s) => format!("    shl {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Shr(d, s) => format!("    shr {}, {}", d.fmt(), s.fmt()),
+            AsmInst.Neg(d) => format!("    neg {}", d.fmt()),
+            AsmInst.Not(d) => format!("    not {}", d.fmt()),
+            AsmInst.Cmp(a, b) => format!("    cmp {}, {}", a.fmt(), b.fmt()),
+            AsmInst.Test(a, b) => format!("    test {}, {}", a.fmt(), b.fmt()),
+            AsmInst.Jmp(l) => format!("    jmp {l}"),
+            AsmInst.Je(l) => format!("    je {l}"),
+            AsmInst.Jne(l) => format!("    jne {l}"),
+            AsmInst.Jl(l) => format!("    jl {l}"),
+            AsmInst.Jle(l) => format!("    jle {l}"),
+            AsmInst.Jg(l) => format!("    jg {l}"),
+            AsmInst.Jge(l) => format!("    jge {l}"),
+            AsmInst.Call(l) => format!("    call {l}"),
+            AsmInst.Ret => "    ret".to_string(),
+            AsmInst.Push(s) => format!("    push {}", s.fmt()),
+            AsmInst.Pop(d) => format!("    pop {}", d.fmt()),
+            AsmInst.Cqo => "    cqo".to_string(),
+            AsmInst.Syscall => "    syscall".to_string(),
+            AsmInst.Comment(c) => format!("    ; {c}"),
+            AsmInst.Directive(d) => d.clone(),
+        }
+    }
+}
+
+// ── Code Generator ───────────────────────────────────────────────────────────
+struct CodeGen {
+    instructions: [AsmInst],
+    data_section: [string],
+    bss_section: [string],
+    label_counter: u32,
+    stack_offset: i32,
+    var_offsets: HashMap<string, i32>,
+    string_literals: HashMap<string, string>,
+}
+
+impl CodeGen {
+    fn new() -> CodeGen {
+        CodeGen {
+            instructions: [],
+            data_section: [],
+            bss_section: [],
+            label_counter: 0,
+            stack_offset: 0,
+            var_offsets: HashMap.new(),
+            string_literals: HashMap.new(),
+        }
+    }
+
+    fn new_label(mut self, prefix: &str) -> string {
+        let label = format!(".L{prefix}{}", self.label_counter)
+        self.label_counter += 1
+        label
+    }
+
+    fn emit(mut self, inst: AsmInst) { self.instructions.push(inst) }
+
+    fn emit_prologue(mut self, name: &str, local_bytes: i32) {
+        self.emit(AsmInst.Directive(format!(".globl {name}")))
+        self.emit(AsmInst.Directive(format!(".type {name}, @function")))
+        self.emit(AsmInst.Label(name.to_string()))
+        self.emit(AsmInst.Push(Operand.Reg(Reg64.Rbp)))
+        self.emit(AsmInst.Mov(Operand.Reg(Reg64.Rbp), Operand.Reg(Reg64.Rsp)))
+        if local_bytes > 0 {
+            let aligned = (local_bytes + 15) & !15  // 16-byte align
+            self.emit(AsmInst.Sub(Operand.Reg(Reg64.Rsp), Operand.Imm(aligned as i64)))
+            self.stack_offset = aligned
+        }
+    }
+
+    fn emit_epilogue(mut self) {
+        self.emit(AsmInst.Mov(Operand.Reg(Reg64.Rsp), Operand.Reg(Reg64.Rbp)))
+        self.emit(AsmInst.Pop(Operand.Reg(Reg64.Rbp)))
+        self.emit(AsmInst.Ret)
+    }
+
+    fn alloc_local(mut self, name: &str, size: i32) -> i32 {
+        self.stack_offset += size
+        let offset = -self.stack_offset
+        self.var_offsets.insert(name.to_string(), offset)
+        offset
+    }
+
+    fn add_string_literal(mut self, value: &str) -> string {
+        if let some(label) = self.string_literals.get(value) {
+            return label.clone()
+        }
+        let label = self.new_label("str")
+        self.data_section.push(format!("{label}:"))
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"")
+        self.data_section.push(format!("    .asciz \"{escaped}\""))
+        self.string_literals.insert(value.to_string(), label.clone())
+        label
+    }
+
+    fn emit_call(mut self, name: &str, arg_count: usize) {
+        // Ensure 16-byte stack alignment before call
+        let need_align = (self.stack_offset + 8) % 16 != 0
+        if need_align { self.emit(AsmInst.Sub(Operand.Reg(Reg64.Rsp), Operand.Imm(8))) }
+        self.emit(AsmInst.Call(name.to_string()))
+        if need_align { self.emit(AsmInst.Add(Operand.Reg(Reg64.Rsp), Operand.Imm(8))) }
+    }
+
+    fn emit_binop(mut self, op: &str, dest: Reg64, lhs: Reg64, rhs: Reg64) {
+        if dest != lhs { self.emit(AsmInst.Mov(Operand.Reg(dest), Operand.Reg(lhs))) }
+        match op {
+            "add" => self.emit(AsmInst.Add(Operand.Reg(dest), Operand.Reg(rhs))),
+            "sub" => self.emit(AsmInst.Sub(Operand.Reg(dest), Operand.Reg(rhs))),
+            "mul" => self.emit(AsmInst.Imul(Operand.Reg(dest), Operand.Reg(rhs))),
+            "div" => {
+                self.emit(AsmInst.Mov(Operand.Reg(Reg64.Rax), Operand.Reg(lhs)))
+                self.emit(AsmInst.Cqo)
+                self.emit(AsmInst.Idiv(Operand.Reg(rhs)))
+                if dest != Reg64.Rax {
+                    self.emit(AsmInst.Mov(Operand.Reg(dest), Operand.Reg(Reg64.Rax)))
+                }
+            }
+            "and" => self.emit(AsmInst.And(Operand.Reg(dest), Operand.Reg(rhs))),
+            "or" => self.emit(AsmInst.Or(Operand.Reg(dest), Operand.Reg(rhs))),
+            "xor" => self.emit(AsmInst.Xor(Operand.Reg(dest), Operand.Reg(rhs))),
+            "shl" => {
+                self.emit(AsmInst.Mov(Operand.Reg(Reg64.Rcx), Operand.Reg(rhs)))
+                self.emit(AsmInst.Shl(Operand.Reg(dest), Operand.Reg(Reg64.Rcx)))
+            }
+            "shr" => {
+                self.emit(AsmInst.Mov(Operand.Reg(Reg64.Rcx), Operand.Reg(rhs)))
+                self.emit(AsmInst.Shr(Operand.Reg(dest), Operand.Reg(Reg64.Rcx)))
+            }
+            _ => self.emit(AsmInst.Comment(format!("unknown binop: {op}"))),
+        }
+    }
+
+    fn emit_comparison(mut self, cmp_op: &str, dest: Reg64, lhs: Reg64, rhs: Reg64) {
+        self.emit(AsmInst.Cmp(Operand.Reg(lhs), Operand.Reg(rhs)))
+        self.emit(AsmInst.Mov(Operand.Reg(dest), Operand.Imm(0)))
+        let true_label = self.new_label("cmp_true")
+        let end_label = self.new_label("cmp_end")
+        match cmp_op {
+            "eq" => self.emit(AsmInst.Je(true_label.clone())),
+            "ne" => self.emit(AsmInst.Jne(true_label.clone())),
+            "lt" => self.emit(AsmInst.Jl(true_label.clone())),
+            "le" => self.emit(AsmInst.Jle(true_label.clone())),
+            "gt" => self.emit(AsmInst.Jg(true_label.clone())),
+            "ge" => self.emit(AsmInst.Jge(true_label.clone())),
+            _ => {}
+        }
+        self.emit(AsmInst.Jmp(end_label.clone()))
+        self.emit(AsmInst.Label(true_label))
+        self.emit(AsmInst.Mov(Operand.Reg(dest), Operand.Imm(1)))
+        self.emit(AsmInst.Label(end_label))
+    }
+
+    fn render(self) -> string {
+        let mut output = string.new()
+
+        // Data section
+        if !self.data_section.is_empty() {
+            output.push_str(".section .data\n")
+            for line in &self.data_section { output.push_str(&format!("{line}\n")) }
+            output.push('\n')
+        }
+
+        // BSS section
+        if !self.bss_section.is_empty() {
+            output.push_str(".section .bss\n")
+            for line in &self.bss_section { output.push_str(&format!("{line}\n")) }
+            output.push('\n')
+        }
+
+        // Text section
+        output.push_str(".section .text\n")
+        for inst in &self.instructions { output.push_str(&format!("{}\n", inst.fmt())) }
+        output
+    }
+}
+
+fn main() {
+    let mut gen = CodeGen.new()
+
+    // Generate a simple "add two numbers" function
+    gen.emit_prologue("add_numbers", 16)
+    let offset_a = gen.alloc_local("a", 8)
+    let offset_b = gen.alloc_local("b", 8)
+
+    // Store args from registers to stack
+    gen.emit(AsmInst.Mov(Operand.Mem(Reg64.Rbp, offset_a), Operand.Reg(Reg64.Rdi)))
+    gen.emit(AsmInst.Mov(Operand.Mem(Reg64.Rbp, offset_b), Operand.Reg(Reg64.Rsi)))
+
+    // Load, add, return
+    gen.emit(AsmInst.Mov(Operand.Reg(Reg64.Rax), Operand.Mem(Reg64.Rbp, offset_a)))
+    gen.emit(AsmInst.Add(Operand.Reg(Reg64.Rax), Operand.Mem(Reg64.Rbp, offset_b)))
+    gen.emit_epilogue()
+
+    let output = gen.render()
+    assert(output.contains(".globl add_numbers"))
+    assert(output.contains("add_numbers:"))
+    assert(output.contains("push rbp"))
+    assert(output.contains("mov rbp, rsp"))
+    assert(output.contains("add rax"))
+    assert(output.contains("ret"))
+    print("Function codegen ✓")
+
+    // String literal
+    let mut gen2 = CodeGen.new()
+    let label = gen2.add_string_literal("Hello, World!")
+    assert(label.starts_with(".Lstr"))
+    let output = gen2.render()
+    assert(output.contains(".section .data"))
+    assert(output.contains("Hello, World!"))
+    print("String literal ✓")
+
+    // Binop emission
+    let mut gen3 = CodeGen.new()
+    gen3.emit_binop("add", Reg64.Rax, Reg64.Rbx, Reg64.Rcx)
+    assert(gen3.instructions.len() == 2)  // mov + add
+    print("Binop emission ✓")
+
+    // Comparison emission
+    let mut gen4 = CodeGen.new()
+    gen4.emit_comparison("eq", Reg64.Rax, Reg64.Rbx, Reg64.Rcx)
+    let output = gen4.instructions.iter().map(|i| i.fmt()).collect::<[string]>().join("\n")
+    assert(output.contains("cmp"))
+    assert(output.contains("je"))
+    print("Comparison codegen ✓")
+
+    // Label generation
+    let mut gen5 = CodeGen.new()
+    let l1 = gen5.new_label("test")
+    let l2 = gen5.new_label("test")
+    assert(l1 != l2)
+    assert(l1 == ".Ltest0")
+    assert(l2 == ".Ltest1")
+    print("Label generation ✓")
+
+    // Operand formatting
+    assert(Operand.Reg(Reg64.Rax).fmt() == "rax")
+    assert(Operand.Imm(42).fmt() == "42")
+    assert(Operand.Mem(Reg64.Rbp, -8).fmt() == "[rbp + -8]")
+    print("Operand formatting ✓")
+
+    // Full program: exit(0) via syscall
+    let mut gen6 = CodeGen.new()
+    gen6.emit(AsmInst.Directive(".globl _start".to_string()))
+    gen6.emit(AsmInst.Label("_start".to_string()))
+    gen6.emit(AsmInst.Mov(Operand.Reg(Reg64.Rax), Operand.Imm(60)))  // sys_exit
+    gen6.emit(AsmInst.Xor(Operand.Reg(Reg64.Rdi), Operand.Reg(Reg64.Rdi)))  // status 0
+    gen6.emit(AsmInst.Syscall)
+    let output = gen6.render()
+    assert(output.contains("_start:"))
+    assert(output.contains("mov rax, 60"))
+    assert(output.contains("syscall"))
+    print("Syscall program ✓")
+
+    print("Code Generation complete ✓")
+}
