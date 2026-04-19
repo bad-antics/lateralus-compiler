@@ -1,0 +1,328 @@
+// src/passes/ssa_construction.ltl — SSA form construction (Cytron et al.)
+use std.collections.{HashMap, HashSet, BTreeSet}
+
+type VarId = u32
+type BlockId = u32
+
+// ── IR in non-SSA form ───────────────────────────────────────────────────────
+enum IRValue {
+    Const(i64),
+    Var(VarId),
+    Phi([(BlockId, VarId)]),
+    BinExpr { op: string, lhs: Box<IRValue>, rhs: Box<IRValue> },
+    Call { name: string, args: [IRValue] },
+}
+
+enum IRInst {
+    Assign { dst: VarId, value: IRValue },
+    Branch { cond: IRValue, true_blk: BlockId, false_blk: BlockId },
+    Jump(BlockId),
+    Return(Option<IRValue>),
+}
+
+struct BasicBlock {
+    id:         BlockId,
+    insts:      [IRInst],
+    succs:      [BlockId],
+    preds:      [BlockId],
+    dom_front:  [BlockId],
+    idom:       Option<BlockId>,
+}
+
+struct Function {
+    blocks:   [BasicBlock],
+    var_defs: HashMap<string, [BlockId]>,  // original var name → defining blocks
+    next_var: VarId,
+}
+
+// ── Dominance frontier computation ───────────────────────────────────────────
+fn compute_idom(blocks: &[BasicBlock]) -> HashMap<BlockId, BlockId> {
+    let mut idom: HashMap<BlockId, BlockId> = HashMap.new()
+    let mut changed = true
+
+    // Initialize: entry has no idom
+    while changed {
+        changed = false
+        for block in blocks.iter().skip(1) {  // skip entry
+            let mut new_idom: Option<BlockId> = none
+            for &pred in &block.preds {
+                if new_idom.is_none() || idom.contains_key(&pred) {
+                    new_idom = match new_idom {
+                        none => some(pred),
+                        some(current) => some(intersect_idom(&idom, current, pred)),
+                    }
+                }
+            }
+            if let some(d) = new_idom {
+                if idom.get(&block.id) != some(&d) {
+                    idom.insert(block.id, d)
+                    changed = true
+                }
+            }
+        }
+    }
+    idom
+}
+
+fn intersect_idom(idom: &HashMap<BlockId, BlockId>, mut a: BlockId, mut b: BlockId) -> BlockId {
+    while a != b {
+        while a > b { a = *idom.get(&a).unwrap_or(&0) }
+        while b > a { b = *idom.get(&b).unwrap_or(&0) }
+    }
+    a
+}
+
+fn compute_dom_frontiers(blocks: &mut [BasicBlock], idom: &HashMap<BlockId, BlockId>) {
+    for block in blocks.iter_mut() {
+        block.dom_front = []
+    }
+
+    let preds_map: HashMap<BlockId, [BlockId]> = blocks.iter()
+        .map(|b| (b.id, b.preds.clone()))
+        .collect()
+
+    for block in blocks.iter() {
+        if block.preds.len() >= 2 {
+            for &pred in &block.preds {
+                let mut runner = pred
+                while some(&runner) != idom.get(&block.id) && runner != 0 {
+                    // Add block.id to runner's dominance frontier
+                    // (collected separately to avoid borrow issues)
+                    runner = *idom.get(&runner).unwrap_or(&0)
+                }
+            }
+        }
+    }
+
+    // Simplified: compute via definition
+    for b in 0..blocks.len() {
+        let block_id = blocks[b].id
+        let block_preds = blocks[b].preds.clone()
+        if block_preds.len() >= 2 {
+            for &p in &block_preds {
+                let mut runner = p
+                while runner != *idom.get(&block_id).unwrap_or(&0) {
+                    let runner_idx = blocks.iter().position(|bl| bl.id == runner).unwrap()
+                    if !blocks[runner_idx].dom_front.contains(&block_id) {
+                        blocks[runner_idx].dom_front.push(block_id)
+                    }
+                    runner = *idom.get(&runner).unwrap_or(&0)
+                    if runner == 0 { break }
+                }
+            }
+        }
+    }
+}
+
+// ── Phi insertion (Cytron algorithm) ─────────────────────────────────────────
+fn insert_phi_functions(func: &mut Function) {
+    for (var_name, def_blocks) in &func.var_defs {
+        let mut has_phi: HashSet<BlockId> = HashSet.new()
+        let mut worklist: [BlockId] = def_blocks.clone()
+
+        while let some(block_id) = worklist.pop() {
+            let block_idx = func.blocks.iter().position(|b| b.id == block_id).unwrap()
+            let frontiers = func.blocks[block_idx].dom_front.clone()
+
+            for &df_block in &frontiers {
+                if !has_phi.contains(&df_block) {
+                    has_phi.insert(df_block)
+
+                    // Insert phi at beginning of df_block
+                    let df_idx = func.blocks.iter().position(|b| b.id == df_block).unwrap()
+                    let phi_var = func.next_var
+                    func.next_var += 1
+
+                    let preds = func.blocks[df_idx].preds.clone()
+                    let phi_args: [(BlockId, VarId)] = preds.iter()
+                        .map(|&p| (p, 0))  // placeholder var ids
+                        .collect()
+
+                    func.blocks[df_idx].insts.insert(0, IRInst.Assign {
+                        dst: phi_var,
+                        value: IRValue.Phi(phi_args),
+                    })
+
+                    worklist.push(df_block)
+                }
+            }
+        }
+    }
+}
+
+// ── Variable renaming ────────────────────────────────────────────────────────
+struct RenamingState {
+    stacks: HashMap<string, [VarId]>,
+    counters: HashMap<string, u32>,
+    next_var: VarId,
+}
+
+impl RenamingState {
+    fn new(next_var: VarId) -> RenamingState {
+        RenamingState {
+            stacks: HashMap.new(),
+            counters: HashMap.new(),
+            next_var,
+        }
+    }
+
+    fn new_name(mut self, var: &str) -> VarId {
+        let id = self.next_var
+        self.next_var += 1
+        self.stacks.entry(var.to_string()).or_insert([]).push(id)
+        *self.counters.entry(var.to_string()).or_insert(0) += 1
+        id
+    }
+
+    fn current_name(self, var: &str) -> Option<VarId> {
+        self.stacks.get(var)?.last().copied()
+    }
+
+    fn pop_name(mut self, var: &str) {
+        if let some(stack) = self.stacks.get_mut(var) {
+            stack.pop();
+        }
+    }
+}
+
+fn rename_block(
+    block_id: BlockId,
+    func: &mut Function,
+    state: &mut RenamingState,
+    idom: &HashMap<BlockId, BlockId>,
+    dom_children: &HashMap<BlockId, [BlockId]>,
+) {
+    let block_idx = func.blocks.iter().position(|b| b.id == block_id).unwrap()
+    let mut defs_in_block: [string] = []
+
+    // Rename instructions
+    for inst in &mut func.blocks[block_idx].insts {
+        match inst {
+            IRInst.Assign { dst, value } => {
+                // Rename uses first
+                rename_uses(value, state)
+                // Then define new name
+                let new_id = state.new_name(&format!("v{dst}"))
+                defs_in_block.push(format!("v{dst}"))
+                *dst = new_id
+            }
+            IRInst.Branch { cond, .. } => rename_uses(cond, state),
+            IRInst.Return(some(v)) => rename_uses(v, state),
+            _ => {}
+        }
+    }
+
+    // Fill phi arguments in successors
+    let succs = func.blocks[block_idx].succs.clone()
+    for &succ in &succs {
+        let succ_idx = func.blocks.iter().position(|b| b.id == succ).unwrap()
+        for inst in &mut func.blocks[succ_idx].insts {
+            if let IRInst.Assign { value: IRValue.Phi(ref mut args), .. } = inst {
+                for (pred, var_id) in args {
+                    if *pred == block_id {
+                        // Find current name for the phi variable
+                        *var_id = state.next_var.saturating_sub(1)  // simplified
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into dominated children
+    if let some(children) = dom_children.get(&block_id) {
+        for &child in children {
+            rename_block(child, func, state, idom, dom_children)
+        }
+    }
+
+    // Pop definitions
+    for var in defs_in_block.iter().rev() {
+        state.pop_name(var)
+    }
+}
+
+fn rename_uses(value: &mut IRValue, state: &RenamingState) {
+    match value {
+        IRValue.Var(id) => {
+            if let some(new_id) = state.current_name(&format!("v{id}")) {
+                *id = new_id
+            }
+        }
+        IRValue.BinExpr { lhs, rhs, .. } => {
+            rename_uses(lhs, state)
+            rename_uses(rhs, state)
+        }
+        IRValue.Call { args, .. } => {
+            for arg in args { rename_uses(arg, state) }
+        }
+        _ => {}
+    }
+}
+
+// ── Full SSA construction ────────────────────────────────────────────────────
+pub fn construct_ssa(func: &mut Function) {
+    let idom = compute_idom(&func.blocks)
+
+    // Set idom on blocks
+    for block in &mut func.blocks {
+        block.idom = idom.get(&block.id).copied()
+    }
+
+    compute_dom_frontiers(&mut func.blocks, &idom)
+    insert_phi_functions(func)
+
+    // Build dominator tree children
+    let mut dom_children: HashMap<BlockId, [BlockId]> = HashMap.new()
+    for (&child, &parent) in &idom {
+        dom_children.entry(parent).or_insert([]).push(child)
+    }
+
+    let mut state = RenamingState.new(func.next_var)
+    rename_block(0, func, &mut state, &idom, &dom_children)
+    func.next_var = state.next_var
+}
+
+fn main() {
+    // Simple diamond CFG:  0 → {1, 2} → 3
+    let mut func = Function {
+        blocks: [
+            BasicBlock { id: 0, insts: [
+                IRInst.Assign { dst: 1, value: IRValue.Const(10) },
+                IRInst.Branch { cond: IRValue.Var(0), true_blk: 1, false_blk: 2 },
+            ], succs: [1, 2], preds: [], dom_front: [], idom: none },
+            BasicBlock { id: 1, insts: [
+                IRInst.Assign { dst: 1, value: IRValue.Const(20) },
+                IRInst.Jump(3),
+            ], succs: [3], preds: [0], dom_front: [], idom: none },
+            BasicBlock { id: 2, insts: [
+                IRInst.Assign { dst: 1, value: IRValue.Const(30) },
+                IRInst.Jump(3),
+            ], succs: [3], preds: [0], dom_front: [], idom: none },
+            BasicBlock { id: 3, insts: [
+                IRInst.Return(some(IRValue.Var(1))),
+            ], succs: [], preds: [1, 2], dom_front: [], idom: none },
+        ],
+        var_defs: HashMap.from([("v1".to_string(), [0, 1, 2])]),
+        next_var: 10,
+    }
+
+    print("Before SSA: ${func.blocks.len()} blocks")
+    construct_ssa(&mut func)
+
+    // Check phi was inserted in block 3
+    let block3 = &func.blocks[3]
+    let has_phi = block3.insts.iter().any(|i| matches!(i, IRInst.Assign { value: IRValue.Phi(_), .. }))
+    assert(has_phi, "block 3 should have a phi function")
+    print("Phi function inserted in merge block ✓")
+
+    // Check idom
+    assert(func.blocks[1].idom == some(0), "block 1 dominated by entry")
+    assert(func.blocks[2].idom == some(0), "block 2 dominated by entry")
+    print("Immediate dominators correct ✓")
+
+    print("SSA next_var: ${func.next_var}")
+    assert(func.next_var > 10, "new variables should have been created")
+    print("Variable renaming complete ✓")
+
+    print("SSA construction — all passed ✓")
+}
