@@ -9,31 +9,27 @@
 
 ```
 Source Code (.ltl)
-       │
-       ▼
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│    Lexer     │────▶│    Parser    │────▶│     AST      │
-│  tokenizer   │     │  recursive   │     │  typed nodes  │
-│  keywords    │     │  pratt       │     │  expressions  │
-│  strings     │     │  earley      │     │  statements   │
-│  numbers     │     │  lr/ll(1)    │     │              │
-└─────────────┘     └──────────────┘     └──────┬───────┘
-                                                │
-                    ┌──────────────┐     ┌──────▼───────┐
-                    │  Optimizer   │◀────│   IR Builder  │
-                    │  const fold  │     │  SSA form     │
-                    │  dead code   │     │  basic blocks │
-                    │  inlining    │     │  phi nodes    │
-                    │  peephole    │     │              │
-                    └──────┬───────┘     └──────────────┘
-                           │
-                    ┌──────▼───────┐     ┌──────────────┐
-                    │   Codegen    │────▶│   Runtime     │
-                    │  reg alloc   │     │  bytecode VM  │
-                    │  instr sel   │     │  stack machine│
-                    │  ELF writer  │     │  GC           │
-                    │  stack frame │     │  REPL         │
-                    └──────────────┘     └──────────────┘
+        |
+        v
+  [ Lexer ] --------> [ Parser ] --------> [ AST ]
+    tokenizer            recursive            typed nodes
+    keywords             pratt                expressions
+    strings              earley               statements
+    numbers              lr/ll(1)
+                                                |
+                                                v
+                   [ Optimizer ] <-------- [ IR Builder ]
+                     const fold              SSA form
+                     dead code               basic blocks
+                     inlining                phi nodes
+                     peephole
+                         |
+                         v
+                    [ Codegen ] --------> [ Runtime ]
+                      reg alloc            bytecode VM
+                      instr sel            stack machine
+                      ELF writer           GC
+                      stack frame          REPL
 ```
 
 ## Module Map
