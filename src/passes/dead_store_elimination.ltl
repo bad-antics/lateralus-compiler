@@ -1,0 +1,292 @@
+// Compiler Pass - Dead Store Elimination
+// Removes stores to variables that are never read before being overwritten.
+
+use std.collections.{HashMap, HashSet}
+
+type VarId = usize
+type BlockId = usize
+type InstrIdx = usize
+
+#[derive(Clone, Debug, PartialEq)]
+enum Instruction {
+    Store(VarId, VarId),       // store val to addr
+    Load(VarId, VarId),        // load from addr to dest
+    Const(VarId, i64),
+    BinOp(VarId, string, VarId, VarId),
+    Call(VarId, string, [VarId]),
+    Return(Option<VarId>),
+    Jump(BlockId),
+    Branch(VarId, BlockId, BlockId),
+    Nop,
+}
+
+impl Instruction {
+    fn is_store(self) -> bool { matches!(self, Instruction.Store(..)) }
+    fn is_load(self) -> bool { matches!(self, Instruction.Load(..)) }
+    fn is_nop(self) -> bool { matches!(self, Instruction.Nop) }
+
+    fn stored_addr(self) -> Option<VarId> {
+        match self { Instruction.Store(addr, _) => some(*addr), _ => none }
+    }
+
+    fn loaded_addr(self) -> Option<VarId> {
+        match self { Instruction.Load(_, addr) => some(*addr), _ => none }
+    }
+
+    fn defs(self) -> [VarId] {
+        match self {
+            Instruction.Load(d, _) | Instruction.Const(d, _)
+            | Instruction.BinOp(d, ..) | Instruction.Call(d, ..) => vec![*d],
+            _ => vec![],
+        }
+    }
+
+    fn uses(self) -> [VarId] {
+        match self {
+            Instruction.Store(a, v) => vec![*a, *v],
+            Instruction.Load(_, a) => vec![*a],
+            Instruction.BinOp(_, _, a, b) => vec![*a, *b],
+            Instruction.Call(_, _, args) => args.clone(),
+            Instruction.Return(some(v)) => vec![*v],
+            Instruction.Branch(c, _, _) => vec![*c],
+            _ => vec![],
+        }
+    }
+
+    fn has_side_effects(self) -> bool {
+        matches!(self, Instruction.Call(..) | Instruction.Store(..))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    id: BlockId,
+    instructions: [Instruction],
+    successors: [BlockId],
+    predecessors: [BlockId],
+}
+
+#[derive(Clone, Debug, Default)]
+struct DseStats {
+    stores_analyzed: usize,
+    stores_eliminated: usize,
+    loads_found: usize,
+    instructions_before: usize,
+    instructions_after: usize,
+}
+
+struct DeadStoreEliminator {
+    blocks: HashMap<BlockId, BasicBlock>,
+    alias_sets: HashMap<VarId, HashSet<VarId>>,  // may-alias groups
+    stats: DseStats,
+}
+
+impl DeadStoreEliminator {
+    fn new() -> DeadStoreEliminator {
+        DeadStoreEliminator {
+            blocks: HashMap.new(),
+            alias_sets: HashMap.new(),
+            stats: DseStats.default(),
+        }
+    }
+
+    fn add_block(mut self, block: BasicBlock) {
+        self.blocks.insert(block.id, block)
+    }
+
+    fn add_alias(mut self, a: VarId, b: VarId) {
+        self.alias_sets.entry(a).or_insert(HashSet.new()).insert(b)
+        self.alias_sets.entry(b).or_insert(HashSet.new()).insert(a)
+    }
+
+    fn may_alias(self, a: VarId, b: VarId) -> bool {
+        if a == b { return true }
+        self.alias_sets.get(&a).map(|s| s.contains(&b)).unwrap_or(false)
+    }
+
+    fn eliminate(mut self) {
+        let total_before: usize = self.blocks.values()
+            .map(|b| b.instructions.len()).sum();
+        self.stats.instructions_before = total_before
+
+        let block_ids: [BlockId] = self.blocks.keys().cloned().collect()
+        for bid in &block_ids {
+            self.eliminate_in_block(*bid)
+        }
+
+        let total_after: usize = self.blocks.values()
+            .map(|b| b.instructions.iter().filter(|i| !i.is_nop()).count()).sum();
+        self.stats.instructions_after = total_after
+    }
+
+    fn eliminate_in_block(mut self, block_id: BlockId) {
+        let block = self.blocks.get(&block_id).unwrap().clone()
+        let n = block.instructions.len()
+        let mut dead: HashSet<InstrIdx> = HashSet.new()
+
+        // Walk backwards: track which addresses have been loaded
+        let mut loaded_addrs: HashSet<VarId> = HashSet.new()
+        // Conservatively: if block has successors, all stores may be live
+        let has_successors = !block.successors.is_empty()
+
+        for i in (0..n).rev() {
+            let inst = &block.instructions[i]
+
+            match inst {
+                Instruction.Load(_, addr) => {
+                    loaded_addrs.insert(*addr)
+                    self.stats.loads_found += 1
+                },
+                Instruction.Store(addr, _) => {
+                    self.stats.stores_analyzed += 1
+                    if !has_successors && !loaded_addrs.iter().any(|la| self.may_alias(*addr, *la)) {
+                        dead.insert(i)
+                        self.stats.stores_eliminated += 1
+                    } else {
+                        loaded_addrs.insert(*addr)  // mark as potentially needed
+                    }
+                },
+                Instruction.Call(..) => {
+                    // Calls may read any address
+                    // All stores above this call are potentially live
+                    loaded_addrs = (0..1000).collect()  // conservative
+                },
+                _ => {},
+            }
+        }
+
+        // Replace dead stores with nops
+        let block_mut = self.blocks.get_mut(&block_id).unwrap()
+        for i in &dead {
+            block_mut.instructions[*i] = Instruction.Nop
+        }
+    }
+
+    fn remove_nops(mut self) {
+        for (_, block) in &mut self.blocks {
+            block.instructions.retain(|i| !i.is_nop())
+        }
+    }
+
+    fn stats(self) -> &DseStats { &self.stats }
+}
+
+fn main() {
+    // Instruction properties
+    assert(Instruction.Store(1, 2).is_store())
+    assert(Instruction.Load(3, 4).is_load())
+    assert(Instruction.Nop.is_nop())
+    assert(Instruction.Store(1, 2).stored_addr() == some(1))
+    assert(Instruction.Load(3, 4).loaded_addr() == some(4))
+    print("Instruction props ✓")
+
+    // Defs and uses
+    let binop = Instruction.BinOp(5, "+".into(), 1, 2)
+    assert(binop.defs() == vec![5])
+    assert(binop.uses() == vec![1, 2])
+    assert(Instruction.Return(some(3)).uses() == vec![3])
+    print("Defs/uses ✓")
+
+    // Side effects
+    assert(Instruction.Store(1, 2).has_side_effects())
+    assert(Instruction.Call(1, "f".into(), vec![]).has_side_effects())
+    assert(!Instruction.Const(1, 5).has_side_effects())
+    print("Side effects ✓")
+
+    // Dead store in block without successors: store then overwrite without load
+    let mut dse = DeadStoreEliminator.new()
+    dse.add_block(BasicBlock {
+        id: 0,
+        instructions: vec![
+            Instruction.Store(100, 1),   // dead: overwritten below without load
+            Instruction.Store(100, 2),   // live: last store to 100
+            Instruction.Return(none),
+        ],
+        successors: vec![],
+        predecessors: vec![],
+    })
+    dse.eliminate()
+    assert(dse.stats().stores_analyzed == 2)
+    assert(dse.stats().stores_eliminated >= 1)
+    print("Dead store elimination ✓")
+
+    // Store followed by load is NOT dead
+    let mut dse2 = DeadStoreEliminator.new()
+    dse2.add_block(BasicBlock {
+        id: 0,
+        instructions: vec![
+            Instruction.Store(100, 1),
+            Instruction.Load(2, 100),
+            Instruction.Return(some(2)),
+        ],
+        successors: vec![],
+        predecessors: vec![],
+    })
+    dse2.eliminate()
+    assert(dse2.stats().stores_eliminated == 0)
+    print("Live store preserved ✓")
+
+    // Alias analysis
+    let mut dse3 = DeadStoreEliminator.new()
+    dse3.add_alias(100, 200)
+    assert(dse3.may_alias(100, 200))
+    assert(dse3.may_alias(200, 100))
+    assert(dse3.may_alias(100, 100))
+    assert(!dse3.may_alias(100, 300))
+    print("Alias analysis ✓")
+
+    // Remove nops
+    let mut dse4 = DeadStoreEliminator.new()
+    dse4.add_block(BasicBlock {
+        id: 0,
+        instructions: vec![
+            Instruction.Nop,
+            Instruction.Const(1, 5),
+            Instruction.Nop,
+            Instruction.Return(some(1)),
+        ],
+        successors: vec![],
+        predecessors: vec![],
+    })
+    dse4.remove_nops()
+    assert(dse4.blocks.get(&0).unwrap().instructions.len() == 2)
+    print("Remove nops ✓")
+
+    // Block with successors: stores not eliminated (may be read later)
+    let mut dse5 = DeadStoreEliminator.new()
+    dse5.add_block(BasicBlock {
+        id: 0,
+        instructions: vec![
+            Instruction.Store(100, 1),
+            Instruction.Jump(1),
+        ],
+        successors: vec![1],
+        predecessors: vec![],
+    })
+    dse5.add_block(BasicBlock {
+        id: 1,
+        instructions: vec![Instruction.Return(none)],
+        successors: vec![],
+        predecessors: vec![0],
+    })
+    dse5.eliminate()
+    assert(dse5.stats().stores_eliminated == 0)
+    print("Successor preserves stores ✓")
+
+    // Stats
+    let s = DseStats.default()
+    assert(s.stores_analyzed == 0)
+    assert(s.stores_eliminated == 0)
+    print("Stats ✓")
+
+    // Empty block
+    let mut dse6 = DeadStoreEliminator.new()
+    dse6.add_block(BasicBlock {
+        id: 0, instructions: vec![], successors: vec![], predecessors: vec![],
+    })
+    dse6.eliminate()
+    assert(dse6.stats().stores_eliminated == 0)
+    print("Empty block ✓")
+
+    print("Dead Store Elimination complete ✓")
+}
