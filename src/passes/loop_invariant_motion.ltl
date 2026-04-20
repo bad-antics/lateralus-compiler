@@ -1,0 +1,277 @@
+// Compiler Pass - Loop Invariant Code Motion (LICM)
+// Hoists loop-invariant computations out of loops.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Debug)]
+enum Instruction {
+    Assign(string, Expr),
+    Load(string, string),         // dest, addr
+    Store(string, string),        // value, addr
+    Call(string, string, [string]), // dest, func, args
+    Branch(string, usize, usize),
+    Jump(usize),
+    Return(string),
+    Phi(string, [(usize, string)]),
+}
+
+#[derive(Clone, Debug)]
+enum Expr {
+    Var(string),
+    Lit(i64),
+    BinOp(string, string, string),  // op, lhs, rhs
+    UnaryOp(string, string),
+    Pure(string, [string]),          // pure function call
+}
+
+struct BasicBlock {
+    id: usize,
+    instructions: [Instruction],
+    predecessors: [usize],
+    successors: [usize],
+}
+
+struct Loop {
+    header: usize,
+    blocks: HashSet<usize>,
+    exits: [usize],
+    preheader: Option<usize>,
+    back_edges: [(usize, usize)],
+    depth: usize,
+}
+
+impl Loop {
+    fn contains_block(self, block_id: usize) -> bool {
+        self.blocks.contains(&block_id)
+    }
+
+    fn block_count(self) -> usize { self.blocks.len() }
+}
+
+struct LoopAnalysis {
+    loops: [Loop],
+}
+
+impl LoopAnalysis {
+    fn new() -> LoopAnalysis { LoopAnalysis { loops: [] } }
+
+    fn add_loop(mut self, lp: Loop) { self.loops.push(lp) }
+
+    fn loop_count(self) -> usize { self.loops.len() }
+
+    fn innermost_loop(self, block_id: usize) -> Option<&Loop> {
+        self.loops.iter()
+            .filter(|l| l.contains_block(block_id))
+            .max_by_key(|l| l.depth)
+    }
+}
+
+struct LICMPass {
+    hoisted: [HoistedInst],
+    analysis: LoopAnalysis,
+    loop_defs: HashMap<string, usize>,  // var -> defining block
+    invariants: HashSet<string>,
+}
+
+struct HoistedInst {
+    instruction: Instruction,
+    from_block: usize,
+    to_block: usize,  // preheader
+    reason: string,
+}
+
+impl LICMPass {
+    fn new(analysis: LoopAnalysis) -> LICMPass {
+        LICMPass {
+            hoisted: [], analysis,
+            loop_defs: HashMap.new(),
+            invariants: HashSet.new(),
+        }
+    }
+
+    fn is_invariant(self, expr: &Expr, loop_info: &Loop) -> bool {
+        match expr {
+            Expr.Lit(_) => true,
+            Expr.Var(name) => {
+                // Invariant if defined outside the loop
+                match self.loop_defs.get(name) {
+                    some(&block_id) => !loop_info.contains_block(block_id),
+                    none => true,  // undefined = external
+                }
+                || self.invariants.contains(name)
+            },
+            Expr.BinOp(_, lhs, rhs) => {
+                self.is_var_invariant(lhs, loop_info) && self.is_var_invariant(rhs, loop_info)
+            },
+            Expr.UnaryOp(_, operand) => self.is_var_invariant(operand, loop_info),
+            Expr.Pure(_, args) => {
+                args.iter().all(|a| self.is_var_invariant(a, loop_info))
+            },
+        }
+    }
+
+    fn is_var_invariant(self, var: &str, loop_info: &Loop) -> bool {
+        if self.invariants.contains(var) { return true }
+        match self.loop_defs.get(var) {
+            some(&block_id) => !loop_info.contains_block(block_id),
+            none => true,
+        }
+    }
+
+    fn analyze_definitions(mut self, blocks: &[BasicBlock]) {
+        for block in blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction.Assign(dest, _) => { self.loop_defs.insert(dest.clone(), block.id); },
+                    Instruction.Load(dest, _) => { self.loop_defs.insert(dest.clone(), block.id); },
+                    Instruction.Call(dest, _, _) => { self.loop_defs.insert(dest.clone(), block.id); },
+                    Instruction.Phi(dest, _) => { self.loop_defs.insert(dest.clone(), block.id); },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    fn find_invariants(mut self, blocks: &[BasicBlock], loop_info: &Loop) -> [usize] {
+        let mut hoistable: [usize] = []  // indices into hoisted
+        let mut changed = true
+
+        while changed {
+            changed = false
+            for &block_id in &loop_info.blocks {
+                let block = &blocks[block_id]
+                for (idx, inst) in block.instructions.iter().enumerate() {
+                    if let Instruction.Assign(dest, expr) = inst {
+                        if !self.invariants.contains(dest) && self.is_invariant(expr, loop_info) {
+                            self.invariants.insert(dest.clone())
+                            if let some(preheader) = loop_info.preheader {
+                                self.hoisted.push(HoistedInst {
+                                    instruction: inst.clone(),
+                                    from_block: block_id,
+                                    to_block: preheader,
+                                    reason: format!("invariant in loop at block {}", loop_info.header),
+                                })
+                            }
+                            changed = true
+                        }
+                    }
+                }
+            }
+        }
+
+        hoistable
+    }
+
+    fn run(mut self, blocks: &[BasicBlock]) {
+        self.analyze_definitions(blocks)
+        let loops_snapshot = self.analysis.loops.clone()
+        for loop_info in &loops_snapshot {
+            self.find_invariants(blocks, loop_info);
+        }
+    }
+
+    fn hoisted_count(self) -> usize { self.hoisted.len() }
+
+    fn stats(self) -> (usize, usize) {
+        (self.hoisted.len(), self.analysis.loop_count())
+    }
+}
+
+fn main() {
+    // Loop structure
+    let mut loop_blocks = HashSet.new()
+    loop_blocks.insert(1)
+    loop_blocks.insert(2)
+    loop_blocks.insert(3)
+
+    let test_loop = Loop {
+        header: 1,
+        blocks: loop_blocks.clone(),
+        exits: vec![4],
+        preheader: some(0),
+        back_edges: vec![(3, 1)],
+        depth: 1,
+    }
+
+    assert(test_loop.contains_block(1))
+    assert(test_loop.contains_block(2))
+    assert(!test_loop.contains_block(0))
+    assert(!test_loop.contains_block(4))
+    assert(test_loop.block_count() == 3)
+    print("Loop structure ✓")
+
+    // LoopAnalysis
+    let mut analysis = LoopAnalysis.new()
+    analysis.add_loop(test_loop)
+    assert(analysis.loop_count() == 1)
+    assert(analysis.innermost_loop(2).is_some())
+    assert(analysis.innermost_loop(99).is_none())
+    print("LoopAnalysis ✓")
+
+    // Build blocks:
+    // Block 0 (preheader): x = 10; y = 20
+    // Block 1 (header): z = x + y  (invariant!); branch(i < n, block2, block4)
+    // Block 2 (body): sum = sum + z; i = i + 1
+    // Block 3 (latch): jump block1
+    // Block 4 (exit): return sum
+    let blocks = vec![
+        BasicBlock {
+            id: 0, predecessors: [], successors: vec![1],
+            instructions: vec![
+                Instruction.Assign("x".to_string(), Expr.Lit(10)),
+                Instruction.Assign("y".to_string(), Expr.Lit(20)),
+            ],
+        },
+        BasicBlock {
+            id: 1, predecessors: vec![0, 3], successors: vec![2, 4],
+            instructions: vec![
+                Instruction.Assign("z".to_string(), Expr.BinOp("+".to_string(), "x".to_string(), "y".to_string())),
+                Instruction.Branch("cond".to_string(), 2, 4),
+            ],
+        },
+        BasicBlock {
+            id: 2, predecessors: vec![1], successors: vec![3],
+            instructions: vec![
+                Instruction.Assign("sum_new".to_string(), Expr.BinOp("+".to_string(), "sum".to_string(), "z".to_string())),
+                Instruction.Assign("i_new".to_string(), Expr.BinOp("+".to_string(), "i".to_string(), Expr.Lit(1).to_string())),
+            ],
+        },
+        BasicBlock {
+            id: 3, predecessors: vec![2], successors: vec![1],
+            instructions: vec![Instruction.Jump(1)],
+        },
+        BasicBlock {
+            id: 4, predecessors: vec![1], successors: [],
+            instructions: vec![Instruction.Return("sum".to_string())],
+        },
+    ]
+
+    let mut pass = LICMPass.new(analysis)
+    pass.run(&blocks)
+
+    // z = x + y should be hoisted (both x, y defined outside loop)
+    assert(pass.hoisted_count() >= 1)
+    let hoisted = &pass.hoisted[0]
+    assert(hoisted.to_block == 0)  // moved to preheader
+    match &hoisted.instruction {
+        Instruction.Assign(dest, _) => assert(dest == "z"),
+        _ => panic!("expected assignment"),
+    }
+    print("LICM hoist z = x + y ✓")
+
+    // Stats
+    let (hoisted_n, loops_n) = pass.stats()
+    assert(hoisted_n >= 1)
+    assert(loops_n == 1)
+    print("LICM stats ✓")
+
+    // is_invariant checks
+    assert(pass.is_invariant(&Expr.Lit(42), &pass.analysis.loops[0]))
+    print("Literal invariant ✓")
+
+    // HoistedInst
+    assert(pass.hoisted[0].reason.contains("invariant"))
+    print("Hoist reason ✓")
+
+    print("Loop Invariant Code Motion complete ✓")
+}
