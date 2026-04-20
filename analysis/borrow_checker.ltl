@@ -1,0 +1,259 @@
+
+// Borrow Checker - Enforces ownership and borrowing rules
+// Validates exclusive/shared references, ownership transfers, and scoped borrows.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Symbol(u32)
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Scope(u32)
+
+#[derive(Clone, Debug)]
+enum Ownership { Owned, Moved(Symbol), Dropped }
+
+#[derive(Clone, Debug)]
+enum BorrowKind { Shared, Exclusive }
+
+#[derive(Clone, Debug)]
+struct Borrow {
+    target: Symbol,
+    kind: BorrowKind,
+    scope: Scope,
+    borrower: Symbol,
+}
+
+#[derive(Clone, Debug)]
+enum BorrowError {
+    MovedValue { sym: Symbol, used_in: Scope },
+    DoubleMut { sym: Symbol, scope: Scope },
+    MutWhileShared { sym: Symbol, scope: Scope },
+    SharedWhileMut { sym: Symbol, scope: Scope },
+    DroppedWhileBorrowed { sym: Symbol, scope: Scope },
+    OutOfScope { sym: Symbol, borrow_scope: Scope, use_scope: Scope },
+}
+
+struct BorrowChecker {
+    ownership: HashMap<Symbol, Ownership>,
+    borrows: [Borrow],
+    errors: [BorrowError],
+    current_scope: Scope,
+    next_sym: u32,
+}
+
+impl BorrowChecker {
+    fn new() -> BorrowChecker {
+        BorrowChecker {
+            ownership: HashMap.new(), borrows: [], errors: [],
+            current_scope: Scope(0), next_sym: 0,
+        }
+    }
+
+    fn alloc(mut self) -> Symbol {
+        let s = Symbol(self.next_sym)
+        self.next_sym += 1
+        self.ownership.insert(s, Ownership.Owned)
+        s
+    }
+
+    fn enter_scope(mut self) {
+        self.current_scope = Scope(self.current_scope.0 + 1)
+    }
+
+    fn exit_scope(mut self) {
+        // End borrows in this scope
+        let scope = self.current_scope
+        for b in self.borrows.iter_mut() {
+            if b.scope == scope { /* mark ended */ }
+        }
+        self.borrows.retain(|b| b.scope != scope)
+        self.current_scope = Scope(self.current_scope.0 - 1)
+    }
+
+    fn move_to(mut self, from: Symbol, to: Symbol) {
+        match self.ownership.get(&from) {
+            Some(Ownership.Owned) => {
+                // Check not borrowed
+                if self.has_active_borrows(from) {
+                    self.errors.push(BorrowError.DroppedWhileBorrowed {
+                        sym: from, scope: self.current_scope,
+                    })
+                }
+                self.ownership.insert(from, Ownership.Moved(to))
+                self.ownership.insert(to, Ownership.Owned)
+            }
+            Some(Ownership.Moved(_)) => {
+                self.errors.push(BorrowError.MovedValue {
+                    sym: from, used_in: self.current_scope,
+                })
+            }
+            _ => {}
+        }
+    }
+
+    fn borrow_shared(mut self, borrower: Symbol, target: Symbol) {
+        if !self.check_alive(target) { return }
+        // No exclusive borrows allowed
+        if self.has_exclusive_borrow(target) {
+            self.errors.push(BorrowError.SharedWhileMut {
+                sym: target, scope: self.current_scope,
+            })
+        }
+        self.borrows.push(Borrow {
+            target, kind: BorrowKind.Shared,
+            scope: self.current_scope, borrower,
+        })
+    }
+
+    fn borrow_exclusive(mut self, borrower: Symbol, target: Symbol) {
+        if !self.check_alive(target) { return }
+        if self.has_active_borrows(target) {
+            if self.has_exclusive_borrow(target) {
+                self.errors.push(BorrowError.DoubleMut {
+                    sym: target, scope: self.current_scope,
+                })
+            } else {
+                self.errors.push(BorrowError.MutWhileShared {
+                    sym: target, scope: self.current_scope,
+                })
+            }
+        }
+        self.borrows.push(Borrow {
+            target, kind: BorrowKind.Exclusive,
+            scope: self.current_scope, borrower,
+        })
+    }
+
+    fn drop_sym(mut self, sym: Symbol) {
+        if self.has_active_borrows(sym) {
+            self.errors.push(BorrowError.DroppedWhileBorrowed {
+                sym, scope: self.current_scope,
+            })
+        }
+        self.ownership.insert(sym, Ownership.Dropped)
+    }
+
+    fn check_alive(mut self, sym: Symbol) -> bool {
+        match self.ownership.get(&sym) {
+            Some(Ownership.Owned) => true,
+            Some(Ownership.Moved(_)) => {
+                self.errors.push(BorrowError.MovedValue {
+                    sym, used_in: self.current_scope,
+                })
+                false
+            }
+            Some(Ownership.Dropped) => {
+                self.errors.push(BorrowError.MovedValue {
+                    sym, used_in: self.current_scope,
+                })
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn has_active_borrows(self, sym: Symbol) -> bool {
+        self.borrows.iter().any(|b| b.target == sym)
+    }
+
+    fn has_exclusive_borrow(self, sym: Symbol) -> bool {
+        self.borrows.iter().any(|b| b.target == sym && matches!(b.kind, BorrowKind.Exclusive))
+    }
+
+    fn active_borrow_count(self, sym: Symbol) -> usize {
+        self.borrows.iter().filter(|b| b.target == sym).count()
+    }
+
+    fn has_errors(self) -> bool { !self.errors.is_empty() }
+    fn error_count(self) -> usize { self.errors.len() }
+}
+
+fn main() {
+    let mut bc = BorrowChecker.new()
+
+    // Alloc
+    let a = bc.alloc()
+    assert(!bc.has_errors())
+    print("Alloc ✓")
+
+    // Shared borrows OK
+    let r1 = bc.alloc()
+    let r2 = bc.alloc()
+    bc.borrow_shared(r1, a)
+    bc.borrow_shared(r2, a)
+    assert(!bc.has_errors())
+    assert(bc.active_borrow_count(a) == 2)
+    print("Shared borrows ✓")
+
+    // Exclusive while shared = error
+    let mut bc2 = BorrowChecker.new()
+    let x = bc2.alloc()
+    let s = bc2.alloc()
+    let m = bc2.alloc()
+    bc2.borrow_shared(s, x)
+    bc2.borrow_exclusive(m, x)
+    assert(bc2.error_count() == 1)
+    print("Mut while shared ✓")
+
+    // Double exclusive = error
+    let mut bc3 = BorrowChecker.new()
+    let y = bc3.alloc()
+    let m1 = bc3.alloc()
+    let m2 = bc3.alloc()
+    bc3.borrow_exclusive(m1, y)
+    bc3.borrow_exclusive(m2, y)
+    assert(bc3.error_count() == 1)
+    print("Double mut ✓")
+
+    // Move
+    let mut bc4 = BorrowChecker.new()
+    let src = bc4.alloc()
+    let dst = bc4.alloc()
+    bc4.move_to(src, dst)
+    assert(!bc4.has_errors())
+    // Use after move
+    let tmp = bc4.alloc()
+    bc4.borrow_shared(tmp, src)
+    assert(bc4.error_count() == 1)
+    print("Move ✓")
+
+    // Drop while borrowed
+    let mut bc5 = BorrowChecker.new()
+    let v = bc5.alloc()
+    let b = bc5.alloc()
+    bc5.borrow_shared(b, v)
+    bc5.drop_sym(v)
+    assert(bc5.error_count() == 1)
+    print("Drop while borrowed ✓")
+
+    // Scope exit clears borrows
+    let mut bc6 = BorrowChecker.new()
+    let w = bc6.alloc()
+    bc6.enter_scope()
+    let ref_w = bc6.alloc()
+    bc6.borrow_shared(ref_w, w)
+    assert(bc6.active_borrow_count(w) == 1)
+    bc6.exit_scope()
+    assert(bc6.active_borrow_count(w) == 0)
+    assert(!bc6.has_errors())
+    print("Scope ✓")
+
+    // After scope exit, can take exclusive
+    let mut_ref = bc6.alloc()
+    bc6.borrow_exclusive(mut_ref, w)
+    assert(!bc6.has_errors())
+    print("Post-scope mut ✓")
+
+    // Shared while exclusive
+    let mut bc7 = BorrowChecker.new()
+    let p = bc7.alloc()
+    let em = bc7.alloc()
+    let es = bc7.alloc()
+    bc7.borrow_exclusive(em, p)
+    bc7.borrow_shared(es, p)
+    assert(bc7.error_count() == 1)
+    print("Shared while mut ✓")
+
+    print("Borrow checker complete ✓")
+}
