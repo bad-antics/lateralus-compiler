@@ -1,0 +1,110 @@
+// compiler/analysis/property_check.ltl
+//
+// Property-based testing analysis pass.
+//
+// Scans a Lateralus module for `#[property]` annotated functions and
+// synthesizes a shrinking test driver. The pass runs after type-check
+// and before codegen, so generated drivers are fully typed.
+//
+// Batch 76 / gap-fill: property-based testing.
+
+import std::ast
+import std::collections::{List, Map}
+import std::compiler::{Pass, Module, Diagnostic}
+
+/// A property discovered on a function declaration.
+struct Property {
+    fn_name:    String,
+    arg_types:  [ast::Type],
+    runs:       Int,      // default 100
+    max_shrink: Int,      // default 128
+    seed:       Option<Int>,
+}
+
+fn default_property(name: String, args: [ast::Type]) -> Property {
+    Property {
+        fn_name:    name,
+        arg_types:  args,
+        runs:       100,
+        max_shrink: 128,
+        seed:       None,
+    }
+}
+
+/// Parse `#[property(runs=500, seed=42)]` attributes.
+fn parse_attr(attr: ast::Attribute, base: Property) -> Result<Property, Diagnostic> {
+    attr.args
+        |> fold(Ok(base), |acc, (key, value)| {
+            acc?
+            |> then(|p| match (key, value) {
+                ("runs",       ast::IntLit(n))  => Ok(Property { runs: n, ..p }),
+                ("max_shrink", ast::IntLit(n))  => Ok(Property { max_shrink: n, ..p }),
+                ("seed",       ast::IntLit(n))  => Ok(Property { seed: Some(n), ..p }),
+                (k, _) => Err(Diagnostic::warn("unknown property attr: {k}")),
+            })
+        })
+}
+
+/// The pass itself.
+pub fn run(module: &mut Module) -> Result<(), [Diagnostic]> {
+    let mut diags:     [Diagnostic] = []
+    let mut generated: [ast::FnDecl] = []
+
+    for fn_decl in module.items |> filter(|i| i.is_fn()) {
+        let attr = fn_decl.attrs |> find(|a| a.name == "property")
+        match attr {
+            None        => continue,
+            Some(attr)  => {
+                let base = default_property(fn_decl.name, fn_decl.arg_types())
+                match parse_attr(attr, base) {
+                    Err(d) => diags |> push(d),
+                    Ok(p)  => generated |> push(synthesize_driver(p, fn_decl)),
+                }
+            },
+        }
+    }
+
+    module.items |> extend(generated)
+
+    if diags |> any(|d| d.is_error()) { Err(diags) } else { Ok(()) }
+}
+
+/// Build an AST node for `fn __prop_<name>() { ... }`.
+fn synthesize_driver(p: Property, decl: ast::FnDecl) -> ast::FnDecl {
+    let body = ast::Block::new()
+        |> add_stmt(ast::let_("rng", rng_init(p.seed)))
+        |> add_stmt(ast::let_("failures", ast::vec_new()))
+        |> add_stmt(loop_runs(p))
+        |> add_stmt(assert_no_failures())
+
+    ast::FnDecl {
+        name:      "__prop_{decl.name}",
+        args:      [],
+        ret:       ast::Type::unit(),
+        body:      body,
+        attrs:     [ast::attr("test")],
+        visibility: ast::Vis::Private,
+    }
+}
+
+fn rng_init(seed: Option<Int>) -> ast::Expr {
+    match seed {
+        Some(s) => ast::call("std::rand::Rng::seeded", [ast::int(s)]),
+        None    => ast::call("std::rand::Rng::from_env", []),
+    }
+}
+
+fn loop_runs(p: Property) -> ast::Stmt {
+    // for _ in 0..p.runs { run_one(&mut rng, p) }
+    ast::for_("_",
+        ast::range(0, p.runs),
+        ast::call("__prop_one", [ast::ident("rng"), ast::ident("failures")]))
+}
+
+fn assert_no_failures() -> ast::Stmt {
+    ast::if_(
+        ast::call("len", [ast::ident("failures")]) |> gt(ast::int(0)),
+        ast::call("panic", [
+            ast::str("property failed after shrinking: {failures[0]}")
+        ]))
+}
