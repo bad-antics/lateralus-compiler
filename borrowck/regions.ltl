@@ -1,0 +1,139 @@
+// compiler/borrowck/regions.ltl
+//
+// Region-based borrow checker for Lateralus.
+//
+// A region is a static approximation of the set of program points
+// during which a reference is live. The borrow checker maintains
+// a per-function region graph and rejects programs that alias a
+// mutable borrow with any other borrow whose region overlaps.
+//
+// Batch 77 / ownership.
+
+import std::ast
+import std::collections::{Map, Set, List}
+import std::compiler::{Pass, Module, Diagnostic}
+
+pub type RegionId = Int
+
+pub struct Region {
+    id:         RegionId,
+    name:       String,       // synthetic, e.g. "'r12"
+    origin:     ast::Span,    // where the reference was first taken
+    outlives:   Set<RegionId>,
+}
+
+pub struct Loan {
+    region:     RegionId,
+    place:      ast::Place,   // e.g. `x.field[0]`
+    kind:       LoanKind,
+    span:       ast::Span,
+}
+
+pub enum LoanKind {
+    Shared,
+    Mutable,
+}
+
+pub struct BorrowCtx {
+    regions:    Map<RegionId, Region>,
+    loans:      List<Loan>,
+    next_id:    RegionId,
+    diags:      List<Diagnostic>,
+}
+
+pub fn new_ctx() -> BorrowCtx {
+    BorrowCtx {
+        regions: Map::empty(),
+        loans:   List::empty(),
+        next_id: 0,
+        diags:   List::empty(),
+    }
+}
+
+pub fn run(module: &mut Module) -> Result<(), [Diagnostic]> {
+    let mut ctx = new_ctx()
+    for fn_decl in module.items |> filter(|i| i.is_fn()) {
+        check_fn(&mut ctx, fn_decl)
+    }
+    if ctx.diags |> any(|d| d.is_error()) { Err(ctx.diags) } else { Ok(()) }
+}
+
+fn check_fn(ctx: &mut BorrowCtx, f: ast::FnDecl) {
+    let mut live: Map<ast::Place, [Loan]> = Map::empty()
+    for stmt in f.body.stmts { check_stmt(ctx, &mut live, stmt) }
+}
+
+fn check_stmt(ctx: &mut BorrowCtx, live: &mut Map<ast::Place, [Loan]>, s: ast::Stmt) {
+    match s {
+        ast::Stmt::Borrow(place, kind, span) => {
+            let region = fresh_region(ctx, span)
+            let loan   = Loan { region: region.id, place, kind, span }
+            check_conflicts(ctx, live, loan)
+            live |> push(place, loan)
+        },
+        ast::Stmt::Drop(place) => {
+            live |> remove(place)
+        },
+        ast::Stmt::Assign(lhs, rhs) => {
+            check_rhs_regions(ctx, live, rhs)
+            // Writing to `lhs` invalidates any loan that ends at `lhs`.
+            live |> remove(lhs)
+        },
+        ast::Stmt::Pipeline(lhs, stages) => {
+            // Each stage's output region must outlive the next stage's input.
+            let mut prev: Option<RegionId> = None
+            for stage in stages {
+                let r = fresh_region(ctx, stage.span)
+                match prev {
+                    Some(p) => constrain_outlives(ctx, r.id, p),
+                    None    => (),
+                }
+                prev = Some(r.id)
+            }
+        },
+        _ => (),
+    }
+}
+
+fn check_conflicts(ctx: &mut BorrowCtx, live: &Map<ast::Place, [Loan]>, new: Loan) {
+    let existing = live |> get(new.place) |> unwrap_or([])
+    for old in existing {
+        if regions_overlap(ctx, old.region, new.region) {
+            let conflict = match (old.kind, new.kind) {
+                (LoanKind::Mutable, _) | (_, LoanKind::Mutable) => true,
+                _ => false,
+            }
+            if conflict {
+                ctx.diags |> push(Diagnostic::error(
+                    "borrow of `{new.place}` conflicts with earlier borrow",
+                    [old.span, new.span]))
+            }
+        }
+    }
+}
+
+fn fresh_region(ctx: &mut BorrowCtx, span: ast::Span) -> Region {
+    let id = ctx.next_id
+    ctx.next_id = id + 1
+    let r = Region { id, name: "'r{id}", origin: span, outlives: Set::empty() }
+    ctx.regions |> set(id, r)
+    r
+}
+
+fn constrain_outlives(ctx: &mut BorrowCtx, longer: RegionId, shorter: RegionId) {
+    ctx.regions
+        |> update(longer, |r| Region { outlives: r.outlives |> insert(shorter), ..r })
+}
+
+fn regions_overlap(ctx: &BorrowCtx, a: RegionId, b: RegionId) -> Bool {
+    // Two regions overlap unless one strictly outlives the other.
+    let a_outlives_b = ctx.regions |> get(a) |> .outlives |> contains(b)
+    let b_outlives_a = ctx.regions |> get(b) |> .outlives |> contains(a)
+    not (a_outlives_b || b_outlives_a)
+}
+
+fn check_rhs_regions(ctx: &mut BorrowCtx, live: &Map<ast::Place, [Loan]>, rhs: ast::Expr) {
+    // Extension point: walk rhs, for each `&p` or `&mut p` subexpression,
+    // synthesize a loan and check conflicts. Left out for brevity.
+    ()
+}
