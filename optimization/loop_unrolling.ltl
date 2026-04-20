@@ -1,0 +1,268 @@
+
+// Loop Unrolling Optimization Pass
+// Analyzes loops and applies unrolling to reduce branch overhead.
+
+use std.collections.HashMap
+
+type BlockId = usize
+
+#[derive(Clone, Debug)]
+struct LoopInfo {
+    header: BlockId,
+    latch: BlockId,
+    body_blocks: [BlockId],
+    trip_count: Option<usize>,
+    induction_var: Option<string>,
+    stride: i64,
+    is_innermost: bool,
+    nesting_depth: usize,
+}
+
+impl LoopInfo {
+    fn new(header: BlockId, latch: BlockId) -> LoopInfo {
+        LoopInfo {
+            header, latch, body_blocks: [],
+            trip_count: none, induction_var: none,
+            stride: 1, is_innermost: true, nesting_depth: 0,
+        }
+    }
+
+    fn block_count(self) -> usize { self.body_blocks.len() + 2 }  // +header +latch
+
+    fn is_countable(self) -> bool { self.trip_count.is_some() }
+
+    fn estimated_benefit(self, factor: usize) -> f64 {
+        if let some(tc) = self.trip_count {
+            let original_branches = tc as f64
+            let unrolled_branches = (tc / factor) as f64
+            original_branches - unrolled_branches
+        } else { 0.0 }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UnrollDecision {
+    loop_header: BlockId,
+    factor: usize,
+    strategy: UnrollStrategy,
+    estimated_speedup: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum UnrollStrategy {
+    Full,              // Complete unroll (known small trip count)
+    Partial(usize),    // Unroll by factor with remainder loop
+    None,              // Don't unroll
+}
+
+struct UnrollConfig {
+    max_unroll_factor: usize,
+    max_body_size: usize,         // max instructions in loop body
+    full_unroll_threshold: usize, // max trip count for full unroll
+    min_trip_count: usize,        // minimum trips to consider unrolling
+}
+
+impl UnrollConfig {
+    fn default() -> UnrollConfig {
+        UnrollConfig {
+            max_unroll_factor: 8,
+            max_body_size: 100,
+            full_unroll_threshold: 16,
+            min_trip_count: 4,
+        }
+    }
+
+    fn aggressive() -> UnrollConfig {
+        UnrollConfig {
+            max_unroll_factor: 16,
+            max_body_size: 200,
+            full_unroll_threshold: 32,
+            min_trip_count: 2,
+        }
+    }
+}
+
+struct LoopUnroller {
+    config: UnrollConfig,
+    decisions: [UnrollDecision],
+    stats: UnrollStats,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UnrollStats {
+    loops_analyzed: usize,
+    loops_fully_unrolled: usize,
+    loops_partially_unrolled: usize,
+    loops_skipped: usize,
+    total_branches_eliminated: usize,
+}
+
+impl LoopUnroller {
+    fn new(config: UnrollConfig) -> LoopUnroller {
+        LoopUnroller { config, decisions: [], stats: UnrollStats.default() }
+    }
+
+    fn analyze(mut self, loop_info: &LoopInfo) -> UnrollDecision {
+        self.stats.loops_analyzed += 1
+        let body_size = loop_info.block_count()
+
+        // Skip large or non-innermost loops
+        if body_size > self.config.max_body_size || !loop_info.is_innermost {
+            self.stats.loops_skipped += 1
+            return UnrollDecision {
+                loop_header: loop_info.header, factor: 1,
+                strategy: UnrollStrategy.None, estimated_speedup: 0.0,
+            }
+        }
+
+        if let some(tc) = loop_info.trip_count {
+            if tc < self.config.min_trip_count {
+                self.stats.loops_skipped += 1
+                return UnrollDecision {
+                    loop_header: loop_info.header, factor: 1,
+                    strategy: UnrollStrategy.None, estimated_speedup: 0.0,
+                }
+            }
+
+            // Full unroll for small loops
+            if tc <= self.config.full_unroll_threshold {
+                let speedup = loop_info.estimated_benefit(tc)
+                self.stats.loops_fully_unrolled += 1
+                self.stats.total_branches_eliminated += tc
+                let decision = UnrollDecision {
+                    loop_header: loop_info.header, factor: tc,
+                    strategy: UnrollStrategy.Full, estimated_speedup: speedup,
+                }
+                self.decisions.push(decision.clone())
+                return decision
+            }
+
+            // Partial unroll
+            let factor = self.best_factor(tc)
+            let speedup = loop_info.estimated_benefit(factor)
+            self.stats.loops_partially_unrolled += 1
+            self.stats.total_branches_eliminated += tc - (tc / factor)
+            let decision = UnrollDecision {
+                loop_header: loop_info.header, factor,
+                strategy: UnrollStrategy.Partial(factor),
+                estimated_speedup: speedup,
+            }
+            self.decisions.push(decision.clone())
+            decision
+        } else {
+            self.stats.loops_skipped += 1
+            UnrollDecision {
+                loop_header: loop_info.header, factor: 1,
+                strategy: UnrollStrategy.None, estimated_speedup: 0.0,
+            }
+        }
+    }
+
+    fn best_factor(self, trip_count: usize) -> usize {
+        let mut best = 2
+        for f in 2..=self.config.max_unroll_factor {
+            if trip_count % f == 0 { best = f }
+        }
+        best
+    }
+
+    fn stats(self) -> &UnrollStats { &self.stats }
+}
+
+fn main() {
+    // LoopInfo basics
+    let mut li = LoopInfo.new(1, 5)
+    li.body_blocks = [2, 3, 4]
+    li.trip_count = some(100)
+    li.induction_var = some("i".into())
+    assert(li.block_count() == 5)
+    assert(li.is_countable())
+    print("LoopInfo ✓")
+
+    // Estimated benefit
+    let benefit = li.estimated_benefit(4)
+    assert(benefit == 75.0)  // 100 - 25
+    print("Benefit estimation ✓")
+
+    // Default config
+    let cfg = UnrollConfig.default()
+    assert(cfg.max_unroll_factor == 8)
+    assert(cfg.full_unroll_threshold == 16)
+    print("Config ✓")
+
+    // Full unroll (small trip count)
+    let mut unroller = LoopUnroller.new(UnrollConfig.default())
+    let mut small_loop = LoopInfo.new(10, 12)
+    small_loop.body_blocks = [11]
+    small_loop.trip_count = some(8)
+    let decision = unroller.analyze(&small_loop)
+    assert(decision.strategy == UnrollStrategy.Full)
+    assert(decision.factor == 8)
+    print("Full unroll ✓")
+
+    // Partial unroll (large trip count)
+    let mut big_loop = LoopInfo.new(20, 25)
+    big_loop.body_blocks = [21, 22, 23, 24]
+    big_loop.trip_count = some(1000)
+    let decision2 = unroller.analyze(&big_loop)
+    assert(decision2.factor > 1)
+    match decision2.strategy {
+        UnrollStrategy.Partial(f) => assert(f > 1),
+        _ => assert(false),
+    }
+    print("Partial unroll ✓")
+
+    // Skip non-countable
+    let mut unknown = LoopInfo.new(30, 32)
+    unknown.body_blocks = [31]
+    unknown.trip_count = none
+    let decision3 = unroller.analyze(&unknown)
+    assert(decision3.strategy == UnrollStrategy.None)
+    print("Skip non-countable ✓")
+
+    // Skip non-innermost
+    let mut outer = LoopInfo.new(40, 42)
+    outer.body_blocks = [41]
+    outer.trip_count = some(100)
+    outer.is_innermost = false
+    let decision4 = unroller.analyze(&outer)
+    assert(decision4.strategy == UnrollStrategy.None)
+    print("Skip non-innermost ✓")
+
+    // Skip small trip count
+    let mut tiny = LoopInfo.new(50, 52)
+    tiny.body_blocks = [51]
+    tiny.trip_count = some(2)
+    let decision5 = unroller.analyze(&tiny)
+    assert(decision5.strategy == UnrollStrategy.None)
+    print("Skip tiny ✓")
+
+    // Stats
+    let stats = unroller.stats()
+    assert(stats.loops_analyzed == 5)
+    assert(stats.loops_fully_unrolled == 1)
+    assert(stats.loops_partially_unrolled == 1)
+    assert(stats.loops_skipped == 3)
+    assert(stats.total_branches_eliminated > 0)
+    print("Stats ✓")
+
+    // Best factor
+    let u2 = LoopUnroller.new(UnrollConfig.default())
+    assert(u2.best_factor(100) == 4)  // 100 % 4 == 0 (largest <=8 that divides)
+    assert(u2.best_factor(64) == 8)
+    print("Best factor ✓")
+
+    // Aggressive config
+    let agg = UnrollConfig.aggressive()
+    assert(agg.max_unroll_factor == 16)
+    assert(agg.min_trip_count == 2)
+    let mut u3 = LoopUnroller.new(agg)
+    let mut agg_loop = LoopInfo.new(60, 62)
+    agg_loop.body_blocks = [61]
+    agg_loop.trip_count = some(3)
+    let d = u3.analyze(&agg_loop)
+    assert(d.strategy != UnrollStrategy.None)  // aggressive allows small trips
+    print("Aggressive ✓")
+
+    print("Loop unrolling complete ✓")
+}
