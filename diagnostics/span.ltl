@@ -1,0 +1,226 @@
+
+// Source Span and Location tracking for diagnostics
+// Maps byte offsets to line/column positions for error reporting.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FileId(usize)
+
+#[derive(Clone, Debug, PartialEq)]
+struct Span {
+    file: FileId,
+    start: usize,
+    end: usize,
+}
+
+impl Span {
+    fn new(file: FileId, start: usize, end: usize) -> Span {
+        Span { file, start, end }
+    }
+
+    fn len(self) -> usize { self.end - self.start }
+    fn is_empty(self) -> bool { self.start == self.end }
+
+    fn contains(self, offset: usize) -> bool {
+        offset >= self.start && offset < self.end
+    }
+
+    fn merge(self, other: &Span) -> Span {
+        assert(self.file == other.file)
+        Span {
+            file: self.file.clone(),
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
+    }
+
+    fn shrink_to_start(self) -> Span {
+        Span { file: self.file.clone(), start: self.start, end: self.start }
+    }
+
+    fn shrink_to_end(self) -> Span {
+        Span { file: self.file.clone(), start: self.end, end: self.end }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Location {
+    line: usize,    // 1-based
+    column: usize,  // 1-based
+}
+
+impl Location {
+    fn new(line: usize, column: usize) -> Location {
+        Location { line, column }
+    }
+}
+
+struct SourceFile {
+    id: FileId,
+    name: string,
+    content: string,
+    line_starts: [usize],
+}
+
+impl SourceFile {
+    fn new(id: FileId, name: string, content: string) -> SourceFile {
+        let line_starts = compute_line_starts(&content)
+        SourceFile { id, name, content, line_starts }
+    }
+
+    fn offset_to_location(self, offset: usize) -> Location {
+        let line = self.line_starts.partition_point(|&start| start <= offset)
+        let line_start = self.line_starts[line - 1]
+        Location { line, column: offset - line_start + 1 }
+    }
+
+    fn span_to_locations(self, span: &Span) -> (Location, Location) {
+        (self.offset_to_location(span.start), self.offset_to_location(span.end))
+    }
+
+    fn line_content(self, line: usize) -> &str {
+        if line == 0 || line > self.line_starts.len() { return "" }
+        let start = self.line_starts[line - 1]
+        let end = if line < self.line_starts.len() {
+            self.line_starts[line] - 1  // exclude newline
+        } else {
+            self.content.len()
+        }
+        &self.content[start..end]
+    }
+
+    fn line_count(self) -> usize { self.line_starts.len() }
+    fn total_bytes(self) -> usize { self.content.len() }
+}
+
+fn compute_line_starts(content: &str) -> [usize] {
+    let mut starts = vec![0]
+    for (i, ch) in content.char_indices() {
+        if ch == '\n' { starts.push(i + 1) }
+    }
+    starts
+}
+
+struct SourceMap {
+    files: HashMap<FileId, SourceFile>,
+    next_id: usize,
+}
+
+impl SourceMap {
+    fn new() -> SourceMap {
+        SourceMap { files: HashMap.new(), next_id: 0 }
+    }
+
+    fn add_file(mut self, name: string, content: string) -> FileId {
+        let id = FileId(self.next_id)
+        self.next_id += 1
+        self.files.insert(id.clone(), SourceFile.new(id.clone(), name, content))
+        id
+    }
+
+    fn get_file(self, id: &FileId) -> Option<&SourceFile> {
+        self.files.get(id)
+    }
+
+    fn resolve_span(self, span: &Span) -> Option<(string, Location, Location)> {
+        let file = self.files.get(&span.file)?
+        let (start_loc, end_loc) = file.span_to_locations(span)
+        some((file.name.clone(), start_loc, end_loc))
+    }
+
+    fn file_count(self) -> usize { self.files.len() }
+}
+
+fn main() {
+    // Span basics
+    let s = Span.new(FileId(0), 10, 20)
+    assert(s.len() == 10)
+    assert(!s.is_empty())
+    assert(s.contains(15))
+    assert(!s.contains(20))
+    assert(!s.contains(5))
+    print("Span ✓")
+
+    // Empty span
+    let empty = Span.new(FileId(0), 5, 5)
+    assert(empty.is_empty())
+    assert(empty.len() == 0)
+    print("Empty span ✓")
+
+    // Span merge
+    let s1 = Span.new(FileId(0), 10, 20)
+    let s2 = Span.new(FileId(0), 15, 30)
+    let merged = s1.merge(&s2)
+    assert(merged.start == 10)
+    assert(merged.end == 30)
+    print("Span merge ✓")
+
+    // Shrink
+    let shrunk_start = s.shrink_to_start()
+    assert(shrunk_start.start == 10 && shrunk_start.end == 10)
+    let shrunk_end = s.shrink_to_end()
+    assert(shrunk_end.start == 20 && shrunk_end.end == 20)
+    print("Span shrink ✓")
+
+    // Line starts computation
+    let starts = compute_line_starts("hello\nworld\nfoo")
+    assert(starts.len() == 3)
+    assert(starts[0] == 0)
+    assert(starts[1] == 6)
+    assert(starts[2] == 12)
+    print("Line starts ✓")
+
+    // SourceFile
+    let sf = SourceFile.new(FileId(0), "test.ltl".into(), "fn main() {\n    print(42)\n}\n".into())
+    assert(sf.line_count() == 4)  // 3 newlines = 4 line starts
+    print("SourceFile ✓")
+
+    // Offset to location
+    let loc = sf.offset_to_location(0)
+    assert(loc.line == 1 && loc.column == 1)
+    let loc2 = sf.offset_to_location(12)  // start of line 2
+    assert(loc2.line == 2 && loc2.column == 1)
+    let loc3 = sf.offset_to_location(16)  // "print" on line 2
+    assert(loc3.line == 2 && loc3.column == 5)
+    print("Offset to location ✓")
+
+    // Line content
+    assert(sf.line_content(1) == "fn main() {")
+    assert(sf.line_content(2) == "    print(42)")
+    assert(sf.line_content(3) == "}")
+    print("Line content ✓")
+
+    // SourceMap
+    let mut sm = SourceMap.new()
+    let fid1 = sm.add_file("main.ltl".into(), "let x = 1\nlet y = 2\n".into())
+    let fid2 = sm.add_file("lib.ltl".into(), "fn foo() {}\n".into())
+    assert(sm.file_count() == 2)
+    print("SourceMap ✓")
+
+    // Resolve span
+    let span = Span.new(fid1.clone(), 11, 20)
+    let (name, start, end) = sm.resolve_span(&span).unwrap()
+    assert(name == "main.ltl")
+    assert(start.line == 2)
+    assert(start.column == 1)
+    print("Resolve span ✓")
+
+    // Location
+    let l = Location.new(5, 10)
+    assert(l.line == 5 && l.column == 10)
+    assert(Location.new(1, 1) == Location.new(1, 1))
+    assert(Location.new(1, 1) != Location.new(1, 2))
+    print("Location ✓")
+
+    // FileId
+    assert(FileId(0) == FileId(0))
+    assert(FileId(0) != FileId(1))
+    print("FileId ✓")
+
+    // Total bytes
+    assert(sf.total_bytes() == 27)
+    print("Total bytes ✓")
+
+    print("Source span complete ✓")
+}
