@@ -1,0 +1,242 @@
+
+// Escape Analysis - Determines if allocations can be stack-allocated
+// Tracks pointer flow to decide heap vs stack placement.
+
+use std.collections.{HashMap, HashSet}
+
+type VarId = usize
+type FuncId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+enum EscapeState {
+    NoEscape,          // Can be stack-allocated
+    ArgEscape(usize),  // Escapes via function argument at index
+    ReturnEscape,      // Escapes via return value
+    GlobalEscape,      // Escapes to global/heap (worst case)
+}
+
+impl EscapeState {
+    fn escapes(self) -> bool {
+        match self {
+            EscapeState.NoEscape => false,
+            _ => true,
+        }
+    }
+
+    fn can_stack_allocate(self) -> bool {
+        match self {
+            EscapeState.NoEscape => true,
+            EscapeState.ArgEscape(_) => false,
+            EscapeState.ReturnEscape => false,
+            EscapeState.GlobalEscape => false,
+        }
+    }
+
+    fn merge(self, other: &EscapeState) -> EscapeState {
+        match (self, other) {
+            (EscapeState.GlobalEscape, _) | (_, EscapeState.GlobalEscape) => EscapeState.GlobalEscape,
+            (EscapeState.ReturnEscape, _) | (_, EscapeState.ReturnEscape) => EscapeState.ReturnEscape,
+            (EscapeState.ArgEscape(a), EscapeState.ArgEscape(b)) => EscapeState.ArgEscape(a.min(*b)),
+            (EscapeState.ArgEscape(a), _) | (_, EscapeState.ArgEscape(a)) => EscapeState.ArgEscape(*a),
+            _ => EscapeState.NoEscape,
+        }
+    }
+
+    fn severity(self) -> usize {
+        match self {
+            EscapeState.NoEscape => 0,
+            EscapeState.ArgEscape(_) => 1,
+            EscapeState.ReturnEscape => 2,
+            EscapeState.GlobalEscape => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Allocation {
+    var: VarId,
+    type_name: string,
+    size_bytes: usize,
+    escape_state: EscapeState,
+    allocation_site: usize,
+}
+
+impl Allocation {
+    fn new(var: VarId, type_name: string, size_bytes: usize) -> Allocation {
+        Allocation { var, type_name, size_bytes, escape_state: EscapeState.NoEscape, allocation_site: 0 }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct EscapeStats {
+    allocations_analyzed: usize,
+    stack_eligible: usize,
+    heap_required: usize,
+    bytes_saved: usize,
+}
+
+struct EscapeAnalyzer {
+    allocations: HashMap<VarId, Allocation>,
+    pointer_graph: HashMap<VarId, HashSet<VarId>>,
+    returned_vars: HashSet<VarId>,
+    global_vars: HashSet<VarId>,
+    stats: EscapeStats,
+}
+
+impl EscapeAnalyzer {
+    fn new() -> EscapeAnalyzer {
+        EscapeAnalyzer {
+            allocations: HashMap.new(),
+            pointer_graph: HashMap.new(),
+            returned_vars: HashSet.new(),
+            global_vars: HashSet.new(),
+            stats: EscapeStats.default(),
+        }
+    }
+
+    fn add_allocation(mut self, alloc: Allocation) {
+        self.allocations.insert(alloc.var, alloc)
+    }
+
+    fn add_pointer_flow(mut self, from: VarId, to: VarId) {
+        self.pointer_graph.entry(from).or_insert_with(|| HashSet.new()).insert(to)
+    }
+
+    fn mark_returned(mut self, var: VarId) { self.returned_vars.insert(var); }
+    fn mark_global(mut self, var: VarId) { self.global_vars.insert(var); }
+
+    fn analyze(mut self) {
+        // Mark directly escaping allocations
+        for (&var, alloc) in &mut self.allocations {
+            self.stats.allocations_analyzed += 1
+
+            if self.global_vars.contains(&var) {
+                alloc.escape_state = EscapeState.GlobalEscape
+            } else if self.returned_vars.contains(&var) {
+                alloc.escape_state = EscapeState.ReturnEscape
+            }
+        }
+
+        // Propagate through pointer graph
+        let vars: [VarId] = self.allocations.keys().copied().collect()
+        for &var in &vars {
+            if let some(targets) = self.pointer_graph.get(&var) {
+                for &target in targets {
+                    if let some(target_alloc) = self.allocations.get(&target) {
+                        let target_state = target_alloc.escape_state.clone()
+                        if target_state.escapes() {
+                            if let some(alloc) = self.allocations.get_mut(&var) {
+                                alloc.escape_state = alloc.escape_state.merge(&target_state)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute stats
+        for (_, alloc) in &self.allocations {
+            if alloc.escape_state.can_stack_allocate() {
+                self.stats.stack_eligible += 1
+                self.stats.bytes_saved += alloc.size_bytes
+            } else {
+                self.stats.heap_required += 1
+            }
+        }
+    }
+
+    fn get_state(self, var: VarId) -> Option<&EscapeState> {
+        self.allocations.get(&var).map(|a| &a.escape_state)
+    }
+
+    fn stack_candidates(self) -> [VarId] {
+        self.allocations.iter()
+            .filter(|(_, a)| a.escape_state.can_stack_allocate())
+            .map(|(&v, _)| v)
+            .collect()
+    }
+
+    fn stats(self) -> &EscapeStats { &self.stats }
+}
+
+fn main() {
+    // EscapeState
+    assert(!EscapeState.NoEscape.escapes())
+    assert(EscapeState.GlobalEscape.escapes())
+    assert(EscapeState.ReturnEscape.escapes())
+    assert(EscapeState.ArgEscape(0).escapes())
+    print("EscapeState ✓")
+
+    // Can stack allocate
+    assert(EscapeState.NoEscape.can_stack_allocate())
+    assert(!EscapeState.GlobalEscape.can_stack_allocate())
+    assert(!EscapeState.ReturnEscape.can_stack_allocate())
+    print("Stack allocate ✓")
+
+    // Merge
+    let m1 = EscapeState.NoEscape.merge(&EscapeState.GlobalEscape)
+    assert(m1 == EscapeState.GlobalEscape)
+    let m2 = EscapeState.NoEscape.merge(&EscapeState.NoEscape)
+    assert(m2 == EscapeState.NoEscape)
+    let m3 = EscapeState.ArgEscape(1).merge(&EscapeState.ReturnEscape)
+    assert(m3 == EscapeState.ReturnEscape)
+    print("Merge ✓")
+
+    // Severity
+    assert(EscapeState.NoEscape.severity() == 0)
+    assert(EscapeState.GlobalEscape.severity() == 3)
+    print("Severity ✓")
+
+    // Allocation
+    let alloc = Allocation.new(1, "Point".into(), 16)
+    assert(alloc.size_bytes == 16)
+    assert(!alloc.escape_state.escapes())
+    print("Allocation ✓")
+
+    // Full analysis
+    let mut analyzer = EscapeAnalyzer.new()
+    analyzer.add_allocation(Allocation.new(1, "Vec3".into(), 24))
+    analyzer.add_allocation(Allocation.new(2, "Matrix".into(), 128))
+    analyzer.add_allocation(Allocation.new(3, "TempBuf".into(), 64))
+
+    // Var 2 is returned (escapes)
+    analyzer.mark_returned(2)
+    // Var 3 stays local (no escape)
+    // Var 1 flows into var 2
+    analyzer.add_pointer_flow(1, 2)
+
+    analyzer.analyze()
+
+    assert(analyzer.get_state(2) == some(&EscapeState.ReturnEscape))
+    assert(analyzer.get_state(3) == some(&EscapeState.NoEscape))
+    print("Analysis ✓")
+
+    // Stats
+    let stats = analyzer.stats()
+    assert(stats.allocations_analyzed == 3)
+    assert(stats.stack_eligible >= 1)  // at least var 3
+    assert(stats.heap_required >= 1)   // at least var 2
+    print("Stats ✓")
+
+    // Stack candidates
+    let candidates = analyzer.stack_candidates()
+    assert(candidates.contains(&3))  // TempBuf stays local
+    assert(!candidates.contains(&2)) // Matrix escapes
+    print("Candidates ✓")
+
+    // Global escape
+    let mut a2 = EscapeAnalyzer.new()
+    a2.add_allocation(Allocation.new(10, "Singleton".into(), 32))
+    a2.mark_global(10)
+    a2.analyze()
+    assert(a2.get_state(10) == some(&EscapeState.GlobalEscape))
+    print("Global escape ✓")
+
+    // EscapeStats default
+    let s = EscapeStats.default()
+    assert(s.allocations_analyzed == 0)
+    assert(s.bytes_saved == 0)
+    print("Default stats ✓")
+
+    print("Escape analysis complete ✓")
+}
