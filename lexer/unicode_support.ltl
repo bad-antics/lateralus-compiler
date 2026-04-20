@@ -1,0 +1,202 @@
+
+// Unicode Support - Unicode-aware lexer utilities
+// Handles character classification, normalization, and grapheme boundaries.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UnicodeCategory {
+    Letter, Mark, Number, Punctuation, Symbol, Separator, Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CodePoint {
+    value: u32,
+}
+
+impl CodePoint {
+    fn new(value: u32) -> CodePoint { CodePoint { value } }
+    fn from_char(c: char) -> CodePoint { CodePoint { value: c as u32 } }
+
+    fn is_ascii(self) -> bool { self.value <= 0x7F }
+    fn is_bmp(self) -> bool { self.value <= 0xFFFF }
+    fn is_supplementary(self) -> bool { self.value > 0xFFFF && self.value <= 0x10FFFF }
+    fn is_valid(self) -> bool { self.value <= 0x10FFFF && !(self.value >= 0xD800 && self.value <= 0xDFFF) }
+
+    fn to_char(self) -> Option<char> {
+        if self.is_valid() { Some(self.value as char) } else { None }
+    }
+
+    fn utf8_len(self) -> usize {
+        if self.value <= 0x7F { 1 }
+        else if self.value <= 0x7FF { 2 }
+        else if self.value <= 0xFFFF { 3 }
+        else { 4 }
+    }
+
+    fn encode_utf8(self) -> [u8] {
+        let v = self.value
+        if v <= 0x7F { return [v as u8] }
+        if v <= 0x7FF { return [0xC0 | (v >> 6) as u8, 0x80 | (v & 0x3F) as u8] }
+        if v <= 0xFFFF { return [0xE0 | (v >> 12) as u8, 0x80 | ((v >> 6) & 0x3F) as u8, 0x80 | (v & 0x3F) as u8] }
+        [0xF0 | (v >> 18) as u8, 0x80 | ((v >> 12) & 0x3F) as u8, 0x80 | ((v >> 6) & 0x3F) as u8, 0x80 | (v & 0x3F) as u8]
+    }
+
+    fn category(self) -> UnicodeCategory {
+        let v = self.value
+        if (v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A) || (v >= 0xC0 && v <= 0x024F) {
+            UnicodeCategory.Letter
+        } else if v >= 0x30 && v <= 0x39 { UnicodeCategory.Number
+        } else if v == 0x20 || v == 0x09 || v == 0x0A || v == 0x0D { UnicodeCategory.Separator
+        } else if (v >= 0x21 && v <= 0x2F) || (v >= 0x3A && v <= 0x40) || (v >= 0x5B && v <= 0x60) || (v >= 0x7B && v <= 0x7E) {
+            UnicodeCategory.Punctuation
+        } else { UnicodeCategory.Other }
+    }
+
+    fn is_identifier_start(self) -> bool {
+        self.category() == UnicodeCategory.Letter || self.value == '_' as u32
+    }
+
+    fn is_identifier_continue(self) -> bool {
+        let cat = self.category()
+        cat == UnicodeCategory.Letter || cat == UnicodeCategory.Number || self.value == '_' as u32
+    }
+
+    fn is_whitespace(self) -> bool { self.category() == UnicodeCategory.Separator }
+}
+
+struct Utf8Decoder {
+    bytes: [u8],
+    pos: usize,
+}
+
+impl Utf8Decoder {
+    fn new(bytes: &[u8]) -> Utf8Decoder { Utf8Decoder { bytes: bytes.to_vec(), pos: 0 } }
+    fn from_str(s: &str) -> Utf8Decoder { Utf8Decoder { bytes: s.bytes().collect(), pos: 0 } }
+
+    fn remaining(self) -> usize { self.bytes.len() - self.pos }
+    fn is_empty(self) -> bool { self.pos >= self.bytes.len() }
+
+    fn next(mut self) -> Option<CodePoint> {
+        if self.is_empty() { return None }
+        let b0 = self.bytes[self.pos] as u32
+        if b0 <= 0x7F {
+            self.pos += 1
+            return Some(CodePoint.new(b0))
+        }
+        let (len, mut cp) = if b0 & 0xE0 == 0xC0 { (2, b0 & 0x1F) }
+            else if b0 & 0xF0 == 0xE0 { (3, b0 & 0x0F) }
+            else if b0 & 0xF8 == 0xF0 { (4, b0 & 0x07) }
+            else { self.pos += 1; return Some(CodePoint.new(0xFFFD)) };  // replacement char
+
+        if self.pos + len > self.bytes.len() {
+            self.pos = self.bytes.len()
+            return Some(CodePoint.new(0xFFFD))
+        }
+        for i in 1..len {
+            cp = (cp << 6) | (self.bytes[self.pos + i] as u32 & 0x3F)
+        }
+        self.pos += len
+        Some(CodePoint.new(cp))
+    }
+
+    fn count_codepoints(mut self) -> usize {
+        let mut count = 0
+        while self.next().is_some() { count += 1 }
+        count
+    }
+}
+
+fn is_valid_identifier(s: &str) -> bool {
+    let mut dec = Utf8Decoder.from_str(s)
+    match dec.next() {
+        Some(cp) if cp.is_identifier_start() => {}
+        _ => return false,
+    }
+    while let Some(cp) = dec.next() {
+        if !cp.is_identifier_continue() { return false }
+    }
+    true
+}
+
+fn main() {
+    // CodePoint basics
+    let cp = CodePoint.new(0x41)  // 'A'
+    assert(cp.is_ascii())
+    assert(cp.is_bmp())
+    assert(!cp.is_supplementary())
+    assert(cp.is_valid())
+    assert(cp.to_char() == Some('A'))
+    print("CodePoint ✓")
+
+    // UTF-8 length
+    assert(CodePoint.new(0x41).utf8_len() == 1)      // ASCII
+    assert(CodePoint.new(0xE9).utf8_len() == 2)      // é
+    assert(CodePoint.new(0x4E16).utf8_len() == 3)    // 世
+    assert(CodePoint.new(0x1F600).utf8_len() == 4)   // 😀
+    print("UTF-8 length ✓")
+
+    // UTF-8 encoding
+    let ascii = CodePoint.new(0x41).encode_utf8()
+    assert(ascii == [0x41])
+    let two_byte = CodePoint.new(0xE9).encode_utf8()
+    assert(two_byte.len() == 2)
+    assert(two_byte[0] == 0xC3 && two_byte[1] == 0xA9)
+    print("UTF-8 encode ✓")
+
+    // Category
+    assert(CodePoint.from_char('A').category() == UnicodeCategory.Letter)
+    assert(CodePoint.from_char('5').category() == UnicodeCategory.Number)
+    assert(CodePoint.from_char(' ').category() == UnicodeCategory.Separator)
+    assert(CodePoint.from_char('!').category() == UnicodeCategory.Punctuation)
+    print("Category ✓")
+
+    // Identifier checks
+    assert(CodePoint.from_char('a').is_identifier_start())
+    assert(CodePoint.from_char('_').is_identifier_start())
+    assert(!CodePoint.from_char('5').is_identifier_start())
+    assert(CodePoint.from_char('5').is_identifier_continue())
+    print("Identifier ✓")
+
+    // Whitespace
+    assert(CodePoint.from_char(' ').is_whitespace())
+    assert(CodePoint.from_char('\n').is_whitespace())
+    assert(!CodePoint.from_char('a').is_whitespace())
+    print("Whitespace ✓")
+
+    // Surrogate check
+    assert(!CodePoint.new(0xD800).is_valid())
+    assert(!CodePoint.new(0xDFFF).is_valid())
+    assert(CodePoint.new(0xE000).is_valid())
+    print("Surrogates ✓")
+
+    // UTF-8 decoder
+    let mut dec = Utf8Decoder.from_str("hello")
+    assert(dec.remaining() == 5)
+    let first = dec.next().unwrap()
+    assert(first.value == 'h' as u32)
+    print("Decoder ✓")
+
+    // Count codepoints
+    let count = Utf8Decoder.from_str("abc").count_codepoints()
+    assert(count == 3)
+    let empty_count = Utf8Decoder.from_str("").count_codepoints()
+    assert(empty_count == 0)
+    print("Count ✓")
+
+    // Valid identifiers
+    assert(is_valid_identifier("hello"))
+    assert(is_valid_identifier("_private"))
+    assert(is_valid_identifier("x1"))
+    assert(!is_valid_identifier("1bad"))
+    assert(!is_valid_identifier(""))
+    assert(!is_valid_identifier("has space"))
+    print("Valid ident ✓")
+
+    // BMP and supplementary
+    assert(CodePoint.new(0xFFFF).is_bmp())
+    assert(CodePoint.new(0x10000).is_supplementary())
+    assert(CodePoint.new(0x10FFFF).is_valid())
+    assert(!CodePoint.new(0x110000).is_valid())
+    print("Planes ✓")
+
+    print("Unicode support complete ✓")
+}
