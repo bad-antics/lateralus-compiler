@@ -1,0 +1,203 @@
+
+// Mark and Sweep Garbage Collector
+// Implements a tracing garbage collector with root scanning and heap management.
+
+use std.collections.{HashMap, HashSet}
+
+type ObjId = u64
+
+#[derive(Clone, Debug, PartialEq)]
+enum ObjKind { Int(i64), Str(string), Array([ObjId]), Record(HashMap<string, ObjId>), Null }
+
+struct GcObject {
+    id: ObjId,
+    kind: ObjKind,
+    marked: bool,
+    size_bytes: usize,
+}
+
+impl GcObject {
+    fn new(id: ObjId, kind: ObjKind) -> GcObject {
+        let size = match &kind {
+            ObjKind.Int(_) => 8,
+            ObjKind.Str(s) => 24 + s.len(),
+            ObjKind.Array(a) => 24 + a.len() * 8,
+            ObjKind.Record(m) => 24 + m.len() * 40,
+            ObjKind.Null => 8,
+        };
+        GcObject { id, kind, marked: false, size_bytes: size }
+    }
+
+    fn references(self) -> [ObjId] {
+        match &self.kind {
+            ObjKind.Array(ids) => ids.clone(),
+            ObjKind.Record(map) => map.values().cloned().collect(),
+            _ => [],
+        }
+    }
+}
+
+struct Heap {
+    objects: HashMap<ObjId, GcObject>,
+    roots: HashSet<ObjId>,
+    next_id: ObjId,
+    total_bytes: usize,
+    gc_threshold: usize,
+    gc_count: u32,
+    freed_count: u64,
+}
+
+impl Heap {
+    fn new(threshold: usize) -> Heap {
+        Heap {
+            objects: HashMap.new(), roots: HashSet.new(),
+            next_id: 1, total_bytes: 0, gc_threshold: threshold,
+            gc_count: 0, freed_count: 0,
+        }
+    }
+
+    fn alloc(mut self, kind: ObjKind) -> ObjId {
+        let id = self.next_id
+        self.next_id += 1
+        let obj = GcObject.new(id, kind)
+        self.total_bytes += obj.size_bytes
+        self.objects.insert(id, obj)
+        if self.total_bytes > self.gc_threshold { self.collect() }
+        id
+    }
+
+    fn alloc_int(mut self, v: i64) -> ObjId { self.alloc(ObjKind.Int(v)) }
+    fn alloc_str(mut self, s: &str) -> ObjId { self.alloc(ObjKind.Str(s.into())) }
+    fn alloc_array(mut self, items: [ObjId]) -> ObjId { self.alloc(ObjKind.Array(items)) }
+    fn alloc_null(mut self) -> ObjId { self.alloc(ObjKind.Null) }
+
+    fn add_root(mut self, id: ObjId) { self.roots.insert(id); }
+    fn remove_root(mut self, id: ObjId) { self.roots.remove(&id); }
+
+    fn get(self, id: ObjId) -> Option<&GcObject> { self.objects.get(&id) }
+
+    fn object_count(self) -> usize { self.objects.len() }
+    fn root_count(self) -> usize { self.roots.len() }
+
+    fn mark(mut self) {
+        let mut stack: [ObjId] = self.roots.iter().cloned().collect()
+        while let Some(id) = stack.pop() {
+            if let Some(obj) = self.objects.get_mut(&id) {
+                if obj.marked { continue }
+                obj.marked = true
+                for ref_id in obj.references() { stack.push(ref_id) }
+            }
+        }
+    }
+
+    fn sweep(mut self) -> usize {
+        let mut to_remove = []
+        for (id, obj) in &self.objects {
+            if !obj.marked { to_remove.push(*id) }
+        }
+        let count = to_remove.len()
+        for id in to_remove {
+            if let Some(obj) = self.objects.remove(&id) {
+                self.total_bytes -= obj.size_bytes
+            }
+        }
+        self.freed_count += count as u64
+        count
+    }
+
+    fn unmark_all(mut self) {
+        for (_, obj) in &mut self.objects { obj.marked = false }
+    }
+
+    fn collect(mut self) -> usize {
+        self.unmark_all()
+        self.mark()
+        let freed = self.sweep()
+        self.gc_count += 1
+        freed
+    }
+
+    fn stats(self) -> (usize, usize, u32, u64) {
+        (self.object_count(), self.total_bytes, self.gc_count, self.freed_count)
+    }
+}
+
+fn main() {
+    let mut heap = Heap.new(10000)
+
+    // Allocation
+    let a = heap.alloc_int(42)
+    let b = heap.alloc_str("hello")
+    let c = heap.alloc_null()
+    assert(heap.object_count() == 3)
+    print("Alloc ✓")
+
+    // Roots
+    heap.add_root(a)
+    heap.add_root(b)
+    assert(heap.root_count() == 2)
+    print("Roots ✓")
+
+    // GC - c has no root, should be freed
+    let freed = heap.collect()
+    assert(freed == 1)  // null object freed
+    assert(heap.object_count() == 2)
+    print("Collect ✓")
+
+    // Array with references
+    let x = heap.alloc_int(1)
+    let y = heap.alloc_int(2)
+    let arr = heap.alloc_array([x, y])
+    heap.add_root(arr)
+    let freed2 = heap.collect()
+    // x and y should survive because arr references them
+    assert(heap.get(x).is_some())
+    assert(heap.get(y).is_some())
+    assert(heap.get(arr).is_some())
+    print("Array refs ✓")
+
+    // Remove root and collect
+    heap.remove_root(arr)
+    let freed3 = heap.collect()
+    assert(freed3 == 3)  // arr, x, y all freed
+    assert(heap.object_count() == 2)  // a and b remain
+    print("Remove root ✓")
+
+    // Circular reference would be handled (no refs create cycles in our model)
+    // Transitive roots
+    let r1 = heap.alloc_int(10)
+    let r2 = heap.alloc_int(20)
+    let r3 = heap.alloc_array([r1, r2])
+    let r4 = heap.alloc_array([r3])
+    heap.add_root(r4)
+    heap.collect()
+    assert(heap.get(r1).is_some())  // transitively reachable
+    assert(heap.get(r2).is_some())
+    assert(heap.get(r3).is_some())
+    assert(heap.get(r4).is_some())
+    print("Transitive ✓")
+
+    // Stats
+    let (count, bytes, gc_count, freed_total) = heap.stats()
+    assert(count > 0)
+    assert(bytes > 0)
+    assert(gc_count > 0)
+    assert(freed_total > 0)
+    print("Stats ✓")
+
+    // Object references
+    let obj = GcObject.new(99, ObjKind.Array([1, 2, 3]))
+    assert(obj.references() == [1, 2, 3])
+    let obj2 = GcObject.new(100, ObjKind.Int(5))
+    assert(obj2.references().is_empty())
+    print("References ✓")
+
+    // Size estimation
+    let small = GcObject.new(1, ObjKind.Int(0))
+    assert(small.size_bytes == 8)
+    let big = GcObject.new(2, ObjKind.Str("a long string here"))
+    assert(big.size_bytes > 24)
+    print("Size ✓")
+
+    print("GC mark-sweep complete ✓")
+}
