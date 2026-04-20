@@ -1,0 +1,220 @@
+
+// Symbol Resolver - Resolves symbols across compilation units
+// Handles symbol tables, relocations, and linking errors.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SymbolKind { Function, Variable, Constant, Type, Label, External }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Visibility { Local, Global, Weak, Hidden }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RelocType { Absolute, Relative, GotEntry, PltEntry }
+
+#[derive(Clone, Debug)]
+struct Symbol {
+    name: string,
+    kind: SymbolKind,
+    visibility: Visibility,
+    section: string,
+    offset: u64,
+    size: u64,
+    defined: bool,
+    unit: string,
+}
+
+impl Symbol {
+    fn new(name: &str, kind: SymbolKind, section: &str, offset: u64) -> Symbol {
+        Symbol {
+            name: name.into(), kind, visibility: Visibility.Global,
+            section: section.into(), offset, size: 0, defined: true, unit: "".into(),
+        }
+    }
+    fn external(name: &str, kind: SymbolKind) -> Symbol {
+        Symbol {
+            name: name.into(), kind, visibility: Visibility.Global,
+            section: "".into(), offset: 0, size: 0, defined: false, unit: "".into(),
+        }
+    }
+    fn with_visibility(mut self, v: Visibility) -> Symbol { self.visibility = v; self }
+    fn with_size(mut self, s: u64) -> Symbol { self.size = s; self }
+    fn with_unit(mut self, u: &str) -> Symbol { self.unit = u.into(); self }
+    fn is_global(self) -> bool { self.visibility == Visibility.Global }
+    fn is_weak(self) -> bool { self.visibility == Visibility.Weak }
+    fn is_defined(self) -> bool { self.defined }
+    fn is_function(self) -> bool { self.kind == SymbolKind.Function }
+}
+
+#[derive(Clone, Debug)]
+struct Relocation {
+    offset: u64,
+    symbol: string,
+    reloc_type: RelocType,
+    addend: i64,
+    section: string,
+}
+
+impl Relocation {
+    fn new(offset: u64, symbol: &str, reloc_type: RelocType, section: &str) -> Relocation {
+        Relocation { offset, symbol: symbol.into(), reloc_type, addend: 0, section: section.into() }
+    }
+    fn with_addend(mut self, a: i64) -> Relocation { self.addend = a; self }
+}
+
+#[derive(Clone, Debug)]
+struct LinkError {
+    message: string,
+    symbol: string,
+    units: [string],
+}
+
+struct SymbolResolver {
+    symbols: HashMap<string, [Symbol]>,
+    relocations: [Relocation],
+    resolved: HashMap<string, Symbol>,
+    errors: [LinkError],
+}
+
+impl SymbolResolver {
+    fn new() -> SymbolResolver {
+        SymbolResolver { symbols: HashMap.new(), relocations: [], resolved: HashMap.new(), errors: [] }
+    }
+
+    fn add_symbol(mut self, sym: Symbol) {
+        self.symbols.entry(sym.name.clone()).or_insert([]).push(sym)
+    }
+
+    fn add_relocation(mut self, reloc: Relocation) { self.relocations.push(reloc) }
+
+    fn resolve(mut self) {
+        for (name, syms) in &self.symbols {
+            let defined: [&Symbol] = syms.iter().filter(|s| s.is_defined()).collect()
+            let globals: [&Symbol] = defined.iter().filter(|s| s.is_global()).cloned().collect()
+            let weaks: [&Symbol] = defined.iter().filter(|s| s.is_weak()).cloned().collect()
+
+            if globals.len() > 1 {
+                self.errors.push(LinkError {
+                    message: format!("multiple definitions of '{}'", name),
+                    symbol: name.clone(),
+                    units: globals.iter().map(|s| s.unit.clone()).collect(),
+                })
+            } else if globals.len() == 1 {
+                self.resolved.insert(name.clone(), globals[0].clone())
+            } else if !weaks.is_empty() {
+                self.resolved.insert(name.clone(), weaks[0].clone())
+            } else if defined.len() == 1 {
+                self.resolved.insert(name.clone(), defined[0].clone())
+            }
+        }
+
+        // Check for unresolved references
+        let referenced: HashSet<string> = self.relocations.iter().map(|r| r.symbol.clone()).collect()
+        for name in &referenced {
+            if !self.resolved.contains_key(name) {
+                self.errors.push(LinkError {
+                    message: format!("undefined reference to '{}'", name),
+                    symbol: name.clone(), units: [],
+                })
+            }
+        }
+    }
+
+    fn is_resolved(self, name: &str) -> bool { self.resolved.contains_key(name) }
+    fn get_resolved(self, name: &str) -> Option<&Symbol> { self.resolved.get(name) }
+    fn error_count(self) -> usize { self.errors.len() }
+    fn has_errors(self) -> bool { !self.errors.is_empty() }
+    fn resolved_count(self) -> usize { self.resolved.len() }
+    fn symbol_count(self) -> usize { self.symbols.len() }
+    fn relocation_count(self) -> usize { self.relocations.len() }
+}
+
+fn main() {
+    // Symbol
+    let sym = Symbol.new("main", SymbolKind.Function, ".text", 0)
+        .with_size(64)
+        .with_unit("main.o")
+    assert(sym.is_global())
+    assert(sym.is_defined())
+    assert(sym.is_function())
+    assert(sym.size == 64)
+    print("Symbol ✓")
+
+    // External symbol
+    let ext = Symbol.external("printf", SymbolKind.Function)
+    assert(!ext.is_defined())
+    assert(ext.is_global())
+    print("External ✓")
+
+    // Weak symbol
+    let weak = Symbol.new("default_handler", SymbolKind.Function, ".text", 100)
+        .with_visibility(Visibility.Weak)
+    assert(weak.is_weak())
+    assert(!weak.is_global())
+    print("Weak ✓")
+
+    // Relocation
+    let reloc = Relocation.new(0x10, "printf", RelocType.PltEntry, ".text").with_addend(-4)
+    assert(reloc.symbol == "printf")
+    assert(reloc.addend == -4)
+    print("Relocation ✓")
+
+    // Basic resolution
+    let mut resolver = SymbolResolver.new()
+    resolver.add_symbol(Symbol.new("main", SymbolKind.Function, ".text", 0).with_unit("main.o"))
+    resolver.add_symbol(Symbol.new("helper", SymbolKind.Function, ".text", 64).with_unit("util.o"))
+    resolver.add_relocation(Relocation.new(0x20, "helper", RelocType.Relative, ".text"))
+    resolver.resolve()
+    assert(!resolver.has_errors())
+    assert(resolver.is_resolved("main"))
+    assert(resolver.is_resolved("helper"))
+    assert(resolver.resolved_count() == 2)
+    print("Basic resolve ✓")
+
+    // Multiple definition error
+    let mut resolver2 = SymbolResolver.new()
+    resolver2.add_symbol(Symbol.new("foo", SymbolKind.Function, ".text", 0).with_unit("a.o"))
+    resolver2.add_symbol(Symbol.new("foo", SymbolKind.Function, ".text", 0).with_unit("b.o"))
+    resolver2.resolve()
+    assert(resolver2.has_errors())
+    assert(resolver2.errors[0].message.contains("multiple definitions"))
+    print("Multi def ✓")
+
+    // Undefined reference
+    let mut resolver3 = SymbolResolver.new()
+    resolver3.add_relocation(Relocation.new(0, "missing_fn", RelocType.Relative, ".text"))
+    resolver3.resolve()
+    assert(resolver3.has_errors())
+    assert(resolver3.errors[0].message.contains("undefined reference"))
+    print("Undef ref ✓")
+
+    // Weak resolution
+    let mut resolver4 = SymbolResolver.new()
+    resolver4.add_symbol(Symbol.new("handler", SymbolKind.Function, ".text", 0)
+        .with_visibility(Visibility.Weak).with_unit("default.o"))
+    resolver4.add_relocation(Relocation.new(0x10, "handler", RelocType.Relative, ".text"))
+    resolver4.resolve()
+    assert(!resolver4.has_errors())
+    assert(resolver4.is_resolved("handler"))
+    print("Weak resolve ✓")
+
+    // Global overrides weak
+    let mut resolver5 = SymbolResolver.new()
+    resolver5.add_symbol(Symbol.new("init", SymbolKind.Function, ".text", 0)
+        .with_visibility(Visibility.Weak).with_unit("default.o"))
+    resolver5.add_symbol(Symbol.new("init", SymbolKind.Function, ".text", 100)
+        .with_unit("custom.o"))
+    resolver5.resolve()
+    assert(!resolver5.has_errors())
+    let resolved = resolver5.get_resolved("init").unwrap()
+    assert(resolved.offset == 100)  // global wins
+    print("Global > weak ✓")
+
+    // Counts
+    assert(resolver5.symbol_count() == 1)
+    assert(resolver5.relocation_count() == 0)
+    print("Counts ✓")
+
+    print("Symbol resolver complete ✓")
+}
