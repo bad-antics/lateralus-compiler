@@ -1,297 +1,322 @@
+
 // Compiler Pass - Loop Unrolling
-// Unrolls loops with known trip counts to reduce branch overhead.
+// Reduces loop overhead by replicating the loop body.
 
 use std.collections.HashMap
 
-#[derive(Clone, Debug)]
-enum Expr {
-    Const(i64),
-    Var(string),
-    BinOp(string, Box<Expr>, Box<Expr>),
-}
+type VarId = usize
+type BlockId = usize
 
-#[derive(Clone, Debug)]
-enum Statement {
-    Assign(string, Expr),
-    Loop(LoopInfo, [Statement]),
-    If(Expr, [Statement], [Statement]),
-    Call(string, [Expr]),
-    Return(Expr),
+#[derive(Clone, Debug, PartialEq)]
+enum Instruction {
+    Const(VarId, i64),
+    BinOp(VarId, string, VarId, VarId),
+    Copy(VarId, VarId),
+    Load(VarId, VarId),
+    Store(VarId, VarId),
+    Branch(VarId, BlockId, BlockId),
+    Jump(BlockId),
+    Return(Option<VarId>),
+    Phi(VarId, [(BlockId, VarId)]),
+    Call(VarId, string, [VarId]),
+    Nop,
 }
 
 #[derive(Clone, Debug)]
 struct LoopInfo {
-    induction_var: string,
-    start: i64,
-    end: i64,
+    header: BlockId,
+    latch: BlockId,           // back-edge source
+    exit: BlockId,
+    induction_var: VarId,
+    init_value: i64,
     step: i64,
-    is_inclusive: bool,
+    bound: i64,
+    compare_op: string,       // "<", "<=", ">", ">="
+    body_blocks: [BlockId],
+    body_instructions: [Instruction],
 }
 
 impl LoopInfo {
-    fn trip_count(self) -> Option<u64> {
-        if self.step == 0 { return none }
-        let range = if self.is_inclusive {
-            self.end - self.start + self.step.signum()
-        } else {
-            self.end - self.start
+    fn trip_count(self) -> Option<usize> {
+        match self.compare_op.as_str() {
+            "<" => {
+                if self.step > 0 && self.bound > self.init_value {
+                    some(((self.bound - self.init_value + self.step - 1) / self.step) as usize)
+                } else { none }
+            },
+            "<=" => {
+                if self.step > 0 && self.bound >= self.init_value {
+                    some(((self.bound - self.init_value) / self.step + 1) as usize)
+                } else { none }
+            },
+            ">" => {
+                if self.step < 0 && self.init_value > self.bound {
+                    some(((self.init_value - self.bound - self.step - 1) / (-self.step)) as usize)
+                } else { none }
+            },
+            _ => none,
         }
-        if (range > 0 && self.step < 0) || (range < 0 && self.step > 0) {
-            return some(0)
-        }
-        some((range / self.step) as u64)
     }
+
+    fn is_small_body(self) -> bool { self.body_instructions.len() <= 20 }
 }
 
+#[derive(Clone, Debug)]
 struct UnrollConfig {
-    max_trip_count: u64,
-    full_unroll_threshold: u64,
-    partial_unroll_factor: u64,
-    enable_partial: bool,
+    max_unroll_factor: usize,
+    max_trip_count_for_full: usize,
+    min_trip_count: usize,
+    max_body_size: usize,
 }
 
 impl UnrollConfig {
     fn default() -> UnrollConfig {
         UnrollConfig {
-            max_trip_count: 1024,
-            full_unroll_threshold: 16,
-            partial_unroll_factor: 4,
-            enable_partial: true,
+            max_unroll_factor: 8,
+            max_trip_count_for_full: 16,
+            min_trip_count: 2,
+            max_body_size: 20,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum UnrollStrategy {
+    Full,                // Completely unroll (remove loop)
+    Partial(usize),      // Unroll by factor
+    None,                // Don't unroll
+}
+
+#[derive(Clone, Debug, Default)]
+struct UnrollStats {
+    loops_analyzed: usize,
+    fully_unrolled: usize,
+    partially_unrolled: usize,
+    skipped: usize,
+    instructions_before: usize,
+    instructions_after: usize,
 }
 
 struct LoopUnroller {
     config: UnrollConfig,
-    fully_unrolled: usize,
-    partially_unrolled: usize,
-    skipped: usize,
+    stats: UnrollStats,
 }
 
 impl LoopUnroller {
-    fn new(config: UnrollConfig) -> LoopUnroller {
-        LoopUnroller { config, fully_unrolled: 0, partially_unrolled: 0, skipped: 0 }
+    fn new() -> LoopUnroller { LoopUnroller.with_config(UnrollConfig.default()) }
+
+    fn with_config(config: UnrollConfig) -> LoopUnroller {
+        LoopUnroller { config, stats: UnrollStats.default() }
     }
 
-    fn unroll(mut self, stmts: &[Statement]) -> [Statement] {
-        let mut result: [Statement] = []
-        for stmt in stmts {
-            match stmt {
-                Statement.Loop(info, body) => {
-                    let unrolled = self.unroll_loop(info, body)
-                    result.extend(unrolled)
-                },
-                Statement.If(cond, then_body, else_body) => {
-                    let t = self.unroll(then_body)
-                    let e = self.unroll(else_body)
-                    result.push(Statement.If(cond.clone(), t, e))
-                },
-                other => result.push(other.clone()),
-            }
+    fn choose_strategy(self, loop_info: &LoopInfo) -> UnrollStrategy {
+        self.stats.loops_analyzed += 1
+
+        // Check body size
+        if loop_info.body_instructions.len() > self.config.max_body_size {
+            self.stats.skipped += 1
+            return UnrollStrategy.None
         }
-        result
-    }
 
-    fn unroll_loop(mut self, info: &LoopInfo, body: &[Statement]) -> [Statement] {
-        let trip = match info.trip_count() {
+        // Check trip count
+        let trip = match loop_info.trip_count() {
             some(t) => t,
-            none => { self.skipped += 1; return vec![Statement.Loop(info.clone(), body.to_vec())] },
+            none => { self.stats.skipped += 1; return UnrollStrategy.None },
         }
 
-        if trip == 0 {
-            return vec![] // Dead loop
+        if trip < self.config.min_trip_count {
+            self.stats.skipped += 1
+            return UnrollStrategy.None
         }
 
-        // Full unroll for small loops
-        if trip <= self.config.full_unroll_threshold {
-            return self.full_unroll(info, body, trip)
+        // Full unroll for small trip counts
+        if trip <= self.config.max_trip_count_for_full {
+            return UnrollStrategy.Full
         }
 
-        // Partial unroll
-        if self.config.enable_partial && trip <= self.config.max_trip_count {
-            return self.partial_unroll(info, body, trip)
-        }
-
-        self.skipped += 1
-        vec![Statement.Loop(info.clone(), body.to_vec())]
+        // Partial unroll: choose factor that divides trip count
+        let factor = self.best_factor(trip)
+        if factor > 1 { UnrollStrategy.Partial(factor) }
+        else { self.stats.skipped += 1; UnrollStrategy.None }
     }
 
-    fn full_unroll(mut self, info: &LoopInfo, body: &[Statement], trip: u64) -> [Statement] {
-        let mut result: [Statement] = []
-        let mut val = info.start
-
-        for _ in 0..trip {
-            // Substitute induction variable
-            for stmt in body {
-                result.push(self.substitute(stmt, &info.induction_var, val))
+    fn best_factor(self, trip_count: usize) -> usize {
+        let mut best = 1
+        for f in (2..=self.config.max_unroll_factor).rev() {
+            if trip_count % f == 0 {
+                best = f
+                break
             }
-            val += info.step
+        }
+        best
+    }
+
+    fn unroll_full(mut self, loop_info: &LoopInfo) -> [Instruction] {
+        let trip = loop_info.trip_count().unwrap()
+        let mut result: [Instruction] = vec![]
+
+        self.stats.instructions_before += loop_info.body_instructions.len()
+
+        for iteration in 0..trip {
+            let iv_value = loop_info.init_value + (iteration as i64) * loop_info.step
+            // Substitute induction variable with constant
+            for inst in &loop_info.body_instructions {
+                result.push(self.substitute_iv(inst, loop_info.induction_var, iv_value, iteration))
+            }
         }
 
-        self.fully_unrolled += 1
+        self.stats.instructions_after += result.len()
+        self.stats.fully_unrolled += 1
         result
     }
 
-    fn partial_unroll(mut self, info: &LoopInfo, body: &[Statement], trip: u64) -> [Statement] {
-        let factor = self.config.partial_unroll_factor
-        let main_trips = trip / factor
-        let remainder = trip % factor
+    fn unroll_partial(mut self, loop_info: &LoopInfo, factor: usize) -> [Instruction] {
+        let mut result: [Instruction] = vec![]
 
-        let mut unrolled_body: [Statement] = []
-        for _ in 0..factor {
-            unrolled_body.extend(body.iter().cloned())
-        }
+        self.stats.instructions_before += loop_info.body_instructions.len()
 
-        let mut new_info = info.clone()
-        new_info.step = info.step * factor as i64
-        new_info.end = info.start + (main_trips * factor) as i64 * info.step
-
-        let mut result = vec![Statement.Loop(new_info, unrolled_body)]
-
-        // Remainder loop
-        if remainder > 0 {
-            let rem_info = LoopInfo {
-                induction_var: info.induction_var.clone(),
-                start: info.start + (main_trips * factor) as i64 * info.step,
-                end: info.end,
-                step: info.step,
-                is_inclusive: info.is_inclusive,
+        // Replicate body `factor` times with adjusted IV
+        for copy in 0..factor {
+            for inst in &loop_info.body_instructions {
+                result.push(self.rename_vars(inst, copy))
             }
-            result.push(Statement.Loop(rem_info, body.to_vec()))
         }
 
-        self.partially_unrolled += 1
+        // Adjust loop step
+        let new_step = loop_info.step * (factor as i64)
+        result.push(Instruction.Const(loop_info.induction_var + 1000, new_step))
+
+        self.stats.instructions_after += result.len()
+        self.stats.partially_unrolled += 1
         result
     }
 
-    fn substitute(self, stmt: &Statement, var: &str, value: i64) -> Statement {
-        match stmt {
-            Statement.Assign(dest, expr) => {
-                Statement.Assign(dest.clone(), self.substitute_expr(expr, var, value))
+    fn substitute_iv(self, inst: &Instruction, iv: VarId, value: i64, iter: usize) -> Instruction {
+        match inst {
+            Instruction.Copy(dest, src) if *src == iv => {
+                Instruction.Const(*dest + iter * 100, value)
             },
-            Statement.Call(name, args) => {
-                let new_args = args.iter().map(|e| self.substitute_expr(e, var, value)).collect()
-                Statement.Call(name.clone(), new_args)
+            Instruction.BinOp(dest, op, a, b) => {
+                let new_a = if *a == iv { *a + iter * 100 } else { *a }
+                let new_b = if *b == iv { *b + iter * 100 } else { *b }
+                Instruction.BinOp(*dest + iter * 100, op.clone(), new_a, new_b)
             },
-            Statement.Return(expr) => {
-                Statement.Return(self.substitute_expr(expr, var, value))
-            },
-            other => other.clone(),
+            _ => inst.clone(),
         }
     }
 
-    fn substitute_expr(self, expr: &Expr, var: &str, value: i64) -> Expr {
-        match expr {
-            Expr.Var(name) if name == var => Expr.Const(value),
-            Expr.BinOp(op, lhs, rhs) => {
-                Expr.BinOp(op.clone(),
-                    Box.new(self.substitute_expr(lhs, var, value)),
-                    Box.new(self.substitute_expr(rhs, var, value)))
+    fn rename_vars(self, inst: &Instruction, copy: usize) -> Instruction {
+        let offset = copy * 100
+        match inst {
+            Instruction.Const(d, v) => Instruction.Const(*d + offset, *v),
+            Instruction.BinOp(d, op, a, b) => {
+                Instruction.BinOp(*d + offset, op.clone(), *a + offset, *b + offset)
             },
-            other => other.clone(),
+            Instruction.Copy(d, s) => Instruction.Copy(*d + offset, *s + offset),
+            _ => inst.clone(),
         }
     }
 
-    fn stats(self) -> (usize, usize, usize) {
-        (self.fully_unrolled, self.partially_unrolled, self.skipped)
-    }
+    fn stats(self) -> &UnrollStats { &self.stats }
 }
 
 fn main() {
-    // Trip count
-    let info1 = LoopInfo { induction_var: "i".to_string(), start: 0, end: 10, step: 1, is_inclusive: false }
-    assert(info1.trip_count().unwrap() == 10)
+    // Trip count calculation
+    let loop1 = LoopInfo {
+        header: 0, latch: 1, exit: 2,
+        induction_var: 1, init_value: 0, step: 1, bound: 10,
+        compare_op: "<".into(),
+        body_blocks: vec![0, 1],
+        body_instructions: vec![
+            Instruction.BinOp(2, "+".into(), 3, 1),
+        ],
+    }
+    assert(loop1.trip_count() == some(10))
+    print("Trip count < ✓")
 
-    let info2 = LoopInfo { induction_var: "i".to_string(), start: 0, end: 10, step: 2, is_inclusive: false }
-    assert(info2.trip_count().unwrap() == 5)
+    // Trip count <=
+    let loop2 = LoopInfo { compare_op: "<=".into(), bound: 10, ..loop1.clone() }
+    assert(loop2.trip_count() == some(11))
+    print("Trip count <= ✓")
 
-    let info3 = LoopInfo { induction_var: "i".to_string(), start: 1, end: 10, step: 1, is_inclusive: true }
-    assert(info3.trip_count().unwrap() == 10)
+    // Trip count with step
+    let loop3 = LoopInfo { step: 2, bound: 10, ..loop1.clone() }
+    assert(loop3.trip_count() == some(5))
+    print("Trip count step=2 ✓")
 
-    let info_zero = LoopInfo { induction_var: "i".to_string(), start: 10, end: 0, step: 1, is_inclusive: false }
-    assert(info_zero.trip_count().unwrap() == 0)
+    // Small body
+    assert(loop1.is_small_body())
+    print("Small body ✓")
 
-    let info_bad = LoopInfo { induction_var: "i".to_string(), start: 0, end: 10, step: 0, is_inclusive: false }
-    assert(info_bad.trip_count().is_none())
-    print("Trip count ✓")
+    // Strategy: full unroll for small loop
+    let unroller = LoopUnroller.new()
+    let strategy = unroller.choose_strategy(&loop1)
+    assert(strategy == UnrollStrategy.Full)
+    print("Strategy full ✓")
 
-    // Full unroll (trip=4)
-    let config = UnrollConfig.default()
-    let mut unroller = LoopUnroller.new(config)
+    // Strategy: partial for large trip count
+    let loop4 = LoopInfo { bound: 100, ..loop1.clone() }
+    let strategy2 = unroller.choose_strategy(&loop4)
+    match strategy2 {
+        UnrollStrategy.Partial(f) => assert(f > 1),
+        _ => panic("expected partial"),
+    }
+    print("Strategy partial ✓")
 
-    let loop_info = LoopInfo { induction_var: "i".to_string(), start: 0, end: 4, step: 1, is_inclusive: false }
-    let body = vec![
-        Statement.Assign("x".to_string(), Expr.BinOp("add".to_string(),
-            Box.new(Expr.Var("x".to_string())),
-            Box.new(Expr.Var("i".to_string())))),
-    ]
+    // Strategy: skip large body
+    let big_body: [Instruction] = (0..25).map(|i| Instruction.Const(i, i as i64)).collect()
+    let loop5 = LoopInfo { body_instructions: big_body, ..loop1.clone() }
+    assert(unroller.choose_strategy(&loop5) == UnrollStrategy.None)
+    print("Skip large body ✓")
 
-    let result = unroller.unroll(&vec![Statement.Loop(loop_info, body)])
-    assert(result.len() == 4) // 4 unrolled iterations
+    // Full unroll
+    let mut u = LoopUnroller.new()
+    let small_loop = LoopInfo {
+        header: 0, latch: 1, exit: 2,
+        induction_var: 1, init_value: 0, step: 1, bound: 3,
+        compare_op: "<".into(),
+        body_blocks: vec![0],
+        body_instructions: vec![Instruction.Copy(10, 1)],
+    }
+    let unrolled = u.unroll_full(&small_loop)
+    assert(unrolled.len() == 3)  // 3 iterations
+    assert(u.stats().fully_unrolled == 1)
     print("Full unroll ✓")
 
-    // Check substitution
-    match &result[0] {
-        Statement.Assign(_, Expr.BinOp(_, _, rhs)) => {
-            match rhs.as_ref() {
-                Expr.Const(0) => {},
-                _ => panic("Expected i=0"),
-            }
-        },
-        _ => panic("Expected assign"),
-    }
-    match &result[2] {
-        Statement.Assign(_, Expr.BinOp(_, _, rhs)) => {
-            match rhs.as_ref() {
-                Expr.Const(2) => {},
-                _ => panic("Expected i=2"),
-            }
-        },
-        _ => panic("Expected assign"),
-    }
-    print("Substitution ✓")
-
-    // Partial unroll (trip=100)
-    let config2 = UnrollConfig.default()
-    let mut unroller2 = LoopUnroller.new(config2)
-
-    let big_loop = LoopInfo { induction_var: "j".to_string(), start: 0, end: 100, step: 1, is_inclusive: false }
-    let body2 = vec![Statement.Call("process".to_string(), vec![Expr.Var("j".to_string())])]
-
-    let result2 = unroller2.unroll(&vec![Statement.Loop(big_loop, body2)])
-    assert(result2.len() >= 1) // At least the main loop
+    // Partial unroll
+    let mut u2 = LoopUnroller.new()
+    let body = vec![Instruction.Const(10, 1)]
+    let result = u2.unroll_partial(&LoopInfo {
+        body_instructions: body, ..loop1.clone()
+    }, 4)
+    assert(result.len() > 4)  // 4 copies + step adjustment
+    assert(u2.stats().partially_unrolled == 1)
     print("Partial unroll ✓")
 
-    // Dead loop removal
-    let dead_loop = LoopInfo { induction_var: "k".to_string(), start: 10, end: 0, step: 1, is_inclusive: false }
-    let body3 = vec![Statement.Call("noop".to_string(), vec![])]
-    let result3 = unroller2.unroll(&vec![Statement.Loop(dead_loop, body3)])
-    assert(result3.is_empty())
-    print("Dead loop removal ✓")
-
-    // Stats
-    let (full, partial, skipped) = unroller.stats()
-    assert(full >= 1)
-    print("Stats ✓")
+    // Best factor
+    let u3 = LoopUnroller.new()
+    assert(u3.best_factor(16) == 8)
+    assert(u3.best_factor(12) == 6)
+    assert(u3.best_factor(7) == 7)
+    assert(u3.best_factor(13) == 1)  // prime, no good factor
+    print("Best factor ✓")
 
     // Config
     let cfg = UnrollConfig.default()
-    assert(cfg.full_unroll_threshold == 16)
-    assert(cfg.partial_unroll_factor == 4)
-    assert(cfg.enable_partial)
+    assert(cfg.max_unroll_factor == 8)
+    assert(cfg.max_trip_count_for_full == 16)
     print("Config ✓")
 
-    // Expr substitution
-    let expr = Expr.BinOp("mul".to_string(),
-        Box.new(Expr.Var("i".to_string())),
-        Box.new(Expr.Const(2)))
-    let u = LoopUnroller.new(UnrollConfig.default())
-    let subst = u.substitute_expr(&expr, "i", 5)
-    match subst {
-        Expr.BinOp(_, lhs, _) => match *lhs { Expr.Const(5) => {}, _ => panic("bad") },
-        _ => panic("bad"),
-    }
-    print("Expr substitution ✓")
+    // Stats
+    let s = UnrollStats.default()
+    assert(s.loops_analyzed == 0)
+    assert(s.fully_unrolled == 0)
+    print("Stats ✓")
+
+    // Unknown trip count
+    let bad_loop = LoopInfo { step: -1, compare_op: "<".into(), ..loop1.clone() }
+    assert(bad_loop.trip_count().is_none())
+    print("Unknown trip ✓")
 
     print("Loop Unrolling complete ✓")
 }
