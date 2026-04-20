@@ -1,35 +1,231 @@
-// Liveness Analysis
-module compiler.analysis.liveness
 
-pub struct LivenessPass {
-    name: str
-    errors: list
-    warnings: list
+// Liveness Analysis - Determines which variables are live at each program point
+// Computes live-in and live-out sets using backward dataflow analysis.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    id: u32,
+    instructions: [Inst],
+    predecessors: [u32],
+    successors: [u32],
 }
 
-impl LivenessPass {
-    pub fn new() -> LivenessPass {
-        return LivenessPass { name: "Liveness Analysis", errors: [], warnings: [] }
+impl BasicBlock {
+    fn new(id: u32) -> BasicBlock {
+        BasicBlock { id, instructions: [], predecessors: [], successors: [] }
     }
-    pub fn run(self, input: any) -> any {
-        return input
+    fn add_inst(mut self, inst: Inst) { self.instructions.push(inst) }
+    fn add_successor(mut self, id: u32) { self.successors.push(id) }
+    fn add_predecessor(mut self, id: u32) { self.predecessors.push(id) }
+    fn inst_count(self) -> usize { self.instructions.len() }
+}
+
+#[derive(Clone, Debug)]
+struct Inst {
+    id: u32,
+    defs: HashSet<string>,  // variables defined
+    uses: HashSet<string>,  // variables used
+    text: string,
+}
+
+impl Inst {
+    fn new(id: u32, text: &str) -> Inst {
+        Inst { id, defs: HashSet.new(), uses: HashSet.new(), text: text.into() }
     }
-    pub fn add_error(self, msg: str, line: int, col: int) {
-        self.errors = push(self.errors, {"msg": msg, "line": line, "col": col})
+    fn def(mut self, var: &str) -> Inst { self.defs.insert(var.into()); self }
+    fn use_var(mut self, var: &str) -> Inst { self.uses.insert(var.into()); self }
+}
+
+#[derive(Clone, Debug)]
+struct LivenessResult {
+    live_in: HashMap<u32, HashSet<string>>,
+    live_out: HashMap<u32, HashSet<string>>,
+    gen_sets: HashMap<u32, HashSet<string>>,
+    kill_sets: HashMap<u32, HashSet<string>>,
+    iterations: u32,
+}
+
+impl LivenessResult {
+    fn new() -> LivenessResult {
+        LivenessResult {
+            live_in: HashMap.new(), live_out: HashMap.new(),
+            gen_sets: HashMap.new(), kill_sets: HashMap.new(), iterations: 0,
+        }
     }
-    pub fn add_warning(self, msg: str, line: int) {
-        self.warnings = push(self.warnings, {"msg": msg, "line": line})
+
+    fn is_live_in(self, block_id: u32, var: &str) -> bool {
+        self.live_in.get(&block_id).map_or(false, |s| s.contains(&var.to_string()))
     }
-    pub fn ok(self) -> bool { return len(self.errors) == 0 }
-    pub fn report(self) -> str {
-        let mut s = self.name + ": "
-        if self.ok() { s += "OK" } else { s += len(self.errors) as str + " error(s)" }
-        return s
+
+    fn is_live_out(self, block_id: u32, var: &str) -> bool {
+        self.live_out.get(&block_id).map_or(false, |s| s.contains(&var.to_string()))
     }
+
+    fn live_in_count(self, block_id: u32) -> usize {
+        self.live_in.get(&block_id).map_or(0, |s| s.len())
+    }
+
+    fn live_out_count(self, block_id: u32) -> usize {
+        self.live_out.get(&block_id).map_or(0, |s| s.len())
+    }
+}
+
+fn compute_gen_kill(block: &BasicBlock) -> (HashSet<string>, HashSet<string>) {
+    let mut gen = HashSet.new()
+    let mut kill = HashSet.new()
+    // Process instructions in reverse for gen/kill
+    for inst in block.instructions.iter().rev() {
+        // Kill: variables defined
+        for d in &inst.defs { kill.insert(d.clone()); gen.remove(d) }
+        // Gen: variables used
+        for u in &inst.uses { gen.insert(u.clone()) }
+    }
+    (gen, kill)
+}
+
+fn analyze_liveness(blocks: &[BasicBlock]) -> LivenessResult {
+    let mut result = LivenessResult.new()
+
+    // Compute gen/kill for each block
+    for block in blocks {
+        let (gen, kill) = compute_gen_kill(block)
+        result.gen_sets.insert(block.id, gen)
+        result.kill_sets.insert(block.id, kill)
+        result.live_in.insert(block.id, HashSet.new())
+        result.live_out.insert(block.id, HashSet.new())
+    }
+
+    // Fixed-point iteration (backward)
+    let mut changed = true
+    while changed {
+        changed = false
+        result.iterations += 1
+        for block in blocks.iter().rev() {
+            // out[B] = union of in[S] for all successors S
+            let mut new_out = HashSet.new()
+            for succ in &block.successors {
+                if let Some(succ_in) = result.live_in.get(succ) {
+                    for v in succ_in { new_out.insert(v.clone()); }
+                }
+            }
+
+            // in[B] = gen[B] union (out[B] - kill[B])
+            let gen = result.gen_sets.get(&block.id).unwrap()
+            let kill = result.kill_sets.get(&block.id).unwrap()
+            let mut new_in = gen.clone()
+            for v in &new_out {
+                if !kill.contains(v) { new_in.insert(v.clone()); }
+            }
+
+            let old_in = result.live_in.get(&block.id).unwrap()
+            let old_out = result.live_out.get(&block.id).unwrap()
+            if new_in != *old_in || new_out != *old_out {
+                changed = true
+                result.live_in.insert(block.id, new_in)
+                result.live_out.insert(block.id, new_out)
+            }
+        }
+    }
+    result
 }
 
 fn main() {
-    let pass = LivenessPass.new()
-    let result = pass.run("fn main() { println(\"hello\") }")
-    println(pass.report())
+    // Inst builder
+    let inst = Inst.new(0, "x = y + z").def("x").use_var("y").use_var("z")
+    assert(inst.defs.contains(&"x".into()))
+    assert(inst.uses.contains(&"y".into()))
+    assert(inst.uses.contains(&"z".into()))
+    print("Inst ✓")
+
+    // BasicBlock
+    let mut bb = BasicBlock.new(0)
+    bb.add_inst(Inst.new(0, "a = 1").def("a"))
+    bb.add_inst(Inst.new(1, "b = a + 1").def("b").use_var("a"))
+    assert(bb.inst_count() == 2)
+    print("BasicBlock ✓")
+
+    // Gen/Kill
+    let (gen, kill) = compute_gen_kill(&bb)
+    assert(!gen.contains(&"a".into()))  // a is defined before use
+    assert(kill.contains(&"a".into()))
+    assert(kill.contains(&"b".into()))
+    print("Gen/Kill ✓")
+
+    // Simple linear: B0 -> B1
+    // B0: x = 1; y = 2
+    // B1: z = x + y; return z
+    let mut b0 = BasicBlock.new(0)
+    b0.add_inst(Inst.new(0, "x = 1").def("x"))
+    b0.add_inst(Inst.new(1, "y = 2").def("y"))
+    b0.add_successor(1)
+
+    let mut b1 = BasicBlock.new(1)
+    b1.add_inst(Inst.new(2, "z = x + y").def("z").use_var("x").use_var("y"))
+    b1.add_inst(Inst.new(3, "return z").use_var("z"))
+    b1.add_predecessor(0)
+
+    let result = analyze_liveness(&[b0, b1])
+
+    // x and y should be live-out of B0
+    assert(result.is_live_out(0, "x"))
+    assert(result.is_live_out(0, "y"))
+    // z should not be live-out of B0
+    assert(!result.is_live_out(0, "z"))
+    // x and y should be live-in of B1
+    assert(result.is_live_in(1, "x"))
+    assert(result.is_live_in(1, "y"))
+    print("Linear ✓")
+
+    // Diamond: B0 -> B1, B0 -> B2, B1 -> B3, B2 -> B3
+    let mut d0 = BasicBlock.new(0)
+    d0.add_inst(Inst.new(0, "x = input").def("x"))
+    d0.add_successor(1); d0.add_successor(2)
+
+    let mut d1 = BasicBlock.new(1)
+    d1.add_inst(Inst.new(1, "y = x + 1").def("y").use_var("x"))
+    d1.add_predecessor(0); d1.add_successor(3)
+
+    let mut d2 = BasicBlock.new(2)
+    d2.add_inst(Inst.new(2, "y = x * 2").def("y").use_var("x"))
+    d2.add_predecessor(0); d2.add_successor(3)
+
+    let mut d3 = BasicBlock.new(3)
+    d3.add_inst(Inst.new(3, "return y").use_var("y"))
+    d3.add_predecessor(1); d3.add_predecessor(2)
+
+    let dr = analyze_liveness(&[d0, d1, d2, d3])
+    assert(dr.is_live_out(0, "x"))  // x used in both branches
+    assert(dr.is_live_in(1, "x"))
+    assert(dr.is_live_in(2, "x"))
+    assert(dr.is_live_out(1, "y"))
+    assert(dr.is_live_in(3, "y"))
+    print("Diamond ✓")
+
+    // Iterations
+    assert(result.iterations >= 1)
+    assert(dr.iterations >= 1)
+    print("Iterations ✓")
+
+    // Counts
+    assert(result.live_out_count(0) == 2)  // x, y
+    assert(result.live_in_count(1) == 2)   // x, y
+    print("Counts ✓")
+
+    // Dead variable
+    let mut dead0 = BasicBlock.new(0)
+    dead0.add_inst(Inst.new(0, "a = 1").def("a"))
+    dead0.add_inst(Inst.new(1, "b = 2").def("b"))  // b never used
+    dead0.add_successor(1)
+    let mut dead1 = BasicBlock.new(1)
+    dead1.add_inst(Inst.new(2, "return a").use_var("a"))
+    dead1.add_predecessor(0)
+
+    let dead_result = analyze_liveness(&[dead0, dead1])
+    assert(dead_result.is_live_out(0, "a"))
+    assert(!dead_result.is_live_out(0, "b"))  // b is dead
+    print("Dead var ✓")
+
+    print("Liveness analysis complete ✓")
 }
