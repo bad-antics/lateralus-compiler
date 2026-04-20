@@ -1,0 +1,98 @@
+// compiler/codegen/otel_emit.ltl
+//
+// OpenTelemetry span instrumentation codegen.
+//
+// Rewrites functions annotated with `#[traced]` so each entry/exit
+// emits an OTEL span via `std::otel`. Pipeline stages are instrumented
+// individually so flame-graphs show stage-level latency.
+//
+// Batch 76 / gap-fill: observability.
+
+import std::ast
+import std::compiler::{Pass, Module}
+import std::collections::Map
+
+pub struct OtelEmitter {
+    service:  String,
+    resource: Map<String, String>,
+    sampler:  Sampler,
+}
+
+pub enum Sampler {
+    Always,
+    Never,
+    Ratio(Float),
+    ParentBased,
+}
+
+pub fn new(service: String) -> OtelEmitter {
+    OtelEmitter {
+        service:  service,
+        resource: Map::empty() |> set("sdk.name", "lateralus-otel"),
+        sampler:  Sampler::ParentBased,
+    }
+}
+
+/// Walk the module and rewrite `#[traced]` functions.
+pub fn run(e: OtelEmitter, module: &mut Module) {
+    for fn_decl in module.items |> filter(|i| i.has_attr("traced")) {
+        let span_name = fn_decl.attrs
+            |> find(|a| a.name == "traced")
+            |> and_then(|a| a.get_string("name"))
+            |> unwrap_or(fn_decl.name)
+
+        fn_decl.body = wrap_with_span(span_name, fn_decl.body, e.sampler)
+    }
+
+    // Instrument pipeline stages when `#[traced_pipeline]` is on a let-binding.
+    for stmt in module.iter_pipeline_lets() |> filter(|s| s.has_attr("traced_pipeline")) {
+        stmt.expr = instrument_pipeline_stages(stmt.expr, e.service)
+    }
+}
+
+fn wrap_with_span(name: String, body: ast::Block, sampler: Sampler) -> ast::Block {
+    ast::Block::new()
+        |> add_stmt(ast::let_("__span",
+            ast::call("std::otel::start_span", [
+                ast::str(name),
+                sampler_expr(sampler),
+            ])))
+        |> add_stmt(ast::try_recover(
+            body,
+            recover_records_error()))
+        |> add_stmt(ast::call_stmt("std::otel::end_span", [ast::ident("__span")]))
+}
+
+fn sampler_expr(s: Sampler) -> ast::Expr {
+    match s {
+        Sampler::Always       => ast::call("std::otel::Sampler::always", []),
+        Sampler::Never        => ast::call("std::otel::Sampler::never", []),
+        Sampler::Ratio(r)     => ast::call("std::otel::Sampler::ratio", [ast::float(r)]),
+        Sampler::ParentBased  => ast::call("std::otel::Sampler::parent_based", []),
+    }
+}
+
+fn recover_records_error() -> ast::Block {
+    // recover err { std::otel::set_status(__span, err); raise err }
+    ast::Block::new()
+        |> add_stmt(ast::call_stmt("std::otel::set_status", [
+            ast::ident("__span"),
+            ast::ident("err"),
+        ]))
+        |> add_stmt(ast::raise(ast::ident("err")))
+}
+
+/// Rewrite `x |> f() |> g()` to emit a span per stage.
+fn instrument_pipeline_stages(expr: ast::Expr, service: String) -> ast::Expr {
+    match expr {
+        ast::Pipe(lhs, stage) => {
+            let stage_name = "{service}::{stage.callee_name()}"
+            ast::call("std::otel::stage", [
+                ast::str(stage_name),
+                instrument_pipeline_stages(*lhs, service),
+                ast::lambda_unary("__x", ast::pipe(ast::ident("__x"), *stage)),
+            ])
+        },
+        other => other,
+    }
+}
