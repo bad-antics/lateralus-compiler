@@ -1,0 +1,220 @@
+// compiler/macro/sexpr_expander.ltl
+//
+// Hygienic S-expression macro expander for Lateralus.
+//
+// Lateralus is not Lisp, but its macro surface compiles through a small
+// intermediate S-expression layer: `macro! name(pattern) => template`.
+// This pass performs pattern-matching on the input AST node's sexpr
+// serialization, binds fresh names for every template-introduced
+// identifier (hygiene), and splices the result back into the token tree.
+//
+// Batch 79 / compiler niche. First S-expression macro expander in the
+// ecosystem — complements the existing declarative `match! { }` macros
+// with a second, more expressive mechanism.
+
+import std::ast
+import std::collections::{Map, Set}
+import std::compiler::{Pass, Module, Diagnostic}
+
+pub enum Sexpr {
+    Atom(String),
+    Sym(String),            // variable: starts with `$`
+    Num(Int),
+    Str(String),
+    List([Sexpr]),
+}
+
+pub struct MacroDef {
+    name:     String,
+    pattern:  Sexpr,        // may contain $x and $rest... nodes
+    template: Sexpr,        // same variable universe as pattern
+    span:     ast::Span,
+}
+
+pub struct ExpanderCtx {
+    macros:    Map<String, MacroDef>,
+    gensym_n:  Int,
+    diags:     [Diagnostic],
+}
+
+/// Compiler entry: register all `macro!` items and rewrite every matching call.
+pub fn run(module: &mut Module) -> Result<(), [Diagnostic]> {
+    let mut ctx = ExpanderCtx {
+        macros: Map::empty(), gensym_n: 0, diags: [],
+    }
+    collect_macros(module, &mut ctx)
+    rewrite_calls(module, &mut ctx)
+    if ctx.diags |> any(|d| d.is_error()) { Err(ctx.diags) } else { Ok(()) }
+}
+
+fn collect_macros(m: &Module, ctx: &mut ExpanderCtx) {
+    for item in m.items |> filter(|i| i.is_macro_def()) {
+        let def = MacroDef {
+            name:     item.name,
+            pattern:  ast_to_sexpr(item.macro_pattern),
+            template: ast_to_sexpr(item.macro_template),
+            span:     item.span,
+        }
+        if ctx.macros |> contains_key(def.name) {
+            ctx.diags |> push(Diagnostic::error(
+                "macro `{def.name}` redefined", [def.span]))
+        }
+        ctx.macros |> set_mut(def.name, def)
+    }
+}
+
+fn rewrite_calls(m: &mut Module, ctx: &mut ExpanderCtx) {
+    m |> walk_exprs_mut(|e| {
+        match e {
+            ast::Expr::MacroCall { name, body, span } => {
+                match ctx.macros |> get(name) {
+                    Some(def) => {
+                        match expand(ctx, def, body) {
+                            Ok(new_ast) => { *e = new_ast },
+                            Err(msg)    => ctx.diags |> push(
+                                Diagnostic::error("macro `{name}`: {msg}", [span]))
+                        }
+                    },
+                    None => ctx.diags |> push(
+                        Diagnostic::error("unknown macro `{name}`", [span])),
+                }
+            },
+            _ => (),
+        }
+    })
+}
+
+// -- Pattern matching -------------------------------------------------------
+
+pub type Bindings = Map<String, Binding>
+
+pub enum Binding {
+    Single(Sexpr),            // $x  -> one Sexpr
+    Many([Sexpr]),            // $xs... -> zero-or-more Sexprs
+}
+
+pub fn match_pattern(pat: Sexpr, input: Sexpr) -> Result<Bindings, String> {
+    let mut b: Bindings = Map::empty()
+    match_rec(pat, input, &mut b)?
+    Ok(b)
+}
+
+fn match_rec(pat: Sexpr, inp: Sexpr, b: &mut Bindings) -> Result<(), String> {
+    match (pat, inp) {
+        (Sexpr::Sym(n), any) if n |> ends_with("...") => {
+            // variadic binder — only legal inside a List; handled there.
+            Err("`$...` may only appear inside a list")
+        },
+        (Sexpr::Sym(n), any) => {
+            bind_single(b, n, any)
+        },
+        (Sexpr::Atom(a), Sexpr::Atom(c)) if a == c => Ok(()),
+        (Sexpr::Num(a),  Sexpr::Num(c))  if a == c => Ok(()),
+        (Sexpr::Str(a),  Sexpr::Str(c))  if a == c => Ok(()),
+        (Sexpr::List(ps), Sexpr::List(is)) => match_list(ps, is, b),
+        _ => Err("pattern mismatch"),
+    }
+}
+
+fn match_list(ps: [Sexpr], is: [Sexpr], b: &mut Bindings) -> Result<(), String> {
+    // Scan for a single variadic at most.
+    let mut i = 0
+    let mut j = 0
+    while i < len(ps) {
+        let p = ps[i]
+        match p {
+            Sexpr::Sym(n) if n |> ends_with("...") => {
+                let remaining_fixed = len(ps) - i - 1
+                if len(is) - j < remaining_fixed {
+                    return Err("not enough input for variadic `{n}`")
+                }
+                let take = len(is) - j - remaining_fixed
+                let base = n |> trim_end("...")
+                b |> set_mut(base, Binding::Many(is[j..(j + take)]))
+                j = j + take
+                i = i + 1
+            },
+            _ => {
+                if j >= len(is) { return Err("pattern longer than input") }
+                match_rec(p, is[j], b)?
+                i = i + 1
+                j = j + 1
+            },
+        }
+    }
+    if j != len(is) { return Err("input longer than pattern") }
+    Ok(())
+}
+
+fn bind_single(b: &mut Bindings, name: String, v: Sexpr) -> Result<(), String> {
+    match b |> get(name) {
+        Some(Binding::Single(prev)) if prev == v => Ok(()),
+        Some(_) => Err("inconsistent binding for `{name}`"),
+        None => { b |> set_mut(name, Binding::Single(v)); Ok(()) },
+    }
+}
+
+// -- Template expansion with hygiene ----------------------------------------
+
+fn expand(ctx: &mut ExpanderCtx, def: MacroDef, input: ast::Expr) -> Result<ast::Expr, String> {
+    let input_s = ast_to_sexpr(input)
+    let bindings = match_pattern(def.pattern, input_s)?
+
+    // Hygiene pass: any *template-introduced* identifier gets a gensym
+    // suffix so that it cannot accidentally capture names at the call site.
+    let template_intro = collect_template_atoms(def.template)
+                         |> Set::diff(collect_pattern_vars(def.pattern))
+    let rename = template_intro
+                 |> Set::to_list()
+                 |> fold(Map::empty(), |acc, name| {
+                     ctx.gensym_n = ctx.gensym_n + 1
+                     acc |> set(name, "{name}__gensym{ctx.gensym_n}")
+                 })
+
+    let out_s = splice(def.template, bindings, rename)
+    Ok(sexpr_to_ast(out_s))
+}
+
+fn splice(t: Sexpr, b: Bindings, rename: Map<String, String>) -> Sexpr {
+    match t {
+        Sexpr::Sym(n) if n |> ends_with("...") => {
+            let base = n |> trim_end("...")
+            match b |> get(base) {
+                Some(Binding::Many(items)) => Sexpr::List(items),
+                _ => Sexpr::Sym(n),
+            }
+        },
+        Sexpr::Sym(n) => match b |> get(n) {
+            Some(Binding::Single(v)) => v,
+            Some(Binding::Many(_))   => Sexpr::Atom("<error:used variadic as single>"),
+            None                     => Sexpr::Sym(n),
+        },
+        Sexpr::Atom(a) => match rename |> get(a) {
+            Some(fresh) => Sexpr::Atom(fresh),
+            None        => Sexpr::Atom(a),
+        },
+        Sexpr::List(xs) => Sexpr::List(xs |> map(|x| splice(x, b, rename))),
+        other => other,
+    }
+}
+
+fn collect_pattern_vars(p: Sexpr) -> Set<String> {
+    match p {
+        Sexpr::Sym(n) => {
+            let base = if n |> ends_with("...") { n |> trim_end("...") } else { n }
+            Set::singleton(base)
+        },
+        Sexpr::List(xs) => xs |> fold(Set::empty(),
+                                      |acc, x| Set::union(acc, collect_pattern_vars(x))),
+        _ => Set::empty(),
+    }
+}
+
+fn collect_template_atoms(t: Sexpr) -> Set<String> {
+    match t {
+        Sexpr::Atom(a)   => Set::singleton(a),
+        Sexpr::List(xs)  => xs |> fold(Set::empty(),
+                                       |acc, x| Set::union(acc, collect_template_atoms(x))),
+        _ => Set::empty(),
+    }
+}
