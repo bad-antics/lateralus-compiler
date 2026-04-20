@@ -1,0 +1,389 @@
+// Compiler Pass - Instruction Scheduling
+// List scheduling with dependency DAG, latency modeling, and hazard detection.
+
+use std.collections.{HashMap, HashSet, BinaryHeap}
+use std.cmp.{Ordering}
+
+type InstrId = usize
+type RegId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+enum OpKind {
+    IntAlu,       // 1 cycle
+    IntMul,       // 3 cycles
+    IntDiv,       // 20 cycles
+    FpAlu,        // 4 cycles
+    FpMul,        // 5 cycles
+    FpDiv,        // 15 cycles
+    Load,         // 4 cycles (cache hit)
+    Store,        // 1 cycle (fire and forget)
+    Branch,       // 1 cycle
+    Call,         // 1 cycle + pipeline flush
+    Nop,          // 1 cycle
+}
+
+impl OpKind {
+    fn latency(self) -> usize {
+        match self {
+            OpKind.IntAlu => 1, OpKind.IntMul => 3, OpKind.IntDiv => 20,
+            OpKind.FpAlu => 4, OpKind.FpMul => 5, OpKind.FpDiv => 15,
+            OpKind.Load => 4, OpKind.Store => 1,
+            OpKind.Branch => 1, OpKind.Call => 1, OpKind.Nop => 1,
+        }
+    }
+
+    fn is_memory(self) -> bool {
+        matches!(self, OpKind.Load | OpKind.Store)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SchedInstr {
+    id: InstrId,
+    op: OpKind,
+    defs: [RegId],      // registers written
+    uses: [RegId],      // registers read
+    is_side_effect: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DepKind {
+    Data,       // true dependency (RAW)
+    Anti,       // anti-dependency (WAR)
+    Output,     // output dependency (WAW)
+    Memory,     // memory ordering
+    Control,    // control dependency
+}
+
+#[derive(Clone, Debug)]
+struct DepEdge {
+    from: InstrId,
+    to: InstrId,
+    kind: DepKind,
+    latency: usize,
+}
+
+struct DependencyDAG {
+    edges: [DepEdge],
+    successors: HashMap<InstrId, [DepEdge]>,
+    predecessors: HashMap<InstrId, [DepEdge]>,
+}
+
+impl DependencyDAG {
+    fn new() -> DependencyDAG {
+        DependencyDAG {
+            edges: [], successors: HashMap.new(), predecessors: HashMap.new(),
+        }
+    }
+
+    fn add_edge(mut self, edge: DepEdge) {
+        self.successors.entry(edge.from).or_insert([]).push(edge.clone())
+        self.predecessors.entry(edge.to).or_insert([]).push(edge.clone())
+        self.edges.push(edge)
+    }
+
+    fn pred_count(self, id: InstrId) -> usize {
+        self.predecessors.get(&id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    fn succs(self, id: InstrId) -> &[DepEdge] {
+        self.successors.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+fn build_dep_dag(instrs: &[SchedInstr]) -> DependencyDAG {
+    let mut dag = DependencyDAG.new()
+    let mut last_def: HashMap<RegId, InstrId> = HashMap.new()
+    let mut last_use: HashMap<RegId, [InstrId]> = HashMap.new()
+    let mut last_store: Option<InstrId> = none
+    let mut last_load: Option<InstrId> = none
+
+    for instr in instrs {
+        // RAW: read after write
+        for reg in &instr.uses {
+            if let some(&writer) = last_def.get(reg) {
+                let lat = instrs[writer].op.latency()
+                dag.add_edge(DepEdge {
+                    from: writer, to: instr.id,
+                    kind: DepKind.Data, latency: lat,
+                })
+            }
+        }
+
+        // WAR: write after read
+        for reg in &instr.defs {
+            if let some(readers) = last_use.get(reg) {
+                for &reader in readers {
+                    dag.add_edge(DepEdge {
+                        from: reader, to: instr.id,
+                        kind: DepKind.Anti, latency: 0,
+                    })
+                }
+            }
+        }
+
+        // WAW: write after write
+        for reg in &instr.defs {
+            if let some(&prev_writer) = last_def.get(reg) {
+                dag.add_edge(DepEdge {
+                    from: prev_writer, to: instr.id,
+                    kind: DepKind.Output, latency: 0,
+                })
+            }
+        }
+
+        // Memory dependencies
+        if instr.op == OpKind.Load {
+            if let some(store_id) = last_store {
+                dag.add_edge(DepEdge {
+                    from: store_id, to: instr.id,
+                    kind: DepKind.Memory, latency: 1,
+                })
+            }
+            last_load = some(instr.id)
+        }
+        if instr.op == OpKind.Store {
+            if let some(load_id) = last_load {
+                dag.add_edge(DepEdge {
+                    from: load_id, to: instr.id,
+                    kind: DepKind.Memory, latency: 0,
+                })
+            }
+            if let some(store_id) = last_store {
+                dag.add_edge(DepEdge {
+                    from: store_id, to: instr.id,
+                    kind: DepKind.Memory, latency: 0,
+                })
+            }
+            last_store = some(instr.id)
+        }
+
+        // Update tracking
+        for reg in &instr.defs { last_def.insert(*reg, instr.id); }
+        for reg in &instr.uses {
+            last_use.entry(*reg).or_insert([]).push(instr.id)
+        }
+    }
+    dag
+}
+
+#[derive(Clone, Debug)]
+struct ReadyEntry {
+    id: InstrId,
+    priority: i64,   // higher = schedule first
+}
+
+impl PartialEq for ReadyEntry {
+    fn eq(self, other: &ReadyEntry) -> bool { self.priority == other.priority }
+}
+impl Eq for ReadyEntry {}
+impl PartialOrd for ReadyEntry {
+    fn partial_cmp(self, other: &ReadyEntry) -> Option<Ordering> { some(self.cmp(other)) }
+}
+impl Ord for ReadyEntry {
+    fn cmp(self, other: &ReadyEntry) -> Ordering { self.priority.cmp(&other.priority) }
+}
+
+struct ListScheduler {
+    instrs: [SchedInstr],
+    dag: DependencyDAG,
+    heights: HashMap<InstrId, i64>,
+}
+
+impl ListScheduler {
+    fn new(instrs: [SchedInstr]) -> ListScheduler {
+        let dag = build_dep_dag(&instrs)
+        let mut sched = ListScheduler { instrs, dag, heights: HashMap.new() }
+        sched.compute_heights()
+        sched
+    }
+
+    fn compute_heights(mut self) {
+        // Reverse topological order, height = max(height(succ) + latency)
+        let ids: [InstrId] = self.instrs.iter().map(|i| i.id).collect()
+
+        // Simple iterative fixed-point
+        for id in &ids { self.heights.insert(*id, 0); }
+        let mut changed = true
+        while changed {
+            changed = false
+            for id in ids.iter().rev() {
+                let mut max_h: i64 = 0
+                for edge in self.dag.succs(*id) {
+                    let succ_h = *self.heights.get(&edge.to).unwrap_or(&0)
+                    let h = succ_h + edge.latency as i64
+                    if h > max_h { max_h = h }
+                }
+                let cur = *self.heights.get(id).unwrap_or(&0)
+                if max_h > cur {
+                    self.heights.insert(*id, max_h)
+                    changed = true
+                }
+            }
+        }
+    }
+
+    fn schedule(self) -> [InstrId] {
+        let n = self.instrs.len()
+        let mut in_degree: HashMap<InstrId, usize> = HashMap.new()
+        for i in &self.instrs {
+            in_degree.insert(i.id, self.dag.pred_count(i.id))
+        }
+
+        let mut ready = BinaryHeap.new()
+        for (id, deg) in &in_degree {
+            if *deg == 0 {
+                ready.push(ReadyEntry {
+                    id: *id,
+                    priority: *self.heights.get(id).unwrap_or(&0),
+                })
+            }
+        }
+
+        let mut order = []
+        let mut scheduled = HashSet.new()
+
+        while let some(entry) = ready.pop() {
+            if scheduled.contains(&entry.id) { continue }
+            order.push(entry.id)
+            scheduled.insert(entry.id)
+
+            for edge in self.dag.succs(entry.id) {
+                if let some(deg) = in_degree.get_mut(&edge.to) {
+                    *deg -= 1
+                    if *deg == 0 && !scheduled.contains(&edge.to) {
+                        ready.push(ReadyEntry {
+                            id: edge.to,
+                            priority: *self.heights.get(&edge.to).unwrap_or(&0),
+                        })
+                    }
+                }
+            }
+        }
+        order
+    }
+
+    fn estimated_cycles(self, order: &[InstrId]) -> usize {
+        if order.is_empty() { return 0 }
+        let mut cycle = 0
+        let mut ready_time: HashMap<InstrId, usize> = HashMap.new()
+
+        for &id in order {
+            let earliest = *ready_time.get(&id).unwrap_or(&0)
+            let start = cycle.max(earliest)
+            let lat = self.instrs.iter().find(|i| i.id == id).unwrap().op.latency()
+            cycle = start + 1
+
+            for edge in self.dag.succs(id) {
+                let finish = start + edge.latency
+                let cur = *ready_time.get(&edge.to).unwrap_or(&0)
+                if finish > cur { ready_time.insert(edge.to, finish); }
+            }
+        }
+        cycle
+    }
+}
+
+fn main() {
+    // OpKind latencies
+    assert(OpKind.IntAlu.latency() == 1)
+    assert(OpKind.IntMul.latency() == 3)
+    assert(OpKind.IntDiv.latency() == 20)
+    assert(OpKind.FpAlu.latency() == 4)
+    assert(OpKind.Load.latency() == 4)
+    assert(OpKind.Store.latency() == 1)
+    assert(OpKind.Load.is_memory())
+    assert(!OpKind.IntAlu.is_memory())
+    print("OpKind ✓")
+
+    // Simple chain: a = load; b = add a, 1; store b
+    let instrs = vec![
+        SchedInstr { id: 0, op: OpKind.Load, defs: vec![1], uses: vec![], is_side_effect: false },
+        SchedInstr { id: 1, op: OpKind.IntAlu, defs: vec![2], uses: vec![1], is_side_effect: false },
+        SchedInstr { id: 2, op: OpKind.Store, defs: vec![], uses: vec![2], is_side_effect: true },
+    ]
+    let sched = ListScheduler.new(instrs)
+    let order = sched.schedule()
+    assert(order.len() == 3)
+    // Must respect: 0 before 1 before 2
+    let pos0 = order.iter().position(|&x| x == 0).unwrap()
+    let pos1 = order.iter().position(|&x| x == 1).unwrap()
+    let pos2 = order.iter().position(|&x| x == 2).unwrap()
+    assert(pos0 < pos1)
+    assert(pos1 < pos2)
+    print("Chain scheduling ✓")
+
+    // Independent instructions can be reordered
+    let indep = vec![
+        SchedInstr { id: 0, op: OpKind.IntMul, defs: vec![1], uses: vec![10], is_side_effect: false },
+        SchedInstr { id: 1, op: OpKind.IntAlu, defs: vec![2], uses: vec![11], is_side_effect: false },
+        SchedInstr { id: 2, op: OpKind.FpAlu, defs: vec![3], uses: vec![12], is_side_effect: false },
+    ]
+    let sched2 = ListScheduler.new(indep)
+    let order2 = sched2.schedule()
+    assert(order2.len() == 3)
+    // All should appear (order may vary based on height)
+    assert(order2.contains(&0) && order2.contains(&1) && order2.contains(&2))
+    print("Independent scheduling ✓")
+
+    // Height computation: longest path from node to exit
+    // Load(4) -> Add(1) -> Store(1) = path of 4+1 = 5 from load
+    let heights = &sched.heights
+    assert(*heights.get(&0).unwrap() >= 4)  // load has high height
+    assert(*heights.get(&2).unwrap() == 0)  // store is exit
+    print("Heights ✓")
+
+    // Estimated cycles
+    let cycles = sched.estimated_cycles(&order)
+    assert(cycles >= 3)  // at least 3 instructions
+    print("Cycle estimation ✓")
+
+    // DepKind
+    assert(DepKind.Data != DepKind.Anti)
+    assert(DepKind.Output != DepKind.Memory)
+    print("DepKind ✓")
+
+    // DependencyDAG
+    let mut dag = DependencyDAG.new()
+    dag.add_edge(DepEdge { from: 0, to: 1, kind: DepKind.Data, latency: 4 })
+    assert(dag.pred_count(1) == 1)
+    assert(dag.pred_count(0) == 0)
+    assert(dag.succs(0).len() == 1)
+    assert(dag.succs(1).len() == 0)
+    print("DAG ✓")
+
+    // Memory ordering: store before load
+    let mem_instrs = vec![
+        SchedInstr { id: 0, op: OpKind.Store, defs: vec![], uses: vec![1], is_side_effect: true },
+        SchedInstr { id: 1, op: OpKind.Load, defs: vec![2], uses: vec![], is_side_effect: false },
+    ]
+    let mem_sched = ListScheduler.new(mem_instrs)
+    let mem_order = mem_sched.schedule()
+    assert(mem_order[0] == 0)  // store before load
+    print("Memory ordering ✓")
+
+    // Anti-dependency (WAR)
+    let war_instrs = vec![
+        SchedInstr { id: 0, op: OpKind.IntAlu, defs: vec![], uses: vec![5], is_side_effect: false },
+        SchedInstr { id: 1, op: OpKind.IntAlu, defs: vec![5], uses: vec![], is_side_effect: false },
+    ]
+    let war_dag = build_dep_dag(&war_instrs)
+    // Should have WAR edge from 0 to 1
+    let has_war = war_dag.edges.iter().any(|e| e.kind == DepKind.Anti && e.from == 0 && e.to == 1)
+    assert(has_war)
+    print("WAR dependency ✓")
+
+    // Empty schedule
+    let empty = ListScheduler.new(vec![])
+    assert(empty.schedule().is_empty())
+    assert(empty.estimated_cycles(&[]) == 0)
+    print("Empty ✓")
+
+    // ReadyEntry ordering (higher priority first)
+    let a = ReadyEntry { id: 0, priority: 10 }
+    let b = ReadyEntry { id: 1, priority: 5 }
+    assert(a > b)
+    print("Priority ordering ✓")
+
+    print("Instruction Scheduling complete ✓")
+}
