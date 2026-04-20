@@ -1,0 +1,237 @@
+
+// Lifetime Analysis Pass
+// Tracks variable lifetimes, detects dangling references and use-after-free.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct VarId(u32)
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Lifetime(u32)
+
+#[derive(Clone, Debug)]
+enum RefKind { Shared, Mutable }
+
+#[derive(Clone, Debug)]
+struct BorrowInfo {
+    borrower: VarId,
+    lender: VarId,
+    kind: RefKind,
+    start: Lifetime,
+    end: Option<Lifetime>,
+}
+
+#[derive(Clone, Debug)]
+struct VarInfo {
+    id: VarId,
+    name: string,
+    born: Lifetime,
+    died: Option<Lifetime>,
+    moved: bool,
+}
+
+#[derive(Clone, Debug)]
+enum LifetimeError {
+    DanglingReference { var: VarId, ref_to: VarId, at: Lifetime },
+    UseAfterMove { var: VarId, at: Lifetime },
+    UseAfterFree { var: VarId, at: Lifetime },
+    MutableAlias { var: VarId, existing: VarId, at: Lifetime },
+    BorrowWhileMutBorrowed { var: VarId, at: Lifetime },
+}
+
+struct LifetimeAnalyzer {
+    vars: HashMap<VarId, VarInfo>,
+    borrows: [BorrowInfo],
+    errors: [LifetimeError],
+    current_lt: Lifetime,
+    next_id: u32,
+}
+
+impl LifetimeAnalyzer {
+    fn new() -> LifetimeAnalyzer {
+        LifetimeAnalyzer {
+            vars: HashMap.new(), borrows: [], errors: [],
+            current_lt: Lifetime(0), next_id: 0,
+        }
+    }
+
+    fn advance(mut self) { self.current_lt = Lifetime(self.current_lt.0 + 1) }
+
+    fn declare(mut self, name: &str) -> VarId {
+        let id = VarId(self.next_id)
+        self.next_id += 1
+        self.vars.insert(id, VarInfo {
+            id, name: name.into(), born: self.current_lt, died: None, moved: false,
+        })
+        id
+    }
+
+    fn drop_var(mut self, id: VarId) {
+        if let Some(info) = self.vars.get_mut(&id) {
+            info.died = Some(self.current_lt)
+        }
+        // Check for dangling borrows
+        for b in &self.borrows {
+            if b.lender == id && b.end.is_none() {
+                self.errors.push(LifetimeError.DanglingReference {
+                    var: b.borrower, ref_to: id, at: self.current_lt,
+                })
+            }
+        }
+    }
+
+    fn move_var(mut self, id: VarId) {
+        if let Some(info) = self.vars.get_mut(&id) {
+            info.moved = true
+        }
+    }
+
+    fn use_var(mut self, id: VarId) {
+        if let Some(info) = self.vars.get(&id) {
+            if info.moved {
+                self.errors.push(LifetimeError.UseAfterMove { var: id, at: self.current_lt })
+            }
+            if let Some(died) = info.died {
+                if self.current_lt >= died {
+                    self.errors.push(LifetimeError.UseAfterFree { var: id, at: self.current_lt })
+                }
+            }
+        }
+    }
+
+    fn borrow_shared(mut self, borrower: VarId, lender: VarId) {
+        // Check no active mutable borrow
+        for b in &self.borrows {
+            if b.lender == lender && b.end.is_none() {
+                if let RefKind.Mutable = b.kind {
+                    self.errors.push(LifetimeError.BorrowWhileMutBorrowed {
+                        var: lender, at: self.current_lt,
+                    })
+                }
+            }
+        }
+        self.borrows.push(BorrowInfo {
+            borrower, lender, kind: RefKind.Shared,
+            start: self.current_lt, end: None,
+        })
+    }
+
+    fn borrow_mut(mut self, borrower: VarId, lender: VarId) {
+        // Check no active borrows at all
+        for b in &self.borrows {
+            if b.lender == lender && b.end.is_none() {
+                self.errors.push(LifetimeError.MutableAlias {
+                    var: lender, existing: b.borrower, at: self.current_lt,
+                })
+            }
+        }
+        self.borrows.push(BorrowInfo {
+            borrower, lender, kind: RefKind.Mutable,
+            start: self.current_lt, end: None,
+        })
+    }
+
+    fn end_borrow(mut self, borrower: VarId) {
+        for b in self.borrows.iter_mut() {
+            if b.borrower == borrower && b.end.is_none() {
+                b.end = Some(self.current_lt)
+            }
+        }
+    }
+
+    fn is_alive(self, id: VarId) -> bool {
+        self.vars.get(&id).map_or(false, |v| v.died.is_none() && !v.moved)
+    }
+
+    fn active_borrows(self, id: VarId) -> usize {
+        self.borrows.iter().filter(|b| b.lender == id && b.end.is_none()).count()
+    }
+
+    fn has_errors(self) -> bool { !self.errors.is_empty() }
+    fn error_count(self) -> usize { self.errors.len() }
+}
+
+fn main() {
+    let mut la = LifetimeAnalyzer.new()
+
+    // Basic declare and alive
+    let x = la.declare("x")
+    assert(la.is_alive(x))
+    print("Declare ✓")
+
+    // Drop
+    la.advance()
+    la.drop_var(x)
+    assert(!la.is_alive(x))
+    print("Drop ✓")
+
+    // Use after free
+    la.advance()
+    la.use_var(x)
+    assert(la.has_errors())
+    assert(la.error_count() == 1)
+    print("Use after free ✓")
+
+    // Move semantics
+    let mut la2 = LifetimeAnalyzer.new()
+    let a = la2.declare("a")
+    la2.move_var(a)
+    la2.use_var(a)
+    assert(la2.error_count() == 1)
+    print("Use after move ✓")
+
+    // Shared borrows
+    let mut la3 = LifetimeAnalyzer.new()
+    let v = la3.declare("v")
+    let r1 = la3.declare("r1")
+    let r2 = la3.declare("r2")
+    la3.borrow_shared(r1, v)
+    la3.borrow_shared(r2, v)
+    assert(la3.active_borrows(v) == 2)
+    assert(!la3.has_errors())
+    print("Shared borrows ✓")
+
+    // Mutable alias detection
+    let mut la4 = LifetimeAnalyzer.new()
+    let w = la4.declare("w")
+    let m1 = la4.declare("m1")
+    let m2 = la4.declare("m2")
+    la4.borrow_mut(m1, w)
+    la4.borrow_mut(m2, w)  // error: alias
+    assert(la4.error_count() == 1)
+    print("Mutable alias ✓")
+
+    // Borrow while mut borrowed
+    let mut la5 = LifetimeAnalyzer.new()
+    let z = la5.declare("z")
+    let mb = la5.declare("mb")
+    let sb = la5.declare("sb")
+    la5.borrow_mut(mb, z)
+    la5.borrow_shared(sb, z)  // error
+    assert(la5.error_count() == 1)
+    print("Borrow while mut ✓")
+
+    // End borrow allows new mutable
+    let mut la6 = LifetimeAnalyzer.new()
+    let q = la6.declare("q")
+    let b1 = la6.declare("b1")
+    let b2 = la6.declare("b2")
+    la6.borrow_shared(b1, q)
+    la6.end_borrow(b1)
+    la6.borrow_mut(b2, q)
+    assert(!la6.has_errors())
+    print("End borrow ✓")
+
+    // Dangling reference
+    let mut la7 = LifetimeAnalyzer.new()
+    let owner = la7.declare("owner")
+    let ref_var = la7.declare("ref_var")
+    la7.borrow_shared(ref_var, owner)
+    la7.advance()
+    la7.drop_var(owner)  // dangling: ref_var still borrows owner
+    assert(la7.error_count() == 1)
+    print("Dangling reference ✓")
+
+    print("Lifetime analysis complete ✓")
+}
