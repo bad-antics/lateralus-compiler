@@ -1,35 +1,208 @@
-// Precedence Climbing
-module compiler.parser.precedence_climbing
 
-pub struct PrecedenceClimbingPass {
-    name: str
-    errors: list
-    warnings: list
+// Precedence Climbing Parser
+// Parses infix expressions with configurable operator precedence and associativity.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Assoc { Left, Right }
+
+#[derive(Clone, Debug, PartialEq)]
+enum Token {
+    Num(i64),
+    Op(char),
+    LParen,
+    RParen,
+    Eof,
 }
 
-impl PrecedenceClimbingPass {
-    pub fn new() -> PrecedenceClimbingPass {
-        return PrecedenceClimbingPass { name: "Precedence Climbing", errors: [], warnings: [] }
+struct OpInfo {
+    prec: u8,
+    assoc: Assoc,
+}
+
+fn op_info(op: char) -> Option<OpInfo> {
+    match op {
+        '+' | '-' => Some(OpInfo { prec: 1, assoc: Assoc.Left }),
+        '*' | '/' | '%' => Some(OpInfo { prec: 2, assoc: Assoc.Left }),
+        '^' => Some(OpInfo { prec: 3, assoc: Assoc.Right }),
+        _ => None,
     }
-    pub fn run(self, input: any) -> any {
-        return input
+}
+
+fn tokenize(input: &str) -> [Token] {
+    let mut tokens = []
+    let chars = input.chars().collect::<[char]>()
+    let mut i = 0
+    while i < chars.len() {
+        match chars[i] {
+            ' ' => { i += 1 }
+            '(' => { tokens.push(Token.LParen); i += 1 }
+            ')' => { tokens.push(Token.RParen); i += 1 }
+            c if c.is_ascii_digit() || (c == '-' && (tokens.is_empty() || matches!(tokens.last(), Some(Token.Op(_)) | Some(Token.LParen)))) => {
+                let start = i
+                if chars[i] == '-' { i += 1 }
+                while i < chars.len() && chars[i].is_ascii_digit() { i += 1 }
+                let num: i64 = input[start..i].parse().unwrap()
+                tokens.push(Token.Num(num))
+            }
+            c if "+-*/%^".contains(c) => { tokens.push(Token.Op(c)); i += 1 }
+            _ => { i += 1 }  // skip unknown
+        }
     }
-    pub fn add_error(self, msg: str, line: int, col: int) {
-        self.errors = push(self.errors, {"msg": msg, "line": line, "col": col})
+    tokens.push(Token.Eof)
+    tokens
+}
+
+struct Parser {
+    tokens: [Token],
+    pos: usize,
+}
+
+impl Parser {
+    fn new(tokens: [Token]) -> Parser { Parser { tokens, pos: 0 } }
+
+    fn peek(self) -> &Token { &self.tokens[self.pos] }
+
+    fn advance(mut self) -> Token {
+        let t = self.tokens[self.pos].clone()
+        if self.pos < self.tokens.len() - 1 { self.pos += 1 }
+        t
     }
-    pub fn add_warning(self, msg: str, line: int) {
-        self.warnings = push(self.warnings, {"msg": msg, "line": line})
+
+    fn expect(mut self, expected: Token) {
+        let got = self.advance()
+        assert(got == expected)
     }
-    pub fn ok(self) -> bool { return len(self.errors) == 0 }
-    pub fn report(self) -> str {
-        let mut s = self.name + ": "
-        if self.ok() { s += "OK" } else { s += len(self.errors) as str + " error(s)" }
-        return s
+
+    fn parse_expr(mut self, min_prec: u8) -> i64 {
+        let mut lhs = self.parse_atom()
+
+        loop {
+            let op = match self.peek() {
+                Token.Op(c) => *c,
+                _ => break,
+            };
+            let info = match op_info(op) {
+                Some(i) => i,
+                None => break,
+            };
+            if info.prec < min_prec { break }
+
+            self.advance()  // consume operator
+
+            let next_min = match info.assoc {
+                Assoc.Left => info.prec + 1,
+                Assoc.Right => info.prec,
+            };
+            let rhs = self.parse_expr(next_min)
+
+            lhs = match op {
+                '+' => lhs + rhs,
+                '-' => lhs - rhs,
+                '*' => lhs * rhs,
+                '/' => lhs / rhs,
+                '%' => lhs % rhs,
+                '^' => {
+                    let mut result = 1i64
+                    for _ in 0..rhs { result *= lhs }
+                    result
+                }
+                _ => panic("unknown op"),
+            }
+        }
+        lhs
     }
+
+    fn parse_atom(mut self) -> i64 {
+        match self.advance() {
+            Token.Num(n) => n,
+            Token.LParen => {
+                let val = self.parse_expr(0)
+                self.expect(Token.RParen)
+                val
+            }
+            t => panic(format!("unexpected token: {:?}", t)),
+        }
+    }
+}
+
+fn eval(input: &str) -> i64 {
+    let tokens = tokenize(input)
+    let mut parser = Parser.new(tokens)
+    parser.parse_expr(0)
 }
 
 fn main() {
-    let pass = PrecedenceClimbingPass.new()
-    let result = pass.run("fn main() { println(\"hello\") }")
-    println(pass.report())
+    // Simple number
+    assert(eval("42") == 42)
+    print("Number ✓")
+
+    // Addition
+    assert(eval("1 + 2") == 3)
+    assert(eval("10 + 20 + 30") == 60)
+    print("Addition ✓")
+
+    // Subtraction
+    assert(eval("10 - 3") == 7)
+    assert(eval("10 - 3 - 2") == 5)  // left assoc
+    print("Subtraction ✓")
+
+    // Multiplication precedence
+    assert(eval("2 + 3 * 4") == 14)
+    assert(eval("3 * 4 + 2") == 14)
+    print("Mul precedence ✓")
+
+    // Division
+    assert(eval("20 / 4") == 5)
+    assert(eval("20 / 4 / 5") == 1)
+    print("Division ✓")
+
+    // Modulo
+    assert(eval("10 % 3") == 1)
+    assert(eval("17 % 5") == 2)
+    print("Modulo ✓")
+
+    // Parentheses
+    assert(eval("(2 + 3) * 4") == 20)
+    assert(eval("2 * (3 + 4)") == 14)
+    assert(eval("((1 + 2) * (3 + 4))") == 21)
+    print("Parentheses ✓")
+
+    // Right-associative exponentiation
+    assert(eval("2 ^ 3") == 8)
+    assert(eval("2 ^ 3 ^ 2") == 512)  // 2^(3^2) = 2^9 = 512
+    print("Exponentiation ✓")
+
+    // Complex expression
+    assert(eval("2 + 3 * 4 ^ 2") == 50)  // 2 + 3 * 16 = 50
+    print("Complex ✓")
+
+    // Negative numbers
+    assert(eval("-5") == -5)
+    assert(eval("-3 + 8") == 5)
+    print("Negative ✓")
+
+    // Nested parentheses
+    assert(eval("((((5))))") == 5)
+    print("Nested parens ✓")
+
+    // Tokenizer
+    let tokens = tokenize("1 + 2 * 3")
+    assert(tokens[0] == Token.Num(1))
+    assert(tokens[1] == Token.Op('+'))
+    assert(tokens[2] == Token.Num(2))
+    assert(tokens[3] == Token.Op('*'))
+    assert(tokens[4] == Token.Num(3))
+    assert(tokens[5] == Token.Eof)
+    print("Tokenizer ✓")
+
+    // Op info
+    assert(op_info('+').unwrap().prec == 1)
+    assert(op_info('*').unwrap().prec == 2)
+    assert(op_info('^').unwrap().prec == 3)
+    assert(op_info('^').unwrap().assoc == Assoc.Right)
+    assert(op_info('+').unwrap().assoc == Assoc.Left)
+    assert(op_info('@').is_none())
+    print("Op info ✓")
+
+    print("Precedence climbing complete ✓")
 }
