@@ -1,0 +1,294 @@
+
+// Inline Expansion Pass - Replaces function calls with function bodies
+// Uses heuristics for cost-benefit analysis of inlining decisions.
+
+use std.collections.{HashMap, HashSet}
+
+type FuncId = usize
+type BlockId = usize
+
+#[derive(Clone, Debug)]
+struct FunctionInfo {
+    id: FuncId,
+    name: string,
+    body_size: usize,
+    call_count: usize,
+    is_recursive: bool,
+    is_leaf: bool,
+    has_loops: bool,
+    parameter_count: usize,
+    return_count: usize,
+    estimated_cycles: usize,
+}
+
+impl FunctionInfo {
+    fn new(id: FuncId, name: string, body_size: usize) -> FunctionInfo {
+        FunctionInfo {
+            id, name, body_size, call_count: 0,
+            is_recursive: false, is_leaf: true,
+            has_loops: false, parameter_count: 0,
+            return_count: 1, estimated_cycles: body_size,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InlineCandidate {
+    caller: FuncId,
+    callee: FuncId,
+    call_site: usize,
+    benefit: i64,
+    cost: i64,
+}
+
+impl InlineCandidate {
+    fn is_profitable(self) -> bool { self.benefit > self.cost }
+    fn net_benefit(self) -> i64 { self.benefit - self.cost }
+}
+
+#[derive(Clone, Debug)]
+struct InlinePolicy {
+    max_body_size: usize,
+    max_inline_depth: usize,
+    max_total_growth: f64,
+    always_inline_threshold: usize,
+    hot_call_bonus: i64,
+}
+
+impl InlinePolicy {
+    fn default() -> InlinePolicy {
+        InlinePolicy {
+            max_body_size: 100,
+            max_inline_depth: 5,
+            max_total_growth: 2.0,
+            always_inline_threshold: 10,
+            hot_call_bonus: 50,
+        }
+    }
+
+    fn aggressive() -> InlinePolicy {
+        InlinePolicy {
+            max_body_size: 500,
+            max_inline_depth: 10,
+            max_total_growth: 5.0,
+            always_inline_threshold: 30,
+            hot_call_bonus: 100,
+        }
+    }
+
+    fn conservative() -> InlinePolicy {
+        InlinePolicy {
+            max_body_size: 30,
+            max_inline_depth: 2,
+            max_total_growth: 1.2,
+            always_inline_threshold: 5,
+            hot_call_bonus: 20,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct InlineStats {
+    candidates_found: usize,
+    functions_inlined: usize,
+    calls_eliminated: usize,
+    instructions_added: usize,
+    instructions_removed: usize,
+}
+
+impl InlineStats {
+    fn net_instruction_change(self) -> i64 {
+        self.instructions_added as i64 - self.instructions_removed as i64
+    }
+
+    fn growth_ratio(self, original_size: usize) -> f64 {
+        if original_size == 0 { return 0.0 }
+        (original_size as f64 + self.net_instruction_change() as f64) / original_size as f64
+    }
+}
+
+struct InlineExpander {
+    functions: HashMap<FuncId, FunctionInfo>,
+    call_graph: HashMap<FuncId, [FuncId]>,
+    policy: InlinePolicy,
+    stats: InlineStats,
+    current_depth: usize,
+}
+
+impl InlineExpander {
+    fn new(policy: InlinePolicy) -> InlineExpander {
+        InlineExpander {
+            functions: HashMap.new(),
+            call_graph: HashMap.new(),
+            policy,
+            stats: InlineStats.default(),
+            current_depth: 0,
+        }
+    }
+
+    fn add_function(mut self, info: FunctionInfo) {
+        self.call_graph.entry(info.id).or_insert_with(|| vec![])
+        self.functions.insert(info.id, info)
+    }
+
+    fn add_call(mut self, caller: FuncId, callee: FuncId) {
+        self.call_graph.entry(caller).or_insert_with(|| vec![]).push(callee)
+        if let some(f) = self.functions.get_mut(&callee) {
+            f.call_count += 1
+        }
+        if let some(f) = self.functions.get_mut(&caller) {
+            f.is_leaf = false
+        }
+    }
+
+    fn should_inline(self, callee: &FunctionInfo) -> bool {
+        if callee.is_recursive { return false }
+        if self.current_depth >= self.policy.max_inline_depth { return false }
+        if callee.body_size <= self.policy.always_inline_threshold { return true }
+        if callee.body_size > self.policy.max_body_size { return false }
+        true
+    }
+
+    fn compute_benefit(self, callee: &FunctionInfo, is_hot: bool) -> i64 {
+        let mut benefit: i64 = 0
+        // Eliminate call overhead
+        benefit += 5
+        // Small functions benefit more
+        if callee.body_size < 20 { benefit += 20 }
+        // Leaf functions are cheap to inline
+        if callee.is_leaf { benefit += 10 }
+        // Hot call sites benefit more
+        if is_hot { benefit += self.policy.hot_call_bonus }
+        // Single-call functions: inlining eliminates the function entirely
+        if callee.call_count == 1 { benefit += callee.body_size as i64 }
+        benefit
+    }
+
+    fn compute_cost(self, callee: &FunctionInfo) -> i64 {
+        let mut cost = callee.body_size as i64
+        if callee.has_loops { cost += 20 }
+        if callee.parameter_count > 4 { cost += (callee.parameter_count - 4) as i64 * 3 }
+        cost
+    }
+
+    fn evaluate_candidate(self, caller: FuncId, callee_id: FuncId, call_site: usize, is_hot: bool) -> Option<InlineCandidate> {
+        let callee = self.functions.get(&callee_id)?
+        if !self.should_inline(callee) { return none }
+        let benefit = self.compute_benefit(callee, is_hot)
+        let cost = self.compute_cost(callee)
+        some(InlineCandidate { caller, callee: callee_id, call_site, benefit, cost })
+    }
+
+    fn run(mut self) -> usize {
+        let mut inlined = 0
+        let func_ids: [FuncId] = self.functions.keys().copied().collect()
+
+        for caller_id in &func_ids {
+            let callees = self.call_graph.get(caller_id).cloned().unwrap_or(vec![])
+            for (idx, callee_id) in callees.iter().enumerate() {
+                self.stats.candidates_found += 1
+                if let some(candidate) = self.evaluate_candidate(*caller_id, *callee_id, idx, false) {
+                    if candidate.is_profitable() {
+                        let callee_size = self.functions.get(callee_id).map(|f| f.body_size).unwrap_or(0)
+                        self.stats.functions_inlined += 1
+                        self.stats.calls_eliminated += 1
+                        self.stats.instructions_added += callee_size
+                        self.stats.instructions_removed += 1  // call instruction
+                        inlined += 1
+                    }
+                }
+            }
+        }
+        inlined
+    }
+
+    fn stats(self) -> &InlineStats { &self.stats }
+}
+
+fn main() {
+    // FunctionInfo
+    let f = FunctionInfo.new(1, "foo".into(), 20)
+    assert(f.body_size == 20)
+    assert(f.is_leaf)
+    assert(!f.is_recursive)
+    assert(f.call_count == 0)
+    print("FunctionInfo ✓")
+
+    // InlinePolicy presets
+    let def = InlinePolicy.default()
+    assert(def.max_body_size == 100)
+    let agg = InlinePolicy.aggressive()
+    assert(agg.max_body_size == 500)
+    let con = InlinePolicy.conservative()
+    assert(con.max_body_size == 30)
+    print("InlinePolicy ✓")
+
+    // Should inline — tiny function
+    let mut expander = InlineExpander.new(InlinePolicy.default())
+    let tiny = FunctionInfo.new(1, "tiny".into(), 5)
+    assert(expander.should_inline(&tiny))
+    print("Tiny inline ✓")
+
+    // Should not inline — recursive
+    let mut rec_fn = FunctionInfo.new(2, "rec".into(), 10)
+    rec_fn.is_recursive = true
+    assert(!expander.should_inline(&rec_fn))
+    print("Recursive blocked ✓")
+
+    // Should not inline — too large
+    let big = FunctionInfo.new(3, "big".into(), 200)
+    assert(!expander.should_inline(&big))
+    print("Large blocked ✓")
+
+    // Cost/benefit
+    let mut leaf = FunctionInfo.new(4, "leaf".into(), 15)
+    leaf.is_leaf = true
+    leaf.call_count = 1
+    let benefit = expander.compute_benefit(&leaf, false)
+    let cost = expander.compute_cost(&leaf)
+    assert(benefit > 0)
+    assert(cost > 0)
+    print("Cost/benefit ✓")
+
+    // Hot call bonus
+    let hot_benefit = expander.compute_benefit(&leaf, true)
+    assert(hot_benefit > benefit)
+    print("Hot call bonus ✓")
+
+    // InlineCandidate
+    let c = InlineCandidate { caller: 1, callee: 2, call_site: 0, benefit: 30, cost: 10 }
+    assert(c.is_profitable())
+    assert(c.net_benefit() == 20)
+    let c2 = InlineCandidate { caller: 1, callee: 2, call_site: 0, benefit: 5, cost: 50 }
+    assert(!c2.is_profitable())
+    print("InlineCandidate ✓")
+
+    // Full expansion run
+    let mut exp = InlineExpander.new(InlinePolicy.default())
+    exp.add_function(FunctionInfo.new(100, "main".into(), 50))
+    let mut helper = FunctionInfo.new(101, "helper".into(), 8)
+    helper.is_leaf = true
+    exp.add_function(helper)
+    exp.add_call(100, 101)
+
+    let count = exp.run()
+    assert(count >= 1)
+    assert(exp.stats().functions_inlined >= 1)
+    assert(exp.stats().calls_eliminated >= 1)
+    print("Expansion run ✓")
+
+    // Stats
+    let s = InlineStats.default()
+    assert(s.net_instruction_change() == 0)
+    assert(s.growth_ratio(100) == 1.0)
+    let s2 = InlineStats { instructions_added: 50, instructions_removed: 10, ..s }
+    assert(s2.net_instruction_change() == 40)
+    assert(s2.growth_ratio(100) == 1.4)
+    print("Stats ✓")
+
+    // Growth ratio edge case
+    assert(InlineStats.default().growth_ratio(0) == 0.0)
+    print("Edge case ✓")
+
+    print("Inline expansion complete ✓")
+}
