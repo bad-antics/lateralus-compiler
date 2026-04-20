@@ -1,0 +1,228 @@
+
+// Control Flow Graph Builder
+// Constructs CFGs from basic blocks with edges for branches, jumps, and fall-through.
+
+use std.collections.{HashMap, HashSet}
+
+type BlockId = u32
+
+#[derive(Clone, Debug, PartialEq)]
+enum Terminator {
+    Return,
+    Jump(BlockId),
+    Branch(u32, BlockId, BlockId),  // condition reg, true block, false block
+    Switch(u32, [(i64, BlockId)], BlockId),  // reg, cases, default
+    Unreachable,
+}
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    id: BlockId,
+    label: string,
+    instructions: [string],
+    terminator: Terminator,
+}
+
+impl BasicBlock {
+    fn new(id: BlockId, label: &str) -> BasicBlock {
+        BasicBlock { id, label: label.into(), instructions: [], terminator: Terminator.Unreachable }
+    }
+    fn add_instr(mut self, instr: &str) { self.instructions.push(instr.into()) }
+    fn set_terminator(mut self, term: Terminator) { self.terminator = term }
+    fn instr_count(self) -> usize { self.instructions.len() }
+
+    fn successors(self) -> [BlockId] {
+        match &self.terminator {
+            Terminator.Return | Terminator.Unreachable => [],
+            Terminator.Jump(target) => [*target],
+            Terminator.Branch(_, t, f) => [*t, *f],
+            Terminator.Switch(_, cases, default) => {
+                let mut targets: [BlockId] = cases.iter().map(|(_, b)| *b).collect()
+                targets.push(*default)
+                targets
+            }
+        }
+    }
+}
+
+struct Cfg {
+    blocks: HashMap<BlockId, BasicBlock>,
+    entry: BlockId,
+    next_id: BlockId,
+    predecessors: HashMap<BlockId, HashSet<BlockId>>,
+}
+
+impl Cfg {
+    fn new() -> Cfg {
+        Cfg { blocks: HashMap.new(), entry: 0, next_id: 0, predecessors: HashMap.new() }
+    }
+
+    fn add_block(mut self, label: &str) -> BlockId {
+        let id = self.next_id
+        self.next_id += 1
+        self.blocks.insert(id, BasicBlock.new(id, label))
+        self.predecessors.insert(id, HashSet.new())
+        if id == 0 { self.entry = id }
+        id
+    }
+
+    fn get_block(self, id: BlockId) -> Option<&BasicBlock> { self.blocks.get(&id) }
+    fn get_block_mut(mut self, id: BlockId) -> Option<&mut BasicBlock> { self.blocks.get_mut(&id) }
+
+    fn set_terminator(mut self, id: BlockId, term: Terminator) {
+        if let Some(block) = self.blocks.get_mut(&id) {
+            block.set_terminator(term)
+        }
+    }
+
+    fn add_instruction(mut self, id: BlockId, instr: &str) {
+        if let Some(block) = self.blocks.get_mut(&id) {
+            block.add_instr(instr)
+        }
+    }
+
+    fn build_predecessors(mut self) {
+        for (_, preds) in &mut self.predecessors { preds.clear() }
+        for (id, block) in &self.blocks {
+            for succ in block.successors() {
+                self.predecessors.entry(succ).or_default().insert(*id)
+            }
+        }
+    }
+
+    fn predecessors_of(self, id: BlockId) -> HashSet<BlockId> {
+        self.predecessors.get(&id).cloned().unwrap_or_default()
+    }
+
+    fn successors_of(self, id: BlockId) -> [BlockId] {
+        self.blocks.get(&id).map(|b| b.successors()).unwrap_or_default()
+    }
+
+    fn block_count(self) -> usize { self.blocks.len() }
+
+    fn is_reachable(self, target: BlockId) -> bool {
+        let mut visited = HashSet.new()
+        let mut stack = [self.entry]
+        while let Some(id) = stack.pop() {
+            if id == target { return true }
+            if visited.contains(&id) { continue }
+            visited.insert(id)
+            if let Some(block) = self.blocks.get(&id) {
+                for succ in block.successors() { stack.push(succ) }
+            }
+        }
+        false
+    }
+
+    fn dominators(self) -> HashMap<BlockId, HashSet<BlockId>> {
+        let all: HashSet<BlockId> = self.blocks.keys().cloned().collect()
+        let mut doms: HashMap<BlockId, HashSet<BlockId>> = HashMap.new()
+        for &id in &all {
+            if id == self.entry {
+                let mut s = HashSet.new(); s.insert(id); doms.insert(id, s);
+            } else { doms.insert(id, all.clone()); }
+        }
+        let mut changed = true
+        while changed {
+            changed = false
+            for &id in &all {
+                if id == self.entry { continue }
+                let preds = self.predecessors_of(id)
+                let mut new_dom = all.clone()
+                for &p in &preds { new_dom = new_dom.intersection(doms.get(&p).unwrap()).cloned().collect() }
+                new_dom.insert(id)
+                if new_dom != *doms.get(&id).unwrap() { doms.insert(id, new_dom); changed = true }
+            }
+        }
+        doms
+    }
+
+    fn dead_blocks(self) -> [BlockId] {
+        let all: HashSet<BlockId> = self.blocks.keys().cloned().collect()
+        all.into_iter().filter(|id| !self.is_reachable(*id)).collect()
+    }
+}
+
+fn main() {
+    let mut cfg = Cfg.new()
+
+    // Add blocks
+    let entry = cfg.add_block("entry")
+    let then_b = cfg.add_block("then")
+    let else_b = cfg.add_block("else")
+    let merge = cfg.add_block("merge")
+    assert(cfg.block_count() == 4)
+    print("Blocks ✓")
+
+    // Set terminators
+    cfg.set_terminator(entry, Terminator.Branch(0, then_b, else_b))
+    cfg.set_terminator(then_b, Terminator.Jump(merge))
+    cfg.set_terminator(else_b, Terminator.Jump(merge))
+    cfg.set_terminator(merge, Terminator.Return)
+    print("Terminators ✓")
+
+    // Instructions
+    cfg.add_instruction(entry, "load r0, [sp+0]")
+    cfg.add_instruction(entry, "cmp r0, #0")
+    assert(cfg.get_block(entry).unwrap().instr_count() == 2)
+    print("Instructions ✓")
+
+    // Successors
+    let succs = cfg.successors_of(entry)
+    assert(succs.len() == 2)
+    assert(succs.contains(&then_b))
+    assert(succs.contains(&else_b))
+    assert(cfg.successors_of(merge).is_empty())
+    print("Successors ✓")
+
+    // Predecessors
+    cfg.build_predecessors()
+    let preds = cfg.predecessors_of(merge)
+    assert(preds.len() == 2)
+    assert(preds.contains(&then_b))
+    assert(preds.contains(&else_b))
+    let entry_preds = cfg.predecessors_of(entry)
+    assert(entry_preds.is_empty())
+    print("Predecessors ✓")
+
+    // Reachability
+    assert(cfg.is_reachable(merge))
+    assert(cfg.is_reachable(entry))
+    print("Reachable ✓")
+
+    // Dead blocks
+    let dead_cfg = {
+        let mut c = Cfg.new()
+        let e = c.add_block("entry")
+        let r = c.add_block("reachable")
+        let d = c.add_block("dead")
+        c.set_terminator(e, Terminator.Jump(r))
+        c.set_terminator(r, Terminator.Return)
+        c.set_terminator(d, Terminator.Return)
+        c
+    };
+    let dead = dead_cfg.dead_blocks()
+    assert(dead.len() == 1)
+    assert(dead.contains(&2))  // dead block
+    print("Dead blocks ✓")
+
+    // Dominators
+    let doms = cfg.dominators()
+    assert(doms.get(&entry).unwrap().len() == 1)  // entry dominates only itself
+    assert(doms.get(&merge).unwrap().contains(&entry))  // entry dominates merge
+    assert(doms.get(&then_b).unwrap().contains(&entry))
+    print("Dominators ✓")
+
+    // Switch terminator
+    let mut cfg2 = Cfg.new()
+    let s_entry = cfg2.add_block("switch_entry")
+    let c1 = cfg2.add_block("case1")
+    let c2 = cfg2.add_block("case2")
+    let def = cfg2.add_block("default")
+    cfg2.set_terminator(s_entry, Terminator.Switch(0, [(1, c1), (2, c2)], def))
+    let sw_succs = cfg2.successors_of(s_entry)
+    assert(sw_succs.len() == 3)
+    print("Switch ✓")
+
+    print("CFG builder complete ✓")
+}
