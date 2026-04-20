@@ -1,236 +1,427 @@
 // Compiler Pass - Closure Conversion
-// Transforms closures into structs with captured variables.
+// Transforms closures into flat functions with explicit environment structs.
 
-use std.collections.HashMap
-use std.collections.HashSet
+use std.collections.{HashMap, HashSet}
+use std.fmt.{Display, Formatter}
 
-#[derive(Clone)]
-enum CaptureKind {
-    ByValue,
-    ByRef,
-    ByMutRef,
+type VarId = usize
+type FuncId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+enum Type {
+    Int,
+    Float,
+    Bool,
+    Str,
+    Func(Box<FuncType>),
+    Ptr(Box<Type>),
+    Struct(string),
+    Void,
 }
 
-#[derive(Clone)]
-struct CapturedVar {
+#[derive(Clone, Debug, PartialEq)]
+struct FuncType {
+    params: [Type],
+    ret: Type,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Expr {
+    Var(VarId),
+    Lit(i64),
+    Lambda(Lambda),
+    App(Box<Expr>, [Expr]),
+    Let(VarId, Box<Expr>, Box<Expr>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    BinOp(string, Box<Expr>, Box<Expr>),
+    EnvLoad(VarId, usize),   // load from environment at index
+    EnvRef(VarId),            // reference to environment
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Lambda {
+    params: [VarId],
+    body: Box<Expr>,
+    captures: [VarId],   // filled during analysis
+}
+
+#[derive(Clone, Debug)]
+struct FuncDef {
+    id: FuncId,
     name: string,
-    ty: string,
-    kind: CaptureKind,
-    source_scope: usize,
+    params: [VarId],
+    body: Expr,
+    is_closure: bool,
 }
 
-struct ClosureInfo {
-    id: usize,
-    params: [(string, string)],
-    return_type: string,
-    captures: [CapturedVar],
-    body: [string],  // IR instructions
-    is_move: bool,
-}
-
-struct ConvertedClosure {
-    struct_name: string,
-    struct_fields: [(string, string)],  // (field_name, field_type)
-    impl_trait: string,                 // FnOnce, FnMut, or Fn
-    call_fn: ConvertedFn,
-    constructor: ConvertedFn,
-}
-
-struct ConvertedFn {
+#[derive(Clone, Debug)]
+struct EnvStruct {
     name: string,
-    params: [(string, string)],
-    return_type: string,
-    body: [string],
+    fields: [(string, Type)],
+    captured_vars: [VarId],
+}
+
+#[derive(Clone, Debug)]
+struct ClosurePair {
+    func_id: FuncId,
+    env_struct: EnvStruct,
+}
+
+struct FreeVarAnalyzer {
+    bound: HashSet<VarId>,
+}
+
+impl FreeVarAnalyzer {
+    fn new() -> FreeVarAnalyzer {
+        FreeVarAnalyzer { bound: HashSet.new() }
+    }
+
+    fn analyze(mut self, expr: &Expr) -> HashSet<VarId> {
+        match expr {
+            Expr.Var(id) => {
+                let mut s = HashSet.new()
+                if !self.bound.contains(id) { s.insert(*id); }
+                s
+            },
+            Expr.Lit(_) => HashSet.new(),
+            Expr.Lambda(lam) => {
+                let mut inner = self.clone()
+                for p in &lam.params { inner.bound.insert(*p); }
+                inner.analyze(&lam.body)
+            },
+            Expr.App(func, args) => {
+                let mut free = self.analyze(func)
+                for arg in args {
+                    for v in self.analyze(arg) { free.insert(v); }
+                }
+                free
+            },
+            Expr.Let(var, val, body) => {
+                let mut free = self.analyze(val)
+                let mut inner = self.clone()
+                inner.bound.insert(*var)
+                for v in inner.analyze(body) { free.insert(v); }
+                free
+            },
+            Expr.If(cond, then_, else_) => {
+                let mut free = self.analyze(cond)
+                for v in self.analyze(then_) { free.insert(v); }
+                for v in self.analyze(else_) { free.insert(v); }
+                free
+            },
+            Expr.BinOp(_, lhs, rhs) => {
+                let mut free = self.analyze(lhs)
+                for v in self.analyze(rhs) { free.insert(v); }
+                free
+            },
+            Expr.EnvLoad(_, _) | Expr.EnvRef(_) => HashSet.new(),
+        }
+    }
 }
 
 struct ClosureConverter {
-    closures: [ClosureInfo],
-    converted: [ConvertedClosure],
-    next_id: usize,
-    scope_vars: HashMap<usize, HashSet<string>>,
+    next_func_id: FuncId,
+    next_var_id: VarId,
+    lifted_funcs: [FuncDef],
+    env_structs: [EnvStruct],
+    var_types: HashMap<VarId, Type>,
+    stats: ConversionStats,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConversionStats {
+    lambdas_converted: usize,
+    env_structs_created: usize,
+    vars_captured: usize,
+    funcs_lifted: usize,
 }
 
 impl ClosureConverter {
-    fn new() -> ClosureConverter {
-        ClosureConverter { closures: [], converted: [], next_id: 0, scope_vars: HashMap.new() }
-    }
-
-    fn add_scope_var(mut self, scope: usize, name: &str) {
-        self.scope_vars.entry(scope).or_insert_with(|| HashSet.new()).insert(name.to_string())
-    }
-
-    fn analyze_closure(mut self, params: &[(string, string)], return_type: &str, body: &[string], outer_scope: usize, is_move: bool) -> usize {
-        let id = self.next_id; self.next_id += 1
-
-        // Find free variables in the body
-        let mut used_vars = HashSet.new()
-        let param_names: HashSet<string> = params.iter().map(|(n, _)| n.clone()).collect()
-
-        for instr in body {
-            for word in instr.split_whitespace() {
-                if word.starts_with('%') || word.starts_with('@') { continue }
-                if !param_names.contains(word) {
-                    if let some(scope_vars) = self.scope_vars.get(&outer_scope) {
-                        if scope_vars.contains(word) { used_vars.insert(word.to_string()); }
-                    }
-                }
-            }
+    fn new(next_func_id: FuncId, next_var_id: VarId) -> ClosureConverter {
+        ClosureConverter {
+            next_func_id, next_var_id,
+            lifted_funcs: [], env_structs: [],
+            var_types: HashMap.new(),
+            stats: ConversionStats.default(),
         }
+    }
 
-        let captures: [CapturedVar] = used_vars.iter().map(|name| {
-            let kind = if is_move { CaptureKind.ByValue }
-                       else if body.iter().any(|i| i.contains(&format!("{} =", name))) { CaptureKind.ByMutRef }
-                       else { CaptureKind.ByRef }
-            CapturedVar { name: name.clone(), ty: "unknown".to_string(), kind, source_scope: outer_scope }
-        }).collect()
-
-        self.closures.push(ClosureInfo {
-            id, params: params.to_vec(), return_type: return_type.to_string(),
-            captures, body: body.to_vec(), is_move,
-        })
+    fn fresh_func_id(mut self) -> FuncId {
+        let id = self.next_func_id
+        self.next_func_id += 1
         id
     }
 
-    fn convert_all(mut self) {
-        for closure in &self.closures {
-            self.converted.push(Self.convert_one(closure))
+    fn fresh_var(mut self) -> VarId {
+        let id = self.next_var_id
+        self.next_var_id += 1
+        id
+    }
+
+    fn set_var_type(mut self, var: VarId, ty: Type) {
+        self.var_types.insert(var, ty)
+    }
+
+    fn convert(mut self, expr: &Expr) -> Expr {
+        match expr {
+            Expr.Var(id) => Expr.Var(*id),
+            Expr.Lit(n) => Expr.Lit(*n),
+            Expr.Lambda(lam) => self.convert_lambda(lam),
+            Expr.App(func, args) => {
+                let new_func = self.convert(func)
+                let new_args: [Expr] = args.iter().map(|a| self.convert(a)).collect()
+                Expr.App(Box.new(new_func), new_args)
+            },
+            Expr.Let(var, val, body) => {
+                Expr.Let(*var, Box.new(self.convert(val)), Box.new(self.convert(body)))
+            },
+            Expr.If(c, t, e) => {
+                Expr.If(Box.new(self.convert(c)), Box.new(self.convert(t)), Box.new(self.convert(e)))
+            },
+            Expr.BinOp(op, l, r) => {
+                Expr.BinOp(op.clone(), Box.new(self.convert(l)), Box.new(self.convert(r)))
+            },
+            _ => expr.clone(),
         }
     }
 
-    fn convert_one(closure: &ClosureInfo) -> ConvertedClosure {
-        let struct_name = format!("__Closure_{}", closure.id)
+    fn convert_lambda(mut self, lam: &Lambda) -> Expr {
+        // Find free variables
+        let mut analyzer = FreeVarAnalyzer.new()
+        for p in &lam.params { analyzer.bound.insert(*p); }
+        let free_vars: [VarId] = analyzer.analyze(&lam.body).into_iter().collect()
 
-        // Generate struct fields from captures
-        let struct_fields: [(string, string)] = closure.captures.iter().map(|cap| {
-            let field_type = match &cap.kind {
-                CaptureKind.ByValue => cap.ty.clone(),
-                CaptureKind.ByRef => format!("&{}", cap.ty),
-                CaptureKind.ByMutRef => format!("&mut {}", cap.ty),
+        self.stats.lambdas_converted += 1
+        self.stats.vars_captured += free_vars.len()
+
+        if free_vars.is_empty() {
+            // No captures: just lift the function
+            let func_id = self.fresh_func_id()
+            let converted_body = self.convert(&lam.body)
+            self.lifted_funcs.push(FuncDef {
+                id: func_id,
+                name: format!("__lambda_{}", func_id),
+                params: lam.params.clone(),
+                body: converted_body,
+                is_closure: false,
+            })
+            self.stats.funcs_lifted += 1
+            Expr.Var(func_id)
+        } else {
+            // Has captures: create environment struct
+            let func_id = self.fresh_func_id()
+            let env_var = self.fresh_var()
+
+            let env_name = format!("__env_{}", func_id)
+            let fields: [(string, Type)] = free_vars.iter().enumerate()
+                .map(|(i, v)| {
+                    let ty = self.var_types.get(v).cloned().unwrap_or(Type.Int)
+                    (format!("cap_{}", i), ty)
+                }).collect()
+
+            let env_struct = EnvStruct {
+                name: env_name.clone(),
+                fields: fields.clone(),
+                captured_vars: free_vars.clone(),
             }
-            (cap.name.clone(), field_type)
-        }).collect()
 
-        // Determine which Fn* trait to implement
-        let has_mut_capture = closure.captures.iter().any(|c| match c.kind { CaptureKind.ByMutRef => true, _ => false })
-        let impl_trait = if closure.is_move { "FnOnce" }
-                         else if has_mut_capture { "FnMut" }
-                         else { "Fn" }
-
-        // Generate call method
-        let mut call_body: [string] = []
-        for instr in &closure.body {
-            let mut converted = instr.clone()
-            for cap in &closure.captures {
-                converted = converted.replace(&cap.name, &format!("self.{}", cap.name))
+            // Rewrite body: replace free vars with env loads
+            let mut new_body = lam.body.as_ref().clone()
+            for (idx, var) in free_vars.iter().enumerate() {
+                new_body = self.replace_var(&new_body, *var, Expr.EnvLoad(env_var, idx))
             }
-            call_body.push(converted)
+            let converted_body = self.convert(&new_body)
+
+            // Add env parameter
+            let mut new_params = vec![env_var]
+            new_params.extend(lam.params.iter().cloned())
+
+            self.lifted_funcs.push(FuncDef {
+                id: func_id,
+                name: format!("__closure_{}", func_id),
+                params: new_params,
+                body: converted_body,
+                is_closure: true,
+            })
+
+            self.env_structs.push(env_struct.clone())
+            self.stats.funcs_lifted += 1
+            self.stats.env_structs_created += 1
+
+            // Return a reference that pairs func + env
+            Expr.EnvRef(func_id)
         }
-
-        let mut call_params: [(string, string)] = [("self".to_string(), struct_name.clone())]
-        call_params.extend(closure.params.iter().cloned())
-
-        let call_fn = ConvertedFn {
-            name: "call".to_string(),
-            params: call_params,
-            return_type: closure.return_type.clone(),
-            body: call_body,
-        }
-
-        // Generate constructor
-        let ctor_params: [(string, string)] = closure.captures.iter().map(|c| (c.name.clone(), c.ty.clone())).collect()
-        let ctor_body = [format!("{} {{ {} }}", struct_name,
-            closure.captures.iter().map(|c| format!("{}: {}", c.name, c.name)).collect::<[string]>().join(", "))
-        ]
-        let constructor = ConvertedFn {
-            name: format!("new_{}", struct_name),
-            params: ctor_params,
-            return_type: struct_name.clone(),
-            body: ctor_body,
-        }
-
-        ConvertedClosure { struct_name, struct_fields, impl_trait: impl_trait.to_string(), call_fn, constructor }
     }
 
-    fn emit_ir(self) -> [string] {
-        let mut output: [string] = []
-        for conv in &self.converted {
-            output.push(format!("struct {} {{", conv.struct_name))
-            for (name, ty) in &conv.struct_fields {
-                output.push(format!("  {}: {},", name, ty))
-            }
-            output.push("}".to_string())
-            output.push(format!("impl {} for {} {{", conv.impl_trait, conv.struct_name))
-            output.push(format!("  fn {}({}) -> {} {{", conv.call_fn.name,
-                conv.call_fn.params.iter().map(|(n, t)| format!("{}: {}", n, t)).collect::<[string]>().join(", "),
-                conv.call_fn.return_type))
-            for line in &conv.call_fn.body { output.push(format!("    {}", line)) }
-            output.push("  }".to_string())
-            output.push("}".to_string())
+    fn replace_var(self, expr: &Expr, target: VarId, replacement: Expr) -> Expr {
+        match expr {
+            Expr.Var(id) if *id == target => replacement.clone(),
+            Expr.Var(_) | Expr.Lit(_) => expr.clone(),
+            Expr.Lambda(lam) => {
+                if lam.params.contains(&target) { return expr.clone() }
+                Expr.Lambda(Lambda {
+                    params: lam.params.clone(),
+                    body: Box.new(self.replace_var(&lam.body, target, replacement)),
+                    captures: lam.captures.clone(),
+                })
+            },
+            Expr.App(f, args) => Expr.App(
+                Box.new(self.replace_var(f, target, replacement.clone())),
+                args.iter().map(|a| self.replace_var(a, target, replacement.clone())).collect(),
+            ),
+            Expr.Let(v, val, body) => {
+                let new_val = self.replace_var(val, target, replacement.clone())
+                let new_body = if *v == target { body.as_ref().clone() }
+                    else { self.replace_var(body, target, replacement) }
+                Expr.Let(*v, Box.new(new_val), Box.new(new_body))
+            },
+            Expr.If(c, t, e) => Expr.If(
+                Box.new(self.replace_var(c, target, replacement.clone())),
+                Box.new(self.replace_var(t, target, replacement.clone())),
+                Box.new(self.replace_var(e, target, replacement)),
+            ),
+            Expr.BinOp(op, l, r) => Expr.BinOp(
+                op.clone(),
+                Box.new(self.replace_var(l, target, replacement.clone())),
+                Box.new(self.replace_var(r, target, replacement)),
+            ),
+            _ => expr.clone(),
         }
-        output
     }
+
+    fn stats(self) -> &ConversionStats { &self.stats }
+    fn lifted_functions(self) -> &[FuncDef] { &self.lifted_funcs }
+    fn environments(self) -> &[EnvStruct] { &self.env_structs }
 }
 
 fn main() {
-    let mut converter = ClosureConverter.new()
+    // Free variable analysis
+    let mut fva = FreeVarAnalyzer.new()
+    // \x -> x + y  (y is free)
+    let expr = Expr.Lambda(Lambda {
+        params: vec![0],
+        body: Box.new(Expr.BinOp("+".into(),
+            Box.new(Expr.Var(0)),
+            Box.new(Expr.Var(1))
+        )),
+        captures: vec![],
+    })
+    let free = fva.analyze(&expr)
+    assert(free.contains(&1))
+    assert(!free.contains(&0))
+    assert(free.len() == 1)
+    print("Free var analysis ✓")
 
-    // Simulate outer scope with variables
-    converter.add_scope_var(0, "x")
-    converter.add_scope_var(0, "y")
-    converter.add_scope_var(0, "z")
+    // No free vars in closed lambda
+    let closed = Expr.Lambda(Lambda {
+        params: vec![0],
+        body: Box.new(Expr.Var(0)),
+        captures: vec![],
+    })
+    let free2 = FreeVarAnalyzer.new().analyze(&closed)
+    assert(free2.is_empty())
+    print("Closed lambda ✓")
 
-    // Closure: |a: i32| -> i32 { a + x + y }  (captures x, y by ref)
-    let id = converter.analyze_closure(
-        &[("a".to_string(), "i32".to_string())],
-        "i32",
-        &["a + x + y".to_string()],
-        0,
-        false,
+    // Let binding scoping
+    let let_expr = Expr.Let(5,
+        Box.new(Expr.Lit(42)),
+        Box.new(Expr.BinOp("+".into(), Box.new(Expr.Var(5)), Box.new(Expr.Var(6))))
     )
-    assert(id == 0)
-    assert(converter.closures[0].captures.len() == 2)
-    print("Analyze captures \u2713")
+    let free3 = FreeVarAnalyzer.new().analyze(&let_expr)
+    assert(free3.contains(&6))
+    assert(!free3.contains(&5))
+    print("Let scoping ✓")
 
-    // Move closure: move |b| { x + b }  (captures x by value)
-    let id2 = converter.analyze_closure(
-        &[("b".to_string(), "i32".to_string())],
-        "i32",
-        &["x + b".to_string()],
-        0,
-        true,
+    // Convert closed lambda (no env needed)
+    let mut cc = ClosureConverter.new(100, 200)
+    let result = cc.convert(&closed)
+    assert(cc.stats().lambdas_converted == 1)
+    assert(cc.stats().env_structs_created == 0)
+    assert(cc.lifted_functions().len() == 1)
+    assert(!cc.lifted_functions()[0].is_closure)
+    print("Closed conversion ✓")
+
+    // Convert capturing lambda
+    let mut cc2 = ClosureConverter.new(100, 200)
+    cc2.set_var_type(1, Type.Int)
+    let result2 = cc2.convert(&expr)
+    assert(cc2.stats().lambdas_converted == 1)
+    assert(cc2.stats().env_structs_created == 1)
+    assert(cc2.stats().vars_captured == 1)
+    assert(cc2.environments().len() == 1)
+    assert(cc2.environments()[0].captured_vars.contains(&1))
+    assert(cc2.lifted_functions()[0].is_closure)
+    print("Capturing conversion ✓")
+
+    // Environment struct
+    let env = &cc2.environments()[0]
+    assert(env.fields.len() == 1)
+    assert(env.fields[0].1 == Type.Int)
+    assert(env.name.starts_with("__env_"))
+    print("Env struct ✓")
+
+    // Lifted function has env param
+    let lifted = &cc2.lifted_functions()[0]
+    assert(lifted.params.len() == 2)  // env + original param
+    assert(lifted.name.starts_with("__closure_"))
+    print("Lifted func ✓")
+
+    // ConversionStats default
+    let s = ConversionStats.default()
+    assert(s.lambdas_converted == 0)
+    assert(s.env_structs_created == 0)
+    print("Stats default ✓")
+
+    // Type variants
+    assert(Type.Int != Type.Float)
+    assert(Type.Bool != Type.Void)
+    let ft = Type.Func(Box.new(FuncType { params: vec![Type.Int], ret: Type.Int }))
+    assert(ft != Type.Int)
+    print("Type variants ✓")
+
+    // Expr variants
+    assert(Expr.Lit(1) != Expr.Lit(2))
+    assert(Expr.Var(0) == Expr.Var(0))
+    print("Expr variants ✓")
+
+    // Replace var
+    let cc3 = ClosureConverter.new(0, 0)
+    let orig = Expr.BinOp("+".into(), Box.new(Expr.Var(5)), Box.new(Expr.Var(6)))
+    let replaced = cc3.replace_var(&orig, 5, Expr.Lit(99))
+    match &replaced {
+        Expr.BinOp(_, lhs, _) => assert(**lhs == Expr.Lit(99)),
+        _ => assert(false),
+    }
+    print("Replace var ✓")
+
+    // If expression free vars
+    let if_expr = Expr.If(
+        Box.new(Expr.Var(10)),
+        Box.new(Expr.Var(11)),
+        Box.new(Expr.Var(12))
     )
-    assert(id2 == 1)
-    assert(converter.closures[1].is_move)
-    print("Move closure \u2713")
+    let free4 = FreeVarAnalyzer.new().analyze(&if_expr)
+    assert(free4.len() == 3)
+    print("If free vars ✓")
 
-    // Convert
-    converter.convert_all()
-    assert(converter.converted.len() == 2)
-    assert(converter.converted[0].struct_name == "__Closure_0")
-    assert(converter.converted[1].struct_name == "__Closure_1")
-    print("Convert closures \u2713")
+    // Nested lambdas
+    let nested = Expr.Lambda(Lambda {
+        params: vec![0],
+        body: Box.new(Expr.Lambda(Lambda {
+            params: vec![1],
+            body: Box.new(Expr.BinOp("+".into(),
+                Box.new(Expr.Var(0)),
+                Box.new(Expr.Var(2))
+            )),
+            captures: vec![],
+        })),
+        captures: vec![],
+    })
+    let free5 = FreeVarAnalyzer.new().analyze(&nested)
+    assert(free5.contains(&2))
+    assert(!free5.contains(&0))
+    assert(!free5.contains(&1))
+    print("Nested lambdas ✓")
 
-    // Check traits
-    assert(converter.converted[0].impl_trait == "Fn")  // no mut captures
-    assert(converter.converted[1].impl_trait == "FnOnce")  // move
-    print("Trait selection \u2713")
-
-    // Check call body uses self.x
-    let call_body = &converter.converted[0].call_fn.body
-    assert(call_body[0].contains("self.x"))
-    assert(call_body[0].contains("self.y"))
-    print("Body rewriting \u2713")
-
-    // Emit IR
-    let ir = converter.emit_ir()
-    assert(ir.len() > 0)
-    assert(ir[0].contains("struct __Closure_0"))
-    print("IR emission \u2713")
-
-    // CaptureKind
-    let cv = CapturedVar { name: "x".to_string(), ty: "i32".to_string(), kind: CaptureKind.ByRef, source_scope: 0 }
-    match cv.kind { CaptureKind.ByRef => {} _ => panic!("wrong kind") }
-    print("CaptureKind \u2713")
-
-    print("Closure Conversion complete \u2713")
+    print("Closure Conversion complete ✓")
 }
