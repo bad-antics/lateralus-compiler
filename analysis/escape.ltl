@@ -1,0 +1,227 @@
+
+// Escape Analysis - Determines whether objects can be stack-allocated
+// Tracks references to decide if values escape their defining scope.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum AllocSite { Stack(u32), Heap(u32), Unknown(u32) }
+
+impl AllocSite {
+    fn id(self) -> u32 { match self { AllocSite.Stack(i) | AllocSite.Heap(i) | AllocSite.Unknown(i) => i } }
+    fn is_heap(self) -> bool { matches!(self, AllocSite.Heap(_)) }
+    fn is_stack(self) -> bool { matches!(self, AllocSite.Stack(_)) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EscapeState { NoEscape, ArgEscape, GlobalEscape }
+
+impl EscapeState {
+    fn escapes(self) -> bool { self != EscapeState.NoEscape }
+    fn merge(self, other: EscapeState) -> EscapeState {
+        match (self, other) {
+            (EscapeState.GlobalEscape, _) | (_, EscapeState.GlobalEscape) => EscapeState.GlobalEscape,
+            (EscapeState.ArgEscape, _) | (_, EscapeState.ArgEscape) => EscapeState.ArgEscape,
+            _ => EscapeState.NoEscape,
+        }
+    }
+    fn can_stack_allocate(self) -> bool { self == EscapeState.NoEscape }
+}
+
+#[derive(Clone, Debug)]
+struct VarInfo {
+    name: string,
+    alloc: AllocSite,
+    escape_state: EscapeState,
+    referenced_by: HashSet<string>,
+    references: HashSet<string>,
+    is_return_value: bool,
+    is_stored_to_global: bool,
+    is_passed_to_fn: bool,
+}
+
+impl VarInfo {
+    fn new(name: &str, alloc: AllocSite) -> VarInfo {
+        VarInfo {
+            name: name.into(), alloc, escape_state: EscapeState.NoEscape,
+            referenced_by: HashSet.new(), references: HashSet.new(),
+            is_return_value: false, is_stored_to_global: false, is_passed_to_fn: false,
+        }
+    }
+    fn mark_returned(mut self) { self.is_return_value = true; self.escape_state = EscapeState.GlobalEscape }
+    fn mark_global_store(mut self) { self.is_stored_to_global = true; self.escape_state = EscapeState.GlobalEscape }
+    fn mark_arg_passed(mut self) { self.is_passed_to_fn = true; self.escape_state = self.escape_state.merge(EscapeState.ArgEscape) }
+    fn add_reference(mut self, target: &str) { self.references.insert(target.into()) }
+    fn add_referenced_by(mut self, source: &str) { self.referenced_by.insert(source.into()) }
+}
+
+struct EscapeAnalysis {
+    vars: HashMap<string, VarInfo>,
+    next_id: u32,
+    stack_promoted: u32,
+    heap_required: u32,
+}
+
+impl EscapeAnalysis {
+    fn new() -> EscapeAnalysis {
+        EscapeAnalysis { vars: HashMap.new(), next_id: 0, stack_promoted: 0, heap_required: 0 }
+    }
+
+    fn alloc_id(mut self) -> u32 { let id = self.next_id; self.next_id += 1; id }
+
+    fn declare(mut self, name: &str) -> AllocSite {
+        let id = self.alloc_id()
+        let alloc = AllocSite.Unknown(id)
+        self.vars.insert(name.into(), VarInfo.new(name, alloc))
+        alloc
+    }
+
+    fn mark_returned(mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(&name.into()) { v.mark_returned() }
+    }
+
+    fn mark_global_store(mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(&name.into()) { v.mark_global_store() }
+    }
+
+    fn mark_arg_passed(mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(&name.into()) { v.mark_arg_passed() }
+    }
+
+    fn add_reference(mut self, from: &str, to: &str) {
+        if let Some(v) = self.vars.get_mut(&from.into()) { v.add_reference(to) }
+        if let Some(v) = self.vars.get_mut(&to.into()) { v.add_referenced_by(from) }
+    }
+
+    fn propagate(mut self) {
+        let mut changed = true
+        while changed {
+            changed = false
+            let names: [string] = self.vars.keys().cloned().collect()
+            for name in &names {
+                let refs: HashSet<string> = self.vars.get(name).unwrap().references.clone()
+                let state = self.vars.get(name).unwrap().escape_state
+                for ref_name in &refs {
+                    if let Some(target) = self.vars.get_mut(ref_name) {
+                        let new_state = target.escape_state.merge(state)
+                        if new_state != target.escape_state {
+                            target.escape_state = new_state
+                            changed = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finalize(mut self) {
+        self.propagate()
+        let names: [string] = self.vars.keys().cloned().collect()
+        for name in &names {
+            let var = self.vars.get_mut(name).unwrap()
+            if var.escape_state.can_stack_allocate() {
+                var.alloc = AllocSite.Stack(var.alloc.id())
+                self.stack_promoted += 1
+            } else {
+                var.alloc = AllocSite.Heap(var.alloc.id())
+                self.heap_required += 1
+            }
+        }
+    }
+
+    fn get_state(self, name: &str) -> Option<EscapeState> {
+        self.vars.get(&name.into()).map(|v| v.escape_state)
+    }
+
+    fn get_alloc(self, name: &str) -> Option<AllocSite> {
+        self.vars.get(&name.into()).map(|v| v.alloc)
+    }
+
+    fn stack_count(self) -> u32 { self.stack_promoted }
+    fn heap_count(self) -> u32 { self.heap_required }
+    fn var_count(self) -> usize { self.vars.len() }
+}
+
+fn main() {
+    // EscapeState
+    assert(!EscapeState.NoEscape.escapes())
+    assert(EscapeState.ArgEscape.escapes())
+    assert(EscapeState.GlobalEscape.escapes())
+    assert(EscapeState.NoEscape.can_stack_allocate())
+    assert(!EscapeState.ArgEscape.can_stack_allocate())
+    print("EscapeState ✓")
+
+    // Merge
+    assert(EscapeState.NoEscape.merge(EscapeState.NoEscape) == EscapeState.NoEscape)
+    assert(EscapeState.NoEscape.merge(EscapeState.ArgEscape) == EscapeState.ArgEscape)
+    assert(EscapeState.ArgEscape.merge(EscapeState.GlobalEscape) == EscapeState.GlobalEscape)
+    print("Merge ✓")
+
+    // Simple: local variable doesn't escape
+    let mut ea = EscapeAnalysis.new()
+    ea.declare("x")
+    ea.declare("y")
+    ea.finalize()
+    assert(ea.get_state("x") == Some(EscapeState.NoEscape))
+    assert(ea.get_alloc("x").unwrap().is_stack())
+    assert(ea.stack_count() == 2)
+    assert(ea.heap_count() == 0)
+    print("No escape ✓")
+
+    // Returned value escapes
+    let mut ea2 = EscapeAnalysis.new()
+    ea2.declare("result")
+    ea2.declare("temp")
+    ea2.mark_returned("result")
+    ea2.finalize()
+    assert(ea2.get_state("result") == Some(EscapeState.GlobalEscape))
+    assert(ea2.get_alloc("result").unwrap().is_heap())
+    assert(ea2.get_alloc("temp").unwrap().is_stack())
+    assert(ea2.stack_count() == 1)
+    assert(ea2.heap_count() == 1)
+    print("Return escape ✓")
+
+    // Global store escapes
+    let mut ea3 = EscapeAnalysis.new()
+    ea3.declare("obj")
+    ea3.mark_global_store("obj")
+    ea3.finalize()
+    assert(ea3.get_state("obj") == Some(EscapeState.GlobalEscape))
+    print("Global escape ✓")
+
+    // Arg escape
+    let mut ea4 = EscapeAnalysis.new()
+    ea4.declare("buf")
+    ea4.mark_arg_passed("buf")
+    ea4.finalize()
+    assert(ea4.get_state("buf") == Some(EscapeState.ArgEscape))
+    assert(ea4.get_alloc("buf").unwrap().is_heap())
+    print("Arg escape ✓")
+
+    // Propagation: a references b, b escapes -> a escapes
+    let mut ea5 = EscapeAnalysis.new()
+    ea5.declare("a")
+    ea5.declare("b")
+    ea5.add_reference("a", "b")
+    ea5.mark_returned("a")
+    ea5.finalize()
+    assert(ea5.get_state("a") == Some(EscapeState.GlobalEscape))
+    assert(ea5.get_state("b") == Some(EscapeState.GlobalEscape))
+    print("Propagation ✓")
+
+    // Mixed
+    let mut ea6 = EscapeAnalysis.new()
+    ea6.declare("local1")
+    ea6.declare("local2")
+    ea6.declare("escaped")
+    ea6.declare("passed")
+    ea6.mark_returned("escaped")
+    ea6.mark_arg_passed("passed")
+    ea6.finalize()
+    assert(ea6.stack_count() == 2)
+    assert(ea6.heap_count() == 2)
+    assert(ea6.var_count() == 4)
+    print("Mixed ✓")
+
+    print("Escape analysis complete ✓")
+}
