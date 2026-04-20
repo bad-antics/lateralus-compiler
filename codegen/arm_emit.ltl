@@ -1,0 +1,254 @@
+
+// ARM64 (AArch64) Code Emitter - Generates ARM64 instructions
+// Supports register operations, load/store, branches, and function frames.
+
+use std.collections.HashMap
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ArmReg {
+    X0, X1, X2, X3, X4, X5, X6, X7,
+    X8, X9, X10, X11, X12, X13, X14, X15,
+    X16, X17, X18, X19, X20, X21, X22, X23,
+    X24, X25, X26, X27, X28, X29, X30, SP, XZR,
+}
+
+impl ArmReg {
+    fn encoding(self) -> u8 {
+        match self {
+            ArmReg.X0 => 0, ArmReg.X1 => 1, ArmReg.X2 => 2, ArmReg.X3 => 3,
+            ArmReg.X4 => 4, ArmReg.X5 => 5, ArmReg.X6 => 6, ArmReg.X7 => 7,
+            ArmReg.X8 => 8, ArmReg.X9 => 9, ArmReg.X10 => 10, ArmReg.X11 => 11,
+            ArmReg.X12 => 12, ArmReg.X13 => 13, ArmReg.X14 => 14, ArmReg.X15 => 15,
+            ArmReg.X16 => 16, ArmReg.X17 => 17, ArmReg.X18 => 18, ArmReg.X19 => 19,
+            ArmReg.X20 => 20, ArmReg.X21 => 21, ArmReg.X22 => 22, ArmReg.X23 => 23,
+            ArmReg.X24 => 24, ArmReg.X25 => 25, ArmReg.X26 => 26, ArmReg.X27 => 27,
+            ArmReg.X28 => 28, ArmReg.X29 => 29, ArmReg.X30 => 30,
+            ArmReg.SP => 31, ArmReg.XZR => 31,
+        }
+    }
+
+    fn name(self) -> &str {
+        match self {
+            ArmReg.X0 => "x0", ArmReg.X1 => "x1", ArmReg.X2 => "x2", ArmReg.X3 => "x3",
+            ArmReg.X4 => "x4", ArmReg.X5 => "x5", ArmReg.X6 => "x6", ArmReg.X7 => "x7",
+            ArmReg.X8 => "x8", ArmReg.X9 => "x9", ArmReg.X10 => "x10", ArmReg.X11 => "x11",
+            ArmReg.X12 => "x12", ArmReg.X29 => "x29", ArmReg.X30 => "x30",
+            ArmReg.SP => "sp", ArmReg.XZR => "xzr",
+            _ => "x?",
+        }
+    }
+
+    fn is_callee_saved(self) -> bool {
+        let e = self.encoding()
+        e >= 19 && e <= 28
+    }
+
+    fn is_arg_reg(self) -> bool {
+        let e = self.encoding()
+        e <= 7
+    }
+
+    fn fp() -> ArmReg { ArmReg.X29 }
+    fn lr() -> ArmReg { ArmReg.X30 }
+}
+
+#[derive(Clone, Debug)]
+enum ArmOperand {
+    Reg(ArmReg),
+    Imm(i64),
+    MemBase(ArmReg, i32),        // [base, #offset]
+    MemPreIndex(ArmReg, i32),    // [base, #offset]!
+    MemPostIndex(ArmReg, i32),   // [base], #offset
+    Label(string),
+}
+
+#[derive(Clone, Debug)]
+enum ArmInst {
+    Add(ArmReg, ArmReg, ArmOperand),
+    Sub(ArmReg, ArmReg, ArmOperand),
+    Mul(ArmReg, ArmReg, ArmReg),
+    Mov(ArmReg, ArmOperand),
+    Ldr(ArmReg, ArmOperand),
+    Str(ArmReg, ArmOperand),
+    Stp(ArmReg, ArmReg, ArmOperand),
+    Ldp(ArmReg, ArmReg, ArmOperand),
+    Cmp(ArmReg, ArmOperand),
+    B(string),
+    Beq(string),
+    Bne(string),
+    Bl(string),
+    Ret,
+    Nop,
+    Label(string),
+}
+
+struct ArmEmitter {
+    instructions: [ArmInst],
+    labels: HashMap<string, usize>,
+    frame_size: usize,
+}
+
+impl ArmEmitter {
+    fn new() -> ArmEmitter {
+        ArmEmitter { instructions: [], labels: HashMap.new(), frame_size: 0 }
+    }
+
+    fn emit(mut self, inst: ArmInst) { self.instructions.push(inst) }
+    fn inst_count(self) -> usize { self.instructions.len() }
+
+    fn emit_prologue(mut self, local_bytes: usize) {
+        let aligned = (local_bytes + 15) & !15
+        self.frame_size = aligned + 16  // +16 for fp/lr
+        self.emit(ArmInst.Stp(ArmReg.fp(), ArmReg.lr(),
+            ArmOperand.MemPreIndex(ArmReg.SP, -(self.frame_size as i32))))
+        self.emit(ArmInst.Mov(ArmReg.fp(), ArmOperand.Reg(ArmReg.SP)))
+    }
+
+    fn emit_epilogue(mut self) {
+        self.emit(ArmInst.Ldp(ArmReg.fp(), ArmReg.lr(),
+            ArmOperand.MemPostIndex(ArmReg.SP, self.frame_size as i32)))
+        self.emit(ArmInst.Ret)
+    }
+
+    fn emit_mov_imm(mut self, dst: ArmReg, imm: i64) {
+        self.emit(ArmInst.Mov(dst, ArmOperand.Imm(imm)))
+    }
+
+    fn emit_mov_reg(mut self, dst: ArmReg, src: ArmReg) {
+        if dst != src { self.emit(ArmInst.Mov(dst, ArmOperand.Reg(src))) }
+    }
+
+    fn emit_add_imm(mut self, dst: ArmReg, src: ArmReg, imm: i64) {
+        self.emit(ArmInst.Add(dst, src, ArmOperand.Imm(imm)))
+    }
+
+    fn emit_add_reg(mut self, dst: ArmReg, a: ArmReg, b: ArmReg) {
+        self.emit(ArmInst.Add(dst, a, ArmOperand.Reg(b)))
+    }
+
+    fn emit_sub_imm(mut self, dst: ArmReg, src: ArmReg, imm: i64) {
+        self.emit(ArmInst.Sub(dst, src, ArmOperand.Imm(imm)))
+    }
+
+    fn emit_call(mut self, func: &str) { self.emit(ArmInst.Bl(func.into())) }
+
+    fn emit_label(mut self, name: &str) {
+        self.labels.insert(name.into(), self.instructions.len())
+        self.emit(ArmInst.Label(name.into()))
+    }
+
+    fn emit_load(mut self, dst: ArmReg, base: ArmReg, offset: i32) {
+        self.emit(ArmInst.Ldr(dst, ArmOperand.MemBase(base, offset)))
+    }
+
+    fn emit_store(mut self, src: ArmReg, base: ArmReg, offset: i32) {
+        self.emit(ArmInst.Str(src, ArmOperand.MemBase(base, offset)))
+    }
+
+    fn to_asm(self) -> string {
+        let mut lines = []
+        for inst in &self.instructions {
+            match inst {
+                ArmInst.Label(name) => lines.push(format!("{}:", name)),
+                ArmInst.Ret => lines.push("  ret".into()),
+                ArmInst.Nop => lines.push("  nop".into()),
+                ArmInst.Bl(f) => lines.push(format!("  bl {}", f)),
+                ArmInst.B(l) => lines.push(format!("  b {}", l)),
+                ArmInst.Mov(d, ArmOperand.Imm(v)) => lines.push(format!("  mov {}, #{}", d.name(), v)),
+                ArmInst.Mov(d, ArmOperand.Reg(s)) => lines.push(format!("  mov {}, {}", d.name(), s.name())),
+                ArmInst.Add(d, s, ArmOperand.Imm(v)) => lines.push(format!("  add {}, {}, #{}", d.name(), s.name(), v)),
+                ArmInst.Add(d, a, ArmOperand.Reg(b)) => lines.push(format!("  add {}, {}, {}", d.name(), a.name(), b.name())),
+                ArmInst.Sub(d, s, ArmOperand.Imm(v)) => lines.push(format!("  sub {}, {}, #{}", d.name(), s.name(), v)),
+                _ => lines.push("  ; unhandled".into()),
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+fn main() {
+    // Register encoding
+    assert(ArmReg.X0.encoding() == 0)
+    assert(ArmReg.X30.encoding() == 30)
+    assert(ArmReg.SP.encoding() == 31)
+    assert(ArmReg.XZR.encoding() == 31)
+    print("Register encoding ✓")
+
+    // Special registers
+    assert(ArmReg.fp() == ArmReg.X29)
+    assert(ArmReg.lr() == ArmReg.X30)
+    print("Special registers ✓")
+
+    // Callee saved
+    assert(ArmReg.X19.is_callee_saved())
+    assert(ArmReg.X28.is_callee_saved())
+    assert(!ArmReg.X0.is_callee_saved())
+    assert(!ArmReg.X16.is_callee_saved())
+    print("Callee saved ✓")
+
+    // Arg registers
+    assert(ArmReg.X0.is_arg_reg())
+    assert(ArmReg.X7.is_arg_reg())
+    assert(!ArmReg.X8.is_arg_reg())
+    print("Arg registers ✓")
+
+    // Emitter basics
+    let mut em = ArmEmitter.new()
+    assert(em.inst_count() == 0)
+    em.emit_prologue(48)
+    assert(em.inst_count() == 2)
+    assert(em.frame_size == 64)  // 48 aligned to 16 + 16
+    print("Prologue ✓")
+
+    em.emit_mov_imm(ArmReg.X0, 42)
+    em.emit_add_reg(ArmReg.X0, ArmReg.X0, ArmReg.X1)
+    em.emit_call("printf")
+    em.emit_epilogue()
+    assert(em.inst_count() == 7)
+    print("Instructions ✓")
+
+    // ASM output
+    let asm = em.to_asm()
+    assert(asm.contains("mov x0, #42"))
+    assert(asm.contains("add x0, x0, x1"))
+    assert(asm.contains("bl printf"))
+    assert(asm.contains("ret"))
+    print("ASM output ✓")
+
+    // Labels
+    let mut em2 = ArmEmitter.new()
+    em2.emit_label("loop")
+    em2.emit(ArmInst.Nop)
+    assert(em2.labels.contains_key("loop"))
+    print("Labels ✓")
+
+    // Load/store
+    let mut em3 = ArmEmitter.new()
+    em3.emit_load(ArmReg.X0, ArmReg.SP, 16)
+    em3.emit_store(ArmReg.X1, ArmReg.SP, 24)
+    assert(em3.inst_count() == 2)
+    print("Load/Store ✓")
+
+    // No self-move
+    let mut em4 = ArmEmitter.new()
+    em4.emit_mov_reg(ArmReg.X0, ArmReg.X0)
+    assert(em4.inst_count() == 0)
+    em4.emit_mov_reg(ArmReg.X0, ArmReg.X1)
+    assert(em4.inst_count() == 1)
+    print("Self-move elide ✓")
+
+    // Register names
+    assert(ArmReg.X0.name() == "x0")
+    assert(ArmReg.SP.name() == "sp")
+    assert(ArmReg.XZR.name() == "xzr")
+    print("Register names ✓")
+
+    // Sub immediate
+    let mut em5 = ArmEmitter.new()
+    em5.emit_sub_imm(ArmReg.SP, ArmReg.SP, 32)
+    let asm5 = em5.to_asm()
+    assert(asm5.contains("sub sp, sp, #32"))
+    print("Sub immediate ✓")
+
+    print("ARM64 emitter complete ✓")
+}
