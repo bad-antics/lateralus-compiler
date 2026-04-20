@@ -1,281 +1,317 @@
 // Compiler Pass - Tail Call Optimization
-// Transforms tail-recursive calls into loops.
+// Detects tail calls and transforms them into loops to avoid stack overflow.
 
-use std.collections.HashSet
+use std.collections.{HashMap, HashSet}
+use std.fmt.{Display, Formatter}
 
-#[derive(Clone, Debug)]
-enum Instruction {
-    Assign(string, Expr),
-    Return(Expr),
-    Branch(Expr, usize, usize),  // cond, then_block, else_block
-    Jump(usize),
-    Call(string, string, [Expr]),  // dest, fn_name, args
-    TailCall(string, [Expr]),      // fn_name, args (optimized)
-    Phi(string, [(usize, Expr)]),  // dest, [(block, value)]
-    Nop,
-}
+type FuncId = usize
+type VarId = usize
+type BlockId = usize
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Expr {
-    Var(string),
+    Var(VarId),
     Lit(i64),
+    Call(FuncId, [Expr]),
+    SelfCall([Expr]),         // recursive self-call
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    Let(VarId, Box<Expr>, Box<Expr>),
     BinOp(string, Box<Expr>, Box<Expr>),
-    Call(string, [Expr]),
-    Void,
+    Seq([Expr]),
+    Return(Box<Expr>),
+    Loop(Box<Expr>),
+    Continue,
+    Assign(VarId, Box<Expr>),
 }
 
-struct BasicBlock {
-    id: usize,
-    instructions: [Instruction],
-}
-
-struct Function {
+#[derive(Clone, Debug)]
+struct FuncDef {
+    id: FuncId,
     name: string,
-    params: [string],
-    blocks: [BasicBlock],
+    params: [VarId],
+    body: Expr,
     is_recursive: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum TailPosition {
+    Tail,
+    NonTail,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TcoStats {
+    functions_analyzed: usize,
+    tail_calls_found: usize,
+    tail_calls_optimized: usize,
+    non_tail_recursive: usize,
+    loops_created: usize,
+}
+
 struct TailCallOptimizer {
-    optimized_count: usize,
-    failed_count: usize,
-    debug: bool,
+    stats: TcoStats,
 }
 
 impl TailCallOptimizer {
     fn new() -> TailCallOptimizer {
-        TailCallOptimizer { optimized_count: 0, failed_count: 0, debug: false }
+        TailCallOptimizer { stats: TcoStats.default() }
     }
 
-    fn optimize(mut self, func: &mut Function) -> bool {
+    fn optimize_func(mut self, func: &FuncDef) -> FuncDef {
+        self.stats.functions_analyzed += 1
+
+        if !func.is_recursive {
+            return func.clone()
+        }
+
+        // Check if all recursive calls are in tail position
+        let tail_calls = self.find_tail_calls(&func.body, func.id, TailPosition.Tail)
+        let non_tail = self.find_non_tail_calls(&func.body, func.id, TailPosition.Tail)
+
+        self.stats.tail_calls_found += tail_calls
+        self.stats.non_tail_recursive += non_tail
+
+        if tail_calls == 0 {
+            return func.clone()
+        }
+
+        // Transform: wrap body in loop, replace self-calls with param assignment + continue
+        let transformed = self.transform_body(&func.body, &func.params, func.id)
+        self.stats.loops_created += 1
+        self.stats.tail_calls_optimized += tail_calls
+
+        FuncDef {
+            id: func.id,
+            name: func.name.clone(),
+            params: func.params.clone(),
+            body: Expr.Loop(Box.new(Expr.Return(Box.new(transformed)))),
+            is_recursive: false,  // no longer recursive
+        }
+    }
+
+    fn find_tail_calls(self, expr: &Expr, func_id: FuncId, pos: TailPosition) -> usize {
+        match expr {
+            Expr.Call(id, _) | Expr.SelfCall(_) if pos == TailPosition.Tail => {
+                let is_self = match expr {
+                    Expr.Call(id, _) => *id == func_id,
+                    Expr.SelfCall(_) => true,
+                    _ => false,
+                };
+                if is_self { 1 } else { 0 }
+            },
+            Expr.If(_, then_, else_) => {
+                self.find_tail_calls(then_, func_id, pos.clone())
+                    + self.find_tail_calls(else_, func_id, pos)
+            },
+            Expr.Let(_, _, body) => self.find_tail_calls(body, func_id, pos),
+            Expr.Seq(exprs) => {
+                if let some(last) = exprs.last() {
+                    self.find_tail_calls(last, func_id, pos)
+                } else { 0 }
+            },
+            Expr.Return(inner) => self.find_tail_calls(inner, func_id, TailPosition.Tail),
+            _ => 0,
+        }
+    }
+
+    fn find_non_tail_calls(self, expr: &Expr, func_id: FuncId, pos: TailPosition) -> usize {
+        match expr {
+            Expr.Call(id, args) => {
+                let self_in_non_tail = if *id == func_id && pos == TailPosition.NonTail { 1 } else { 0 };
+                let in_args: usize = args.iter()
+                    .map(|a| self.find_non_tail_calls(a, func_id, TailPosition.NonTail))
+                    .sum();
+                self_in_non_tail + in_args
+            },
+            Expr.SelfCall(args) if pos == TailPosition.NonTail => 1,
+            Expr.If(cond, then_, else_) => {
+                self.find_non_tail_calls(cond, func_id, TailPosition.NonTail)
+                    + self.find_non_tail_calls(then_, func_id, pos.clone())
+                    + self.find_non_tail_calls(else_, func_id, pos)
+            },
+            Expr.Let(_, val, body) => {
+                self.find_non_tail_calls(val, func_id, TailPosition.NonTail)
+                    + self.find_non_tail_calls(body, func_id, pos)
+            },
+            Expr.BinOp(_, l, r) => {
+                self.find_non_tail_calls(l, func_id, TailPosition.NonTail)
+                    + self.find_non_tail_calls(r, func_id, TailPosition.NonTail)
+            },
+            Expr.Seq(exprs) => {
+                let mut total = 0;
+                for (i, e) in exprs.iter().enumerate() {
+                    let p = if i == exprs.len() - 1 { pos.clone() } else { TailPosition.NonTail };
+                    total += self.find_non_tail_calls(e, func_id, p)
+                }
+                total
+            },
+            _ => 0,
+        }
+    }
+
+    fn transform_body(self, expr: &Expr, params: &[VarId], func_id: FuncId) -> Expr {
+        match expr {
+            Expr.Call(id, args) if *id == func_id => {
+                // Replace with: param0 = arg0; param1 = arg1; ...; continue
+                let mut stmts: [Expr] = vec![]
+                for (i, arg) in args.iter().enumerate() {
+                    stmts.push(Expr.Assign(params[i], Box.new(arg.clone())))
+                }
+                stmts.push(Expr.Continue)
+                Expr.Seq(stmts)
+            },
+            Expr.SelfCall(args) => {
+                let mut stmts: [Expr] = vec![]
+                for (i, arg) in args.iter().enumerate() {
+                    stmts.push(Expr.Assign(params[i], Box.new(arg.clone())))
+                }
+                stmts.push(Expr.Continue)
+                Expr.Seq(stmts)
+            },
+            Expr.If(cond, then_, else_) => {
+                Expr.If(
+                    cond.clone(),
+                    Box.new(self.transform_body(then_, params, func_id)),
+                    Box.new(self.transform_body(else_, params, func_id)),
+                )
+            },
+            Expr.Let(var, val, body) => {
+                Expr.Let(*var, val.clone(), Box.new(self.transform_body(body, params, func_id)))
+            },
+            Expr.Seq(exprs) => {
+                if exprs.is_empty() { return expr.clone() }
+                let mut new_exprs = exprs[..exprs.len()-1].to_vec();
+                new_exprs.push(self.transform_body(exprs.last().unwrap(), params, func_id));
+                Expr.Seq(new_exprs)
+            },
+            Expr.Return(inner) => {
+                Expr.Return(Box.new(self.transform_body(inner, params, func_id)))
+            },
+            _ => expr.clone(),
+        }
+    }
+
+    fn is_tail_recursive(self, func: &FuncDef) -> bool {
         if !func.is_recursive { return false }
-
-        let mut changed = false
-        for block in func.blocks.iter_mut() {
-            let len = block.instructions.len()
-            if len < 1 { continue }
-
-            // Check last instruction is Return
-            let last_idx = len - 1
-            let is_tail = match &block.instructions[last_idx] {
-                Instruction.Return(Expr.Var(var)) => {
-                    // Check if previous instruction is a call to self assigned to var
-                    if last_idx > 0 {
-                        match &block.instructions[last_idx - 1] {
-                            Instruction.Call(dest, fn_name, args) if dest == var && fn_name == &func.name => {
-                                some((fn_name.clone(), args.clone()))
-                            },
-                            _ => none,
-                        }
-                    } else { none }
-                },
-                Instruction.Return(Expr.Call(fn_name, args)) if fn_name == &func.name => {
-                    some((fn_name.clone(), args.clone()))
-                },
-                _ => none,
-            }
-
-            if let some((fn_name, args)) = is_tail {
-                // Replace call + return with tail call
-                if last_idx > 0 {
-                    match &block.instructions[last_idx - 1] {
-                        Instruction.Call(_, f, _) if f == &func.name => {
-                            block.instructions[last_idx - 1] = Instruction.Nop
-                        },
-                        _ => {},
-                    }
-                }
-                block.instructions[last_idx] = Instruction.TailCall(fn_name, args)
-                self.optimized_count += 1
-                changed = true
-            }
-        }
-
-        if !changed { self.failed_count += 1 }
-        changed
+        let tails = self.find_tail_calls(&func.body, func.id, TailPosition.Tail)
+        let non_tails = self.find_non_tail_calls(&func.body, func.id, TailPosition.Tail)
+        tails > 0 && non_tails == 0
     }
 
-    fn lower_tail_calls(self, func: &mut Function) {
-        // Convert TailCall instructions into parameter reassignment + jump to entry
-        let entry_block = 0usize
-        let params = func.params.clone()
-
-        for block in func.blocks.iter_mut() {
-            let mut new_instructions: [Instruction] = []
-            for instr in &block.instructions {
-                match instr {
-                    Instruction.TailCall(_, args) => {
-                        // Assign args to temp vars first (avoid aliasing)
-                        let mut temps: [string] = []
-                        for (i, arg) in args.iter().enumerate() {
-                            let temp = format!("__tco_temp_{}", i)
-                            new_instructions.push(Instruction.Assign(temp.clone(), arg.clone()))
-                            temps.push(temp)
-                        }
-                        // Assign temps to params
-                        for (i, param) in params.iter().enumerate() {
-                            new_instructions.push(Instruction.Assign(
-                                param.clone(),
-                                Expr.Var(temps[i].clone())
-                            ))
-                        }
-                        // Jump to entry
-                        new_instructions.push(Instruction.Jump(entry_block))
-                    },
-                    _ => new_instructions.push(instr.clone()),
-                }
-            }
-            block.instructions = new_instructions
-        }
-    }
-
-    fn is_tail_position(block: &BasicBlock, idx: usize) -> bool {
-        let len = block.instructions.len()
-        if idx == len - 1 {
-            match &block.instructions[idx] {
-                Instruction.Return(_) => true,
-                _ => false,
-            }
-        } else if idx == len - 2 {
-            match (&block.instructions[idx], &block.instructions[idx + 1]) {
-                (Instruction.Call(dest, _, _), Instruction.Return(Expr.Var(var))) => dest == var,
-                _ => false,
-            }
-        } else { false }
-    }
-
-    fn find_recursive_calls(func: &Function) -> [usize] {
-        let mut positions: [usize] = []
-        for (block_id, block) in func.blocks.iter().enumerate() {
-            for (idx, instr) in block.instructions.iter().enumerate() {
-                match instr {
-                    Instruction.Call(_, fn_name, _) if fn_name == &func.name => {
-                        positions.push(block_id)
-                    },
-                    Instruction.Return(Expr.Call(fn_name, _)) if fn_name == &func.name => {
-                        positions.push(block_id)
-                    },
-                    _ => {},
-                }
-            }
-        }
-        positions
-    }
-
-    fn stats(self) -> (usize, usize) {
-        (self.optimized_count, self.failed_count)
-    }
+    fn stats(self) -> &TcoStats { &self.stats }
 }
 
 fn main() {
-    // Build a simple recursive factorial function:
-    // fn factorial(n, acc):
-    //   if n <= 1: return acc
-    //   return factorial(n-1, n*acc)
-    let mut func = Function {
-        name: "factorial".to_string(),
-        params: vec!["n".to_string(), "acc".to_string()],
-        blocks: vec![
-            BasicBlock {
-                id: 0,
-                instructions: vec![
-                    Instruction.Branch(
-                        Expr.BinOp("<=".to_string(), Box.new(Expr.Var("n".to_string())), Box.new(Expr.Lit(1))),
-                        1, 2
-                    ),
-                ],
-            },
-            BasicBlock {
-                id: 1,
-                instructions: vec![
-                    Instruction.Return(Expr.Var("acc".to_string())),
-                ],
-            },
-            BasicBlock {
-                id: 2,
-                instructions: vec![
-                    Instruction.Return(Expr.Call("factorial".to_string(), vec![
-                        Expr.BinOp("-".to_string(), Box.new(Expr.Var("n".to_string())), Box.new(Expr.Lit(1))),
-                        Expr.BinOp("*".to_string(), Box.new(Expr.Var("n".to_string())), Box.new(Expr.Var("acc".to_string()))),
-                    ])),
-                ],
-            },
-        ],
+    // TailPosition
+    assert(TailPosition.Tail != TailPosition.NonTail)
+    print("TailPosition ✓")
+
+    // Simple tail-recursive factorial: fact(n, acc) = if n <= 1 then acc else fact(n-1, n*acc)
+    let fact = FuncDef {
+        id: 0, name: "factorial".into(), params: vec![1, 2],
         is_recursive: true,
+        body: Expr.If(
+            Box.new(Expr.BinOp("<=".into(), Box.new(Expr.Var(1)), Box.new(Expr.Lit(1)))),
+            Box.new(Expr.Var(2)),
+            Box.new(Expr.Call(0, vec![
+                Expr.BinOp("-".into(), Box.new(Expr.Var(1)), Box.new(Expr.Lit(1))),
+                Expr.BinOp("*".into(), Box.new(Expr.Var(1)), Box.new(Expr.Var(2))),
+            ])),
+        ),
     }
 
-    // Find recursive calls
-    let rec_calls = TailCallOptimizer.find_recursive_calls(&func)
-    assert(rec_calls.len() == 1)
-    assert(rec_calls[0] == 2)  // block 2 has the recursive call
-    print("Find recursive calls ✓")
+    let mut tco = TailCallOptimizer.new()
+    assert(tco.is_tail_recursive(&fact))
+    print("Detected tail recursion ✓")
 
-    // Optimize
-    let mut optimizer = TailCallOptimizer.new()
-    let changed = optimizer.optimize(&mut func)
-    assert(changed)
-    print("TCO optimize ✓")
+    let optimized = tco.optimize_func(&fact)
+    assert(!optimized.is_recursive)
+    assert(tco.stats().tail_calls_found == 1)
+    assert(tco.stats().tail_calls_optimized == 1)
+    assert(tco.stats().loops_created == 1)
+    assert(tco.stats().non_tail_recursive == 0)
+    print("Optimization ✓")
 
-    // Check block 2 now has TailCall
-    match &func.blocks[2].instructions.last().unwrap() {
-        Instruction.TailCall(name, args) => {
-            assert(name == "factorial")
-            assert(args.len() == 2)
-        },
-        _ => panic!("expected TailCall"),
+    // Verify transformed body is a loop
+    match &optimized.body {
+        Expr.Loop(_) => {},
+        _ => assert(false),
     }
-    print("TailCall generated ✓")
+    print("Loop created ✓")
 
-    // Lower tail calls to jumps
-    optimizer.lower_tail_calls(&mut func)
-    let last = func.blocks[2].instructions.last().unwrap()
-    match last {
-        Instruction.Jump(0) => {},
-        _ => panic!("expected jump to entry"),
-    }
-    print("Lower to jump ✓")
-
-    // Check temps were created
-    let has_temp = func.blocks[2].instructions.iter().any(|i| match i {
-        Instruction.Assign(name, _) if name.starts_with("__tco_temp_") => true,
-        _ => false,
-    })
-    assert(has_temp)
-    print("Temp vars created ✓")
-
-    // Stats
-    let (opt, fail) = optimizer.stats()
-    assert(opt == 1)
-    assert(fail == 0)
-    print("Stats ✓")
-
-    // Non-recursive function
-    let mut non_rec = Function {
-        name: "add".to_string(),
-        params: vec!["a".to_string(), "b".to_string()],
-        blocks: vec![BasicBlock {
-            id: 0,
-            instructions: vec![Instruction.Return(
-                Expr.BinOp("+".to_string(), Box.new(Expr.Var("a".to_string())), Box.new(Expr.Var("b".to_string())))
-            )],
-        }],
+    // Non-recursive function: not transformed
+    let non_rec = FuncDef {
+        id: 1, name: "add".into(), params: vec![10, 11],
         is_recursive: false,
+        body: Expr.BinOp("+".into(), Box.new(Expr.Var(10)), Box.new(Expr.Var(11))),
     }
-    let changed2 = optimizer.optimize(&mut non_rec)
-    assert(!changed2)
+    let mut tco2 = TailCallOptimizer.new()
+    let result = tco2.optimize_func(&non_rec)
+    assert(tco2.stats().tail_calls_optimized == 0)
     print("Non-recursive skip ✓")
 
-    // is_tail_position
-    let block = BasicBlock {
-        id: 0,
-        instructions: vec![
-            Instruction.Call("result".to_string(), "foo".to_string(), []),
-            Instruction.Return(Expr.Var("result".to_string())),
-        ],
+    // Non-tail recursive (call in argument position): fib(n) = fib(n-1) + fib(n-2)
+    let fib = FuncDef {
+        id: 2, name: "fib".into(), params: vec![20],
+        is_recursive: true,
+        body: Expr.If(
+            Box.new(Expr.BinOp("<".into(), Box.new(Expr.Var(20)), Box.new(Expr.Lit(2)))),
+            Box.new(Expr.Var(20)),
+            Box.new(Expr.BinOp("+".into(),
+                Box.new(Expr.Call(2, vec![Expr.BinOp("-".into(), Box.new(Expr.Var(20)), Box.new(Expr.Lit(1)))])),
+                Box.new(Expr.Call(2, vec![Expr.BinOp("-".into(), Box.new(Expr.Var(20)), Box.new(Expr.Lit(2)))])),
+            )),
+        ),
     }
-    assert(TailCallOptimizer.is_tail_position(&block, 0))
-    assert(TailCallOptimizer.is_tail_position(&block, 1))
-    print("Tail position check ✓")
+    let mut tco3 = TailCallOptimizer.new()
+    assert(!tco3.is_tail_recursive(&fib))
+    let fib_result = tco3.optimize_func(&fib)
+    assert(fib_result.is_recursive)  // can't optimize
+    assert(tco3.stats().non_tail_recursive == 2)
+    print("Non-tail detected ✓")
+
+    // SelfCall variant
+    let self_call_func = FuncDef {
+        id: 3, name: "countdown".into(), params: vec![30],
+        is_recursive: true,
+        body: Expr.If(
+            Box.new(Expr.BinOp("==".into(), Box.new(Expr.Var(30)), Box.new(Expr.Lit(0)))),
+            Box.new(Expr.Lit(0)),
+            Box.new(Expr.SelfCall(vec![
+                Expr.BinOp("-".into(), Box.new(Expr.Var(30)), Box.new(Expr.Lit(1)))
+            ])),
+        ),
+    }
+    let mut tco4 = TailCallOptimizer.new()
+    let opt = tco4.optimize_func(&self_call_func)
+    assert(!opt.is_recursive)
+    assert(tco4.stats().tail_calls_optimized == 1)
+    print("SelfCall optimization ✓")
+
+    // Stats default
+    let s = TcoStats.default()
+    assert(s.functions_analyzed == 0)
+    assert(s.tail_calls_found == 0)
+    assert(s.loops_created == 0)
+    print("Stats ✓")
+
+    // Expr variants
+    assert(Expr.Lit(1) != Expr.Lit(2))
+    assert(Expr.Continue == Expr.Continue)
+    print("Expr variants ✓")
+
+    // Seq in tail position
+    let seq_func = FuncDef {
+        id: 4, name: "seq_rec".into(), params: vec![40],
+        is_recursive: true,
+        body: Expr.Seq(vec![
+            Expr.Lit(0),
+            Expr.Call(4, vec![Expr.Var(40)]),
+        ]),
+    }
+    let mut tco5 = TailCallOptimizer.new()
+    assert(tco5.is_tail_recursive(&seq_func))
+    print("Seq tail position ✓")
 
     print("Tail Call Optimization complete ✓")
 }
