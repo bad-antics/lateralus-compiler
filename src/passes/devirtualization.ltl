@@ -1,278 +1,301 @@
 // Compiler Pass - Devirtualization
-// Converts virtual/dynamic dispatch calls to direct calls when the concrete type is known.
+// Resolves virtual/dynamic dispatch to direct calls when the concrete type is known.
 
 use std.collections.{HashMap, HashSet}
+use std.fmt.{Display, Formatter}
 
-#[derive(Clone, Debug)]
-struct TypeInfo {
+type TypeId = usize
+type FuncId = usize
+type VarId = usize
+type TraitId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+struct TraitMethod {
+    trait_id: TraitId,
     name: string,
-    is_concrete: bool,
-    impls: [string],  // trait implementations
-    methods: HashMap<string, MethodInfo>,
+    func_id: FuncId,
 }
 
-#[derive(Clone, Debug)]
-struct MethodInfo {
-    name: string,
-    trait_name: Option<string>,
-    is_virtual: bool,
-    signature: string,
+#[derive(Clone, Debug, PartialEq)]
+struct VTableEntry {
+    type_id: TypeId,
+    trait_id: TraitId,
+    methods: [(string, FuncId)],
 }
 
-#[derive(Clone, Debug)]
-enum CallSite {
-    Virtual {
-        receiver: string,      // variable
-        trait_name: string,
-        method: string,
-        args: [string],
-    },
-    Direct {
-        receiver: Option<string>,
-        type_name: string,
-        method: string,
-        args: [string],
-    },
+#[derive(Clone, Debug, PartialEq)]
+enum Instruction {
+    VirtualCall(VarId, VarId, string, [VarId]),   // dest, receiver, method, args
+    DirectCall(VarId, FuncId, [VarId]),            // dest, func, args
+    Const(VarId, i64),
+    New(VarId, TypeId),                            // allocate concrete type
+    Cast(VarId, VarId, TraitId),                   // cast to trait object
+    Phi(VarId, [(usize, VarId)]),
+    Copy(VarId, VarId),
+    Return(Option<VarId>),
 }
 
-impl CallSite {
-    fn method_name(self) -> &str {
-        match self {
-            CallSite.Virtual { ref method, .. } => method.as_str(),
-            CallSite.Direct { ref method, .. } => method.as_str(),
-        }
-    }
-
-    fn is_virtual(self) -> bool {
-        match self { CallSite.Virtual { .. } => true, _ => false }
-    }
+#[derive(Clone, Debug, Default)]
+struct DevirtStats {
+    virtual_calls_found: usize,
+    calls_devirtualized: usize,
+    calls_speculated: usize,
+    types_resolved: usize,
+    calls_unchanged: usize,
 }
 
 struct TypeAnalysis {
-    types: HashMap<string, TypeInfo>,
-    // var -> known concrete type
-    concrete_types: HashMap<string, string>,
-    // trait -> set of concrete implementors
-    implementors: HashMap<string, HashSet<string>>,
+    // Maps variable -> known concrete types
+    known_types: HashMap<VarId, HashSet<TypeId>>,
+    // VTable: (type, trait) -> methods
+    vtables: HashMap<(TypeId, TraitId), VTableEntry>,
+    // Type names for debugging
+    type_names: HashMap<TypeId, string>,
 }
 
 impl TypeAnalysis {
     fn new() -> TypeAnalysis {
         TypeAnalysis {
-            types: HashMap.new(),
-            concrete_types: HashMap.new(),
-            implementors: HashMap.new(),
+            known_types: HashMap.new(),
+            vtables: HashMap.new(),
+            type_names: HashMap.new(),
         }
     }
 
-    fn register_type(mut self, info: TypeInfo) {
-        let name = info.name.clone()
-        for impl_trait in &info.impls {
-            self.implementors.entry(impl_trait.clone())
-                .or_insert_with(HashSet.new)
-                .insert(name.clone())
-        }
-        self.types.insert(name, info)
+    fn set_known_type(mut self, var: VarId, type_id: TypeId) {
+        self.known_types.entry(var).or_insert(HashSet.new()).insert(type_id)
     }
 
-    fn set_concrete_type(mut self, var: &str, type_name: &str) {
-        self.concrete_types.insert(var.to_string(), type_name.to_string())
+    fn get_types(self, var: VarId) -> Option<&HashSet<TypeId>> {
+        self.known_types.get(&var)
     }
 
-    fn resolve_type(self, var: &str) -> Option<&str> {
-        self.concrete_types.get(var).map(|s| s.as_str())
+    fn is_monomorphic(self, var: VarId) -> bool {
+        self.known_types.get(&var).map(|s| s.len() == 1).unwrap_or(false)
     }
 
-    fn has_single_implementor(self, trait_name: &str) -> Option<&str> {
-        self.implementors.get(trait_name)
-            .filter(|s| s.len() == 1)
-            .and_then(|s| s.iter().next())
-            .map(|s| s.as_str())
+    fn single_type(self, var: VarId) -> Option<TypeId> {
+        let types = self.known_types.get(&var)?
+        if types.len() == 1 { types.iter().next().copied() } else { none }
     }
 
-    fn type_implements(self, type_name: &str, trait_name: &str) -> bool {
-        self.types.get(type_name)
-            .map(|t| t.impls.contains(&trait_name.to_string()))
-            .unwrap_or(false)
+    fn register_vtable(mut self, entry: VTableEntry) {
+        self.vtables.insert((entry.type_id, entry.trait_id), entry)
+    }
+
+    fn resolve_method(self, type_id: TypeId, trait_id: TraitId, method: &str) -> Option<FuncId> {
+        let entry = self.vtables.get(&(type_id, trait_id))?
+        entry.methods.iter()
+            .find(|(name, _)| name == method)
+            .map(|(_, fid)| *fid)
+    }
+
+    fn register_type_name(mut self, type_id: TypeId, name: &str) {
+        self.type_names.insert(type_id, name.to_string())
     }
 }
 
 struct Devirtualizer {
     analysis: TypeAnalysis,
-    devirtualized: usize,
-    speculated: usize,
-    unchanged: usize,
+    instructions: [Instruction],
+    stats: DevirtStats,
 }
 
 impl Devirtualizer {
-    fn new(analysis: TypeAnalysis) -> Devirtualizer {
-        Devirtualizer { analysis, devirtualized: 0, speculated: 0, unchanged: 0 }
+    fn new(analysis: TypeAnalysis, instructions: [Instruction]) -> Devirtualizer {
+        Devirtualizer { analysis, instructions, stats: DevirtStats.default() }
     }
 
-    fn devirtualize(mut self, call: &CallSite) -> CallSite {
-        match call {
-            CallSite.Virtual { receiver, trait_name, method, args } => {
-                // Strategy 1: Known concrete type from analysis
-                if let some(concrete) = self.analysis.resolve_type(receiver) {
-                    if self.analysis.type_implements(concrete, trait_name) {
-                        self.devirtualized += 1
-                        return CallSite.Direct {
-                            receiver: some(receiver.clone()),
-                            type_name: concrete.to_string(),
-                            method: method.clone(),
-                            args: args.clone(),
+    fn analyze_types(mut self) {
+        for inst in &self.instructions {
+            match inst {
+                Instruction.New(var, type_id) => {
+                    self.analysis.set_known_type(*var, *type_id)
+                    self.stats.types_resolved += 1
+                },
+                Instruction.Copy(dest, src) => {
+                    if let some(types) = self.analysis.get_types(*src).cloned() {
+                        for t in types { self.analysis.set_known_type(*dest, t) }
+                    }
+                },
+                Instruction.Cast(dest, src, _) => {
+                    if let some(types) = self.analysis.get_types(*src).cloned() {
+                        for t in types { self.analysis.set_known_type(*dest, t) }
+                    }
+                },
+                Instruction.Phi(dest, args) => {
+                    for (_, src) in args {
+                        if let some(types) = self.analysis.get_types(*src).cloned() {
+                            for t in types { self.analysis.set_known_type(*dest, t) }
                         }
                     }
-                }
-
-                // Strategy 2: Single implementor (whole-program devirtualization)
-                if let some(sole) = self.analysis.has_single_implementor(trait_name) {
-                    self.devirtualized += 1
-                    return CallSite.Direct {
-                        receiver: some(receiver.clone()),
-                        type_name: sole.to_string(),
-                        method: method.clone(),
-                        args: args.clone(),
-                    }
-                }
-
-                self.unchanged += 1
-                call.clone()
-            },
-            _ => {
-                self.unchanged += 1
-                call.clone()
-            },
+                },
+                _ => {},
+            }
         }
     }
 
-    fn devirtualize_all(mut self, calls: &[CallSite]) -> [CallSite] {
-        calls.iter().map(|c| self.devirtualize(c)).collect()
+    fn devirtualize(mut self) -> [Instruction] {
+        self.analyze_types()
+
+        let mut result: [Instruction] = vec![]
+        for inst in &self.instructions {
+            result.push(self.devirt_instruction(inst))
+        }
+        self.instructions = result.clone()
+        result
     }
 
-    fn stats(self) -> (usize, usize, usize) {
-        (self.devirtualized, self.speculated, self.unchanged)
+    fn devirt_instruction(mut self, inst: &Instruction) -> Instruction {
+        match inst {
+            Instruction.VirtualCall(dest, receiver, method, args) => {
+                self.stats.virtual_calls_found += 1
+
+                if let some(type_id) = self.analysis.single_type(*receiver) {
+                    // Monomorphic: we know the exact type
+                    // Find which trait this method belongs to
+                    let func = self.find_method_for_type(type_id, method)
+                    match func {
+                        some(func_id) => {
+                            self.stats.calls_devirtualized += 1
+                            let mut all_args = vec![*receiver]
+                            all_args.extend(args.iter().cloned())
+                            Instruction.DirectCall(*dest, func_id, all_args)
+                        },
+                        none => {
+                            self.stats.calls_unchanged += 1
+                            inst.clone()
+                        },
+                    }
+                } else if let some(types) = self.analysis.get_types(*receiver).cloned() {
+                    if types.len() <= 3 {
+                        // Small polymorphic set: could speculate
+                        self.stats.calls_speculated += 1
+                    }
+                    self.stats.calls_unchanged += 1
+                    inst.clone()
+                } else {
+                    self.stats.calls_unchanged += 1
+                    inst.clone()
+                }
+            },
+            _ => inst.clone(),
+        }
     }
+
+    fn find_method_for_type(self, type_id: TypeId, method: &str) -> Option<FuncId> {
+        for ((tid, _), entry) in &self.analysis.vtables {
+            if *tid == type_id {
+                if let some(fid) = entry.methods.iter()
+                    .find(|(n, _)| n == method)
+                    .map(|(_, f)| *f) {
+                    return some(fid)
+                }
+            }
+        }
+        none
+    }
+
+    fn stats(self) -> &DevirtStats { &self.stats }
 }
 
 fn main() {
+    // TypeAnalysis basics
+    let mut ta = TypeAnalysis.new()
+    ta.set_known_type(1, 100)
+    assert(ta.is_monomorphic(1))
+    assert(ta.single_type(1) == some(100))
+    print("TypeAnalysis ✓")
+
+    // Polymorphic
+    ta.set_known_type(2, 100)
+    ta.set_known_type(2, 200)
+    assert(!ta.is_monomorphic(2))
+    assert(ta.single_type(2).is_none())
+    assert(ta.get_types(2).unwrap().len() == 2)
+    print("Polymorphic ✓")
+
+    // Unknown
+    assert(!ta.is_monomorphic(999))
+    assert(ta.single_type(999).is_none())
+    print("Unknown ✓")
+
+    // VTable
+    ta.register_vtable(VTableEntry {
+        type_id: 100, trait_id: 1,
+        methods: vec![("draw".into(), 500), ("update".into(), 501)],
+    })
+    assert(ta.resolve_method(100, 1, "draw") == some(500))
+    assert(ta.resolve_method(100, 1, "update") == some(501))
+    assert(ta.resolve_method(100, 1, "missing").is_none())
+    assert(ta.resolve_method(999, 1, "draw").is_none())
+    print("VTable resolve ✓")
+
+    // Devirtualization
     let mut analysis = TypeAnalysis.new()
+    analysis.register_vtable(VTableEntry {
+        type_id: 10, trait_id: 1,
+        methods: vec![("render".into(), 42)],
+    })
 
-    // Register types
-    let dog_type = TypeInfo {
-        name: "Dog".to_string(), is_concrete: true,
-        impls: vec!["Animal".to_string(), "Debug".to_string()],
-        methods: HashMap.from([
-            ("speak".to_string(), MethodInfo { name: "speak".to_string(), trait_name: some("Animal".to_string()), is_virtual: true, signature: "fn() -> string".to_string() }),
-        ]),
+    let instrs = vec![
+        Instruction.New(1, 10),
+        Instruction.Cast(2, 1, 1),
+        Instruction.VirtualCall(3, 2, "render".into(), vec![]),
+    ]
+
+    let mut devirt = Devirtualizer.new(analysis, instrs)
+    let result = devirt.devirtualize()
+
+    assert(devirt.stats().virtual_calls_found == 1)
+    assert(devirt.stats().calls_devirtualized == 1)
+    // The virtual call should now be a direct call
+    match &result[2] {
+        Instruction.DirectCall(_, func_id, _) => assert(*func_id == 42),
+        _ => assert(false),
     }
-    analysis.register_type(dog_type)
+    print("Devirtualization ✓")
 
-    let cat_type = TypeInfo {
-        name: "Cat".to_string(), is_concrete: true,
-        impls: vec!["Animal".to_string()],
-        methods: HashMap.from([
-            ("speak".to_string(), MethodInfo { name: "speak".to_string(), trait_name: some("Animal".to_string()), is_virtual: true, signature: "fn() -> string".to_string() }),
-        ]),
+    // Unchanged when type unknown
+    let analysis2 = TypeAnalysis.new()
+    let instrs2 = vec![
+        Instruction.VirtualCall(5, 99, "foo".into(), vec![]),
+    ]
+    let mut devirt2 = Devirtualizer.new(analysis2, instrs2)
+    let result2 = devirt2.devirtualize()
+    assert(devirt2.stats().calls_unchanged == 1)
+    match &result2[0] {
+        Instruction.VirtualCall(..) => {},
+        _ => assert(false),
     }
-    analysis.register_type(cat_type)
+    print("Unknown unchanged ✓")
 
-    let fish_type = TypeInfo {
-        name: "Fish".to_string(), is_concrete: true,
-        impls: vec!["Swimmer".to_string()],
-        methods: HashMap.new(),
-    }
-    analysis.register_type(fish_type)
-
-    // Set known types
-    analysis.set_concrete_type("my_dog", "Dog")
-    analysis.set_concrete_type("my_cat", "Cat")
-
-    // Resolve
-    assert(analysis.resolve_type("my_dog") == some("Dog"))
-    assert(analysis.resolve_type("unknown").is_none())
-    print("Type resolution ✓")
-
-    // Implementors
-    let animal_impls = analysis.implementors.get("Animal").unwrap()
-    assert(animal_impls.len() == 2)  // Dog, Cat
-    assert(animal_impls.contains("Dog"))
-    assert(animal_impls.contains("Cat"))
-    print("Implementors tracked ✓")
-
-    // Single implementor
-    assert(analysis.has_single_implementor("Swimmer") == some("Fish"))
-    assert(analysis.has_single_implementor("Animal").is_none())  // 2 implementors
-    print("Single implementor ✓")
-
-    // type_implements
-    assert(analysis.type_implements("Dog", "Animal"))
-    assert(analysis.type_implements("Dog", "Debug"))
-    assert(!analysis.type_implements("Cat", "Debug"))
-    assert(!analysis.type_implements("Fish", "Animal"))
-    print("type_implements ✓")
-
-    // Devirtualize known type
-    let mut devirt = Devirtualizer.new(analysis)
-    let virtual_call = CallSite.Virtual {
-        receiver: "my_dog".to_string(), trait_name: "Animal".to_string(),
-        method: "speak".to_string(), args: [],
-    }
-    assert(virtual_call.is_virtual())
-    assert(virtual_call.method_name() == "speak")
-
-    let result = devirt.devirtualize(&virtual_call)
-    match &result {
-        CallSite.Direct { type_name, method, .. } => {
-            assert(type_name == "Dog")
-            assert(method == "speak")
-        },
-        _ => panic!("should be direct"),
-    }
-    assert(!result.is_virtual())
-    print("Devirtualize known type ✓")
-
-    // Devirtualize single implementor (Swimmer)
-    let swim_call = CallSite.Virtual {
-        receiver: "some_fish".to_string(), trait_name: "Swimmer".to_string(),
-        method: "swim".to_string(), args: [],
-    }
-    let swim_result = devirt.devirtualize(&swim_call)
-    match &swim_result {
-        CallSite.Direct { type_name, .. } => assert(type_name == "Fish"),
-        _ => panic!("should be devirtualized"),
-    }
-    print("Devirtualize single implementor ✓")
-
-    // Cannot devirtualize unknown receiver with multiple implementors
-    let unknown_call = CallSite.Virtual {
-        receiver: "unknown_animal".to_string(), trait_name: "Animal".to_string(),
-        method: "speak".to_string(), args: [],
-    }
-    let unknown_result = devirt.devirtualize(&unknown_call)
-    assert(unknown_result.is_virtual())
-    print("Skip unknown multi-impl ✓")
-
-    // Already direct stays direct
-    let direct = CallSite.Direct {
-        receiver: some("x".to_string()), type_name: "Dog".to_string(),
-        method: "bark".to_string(), args: [],
-    }
-    let direct_result = devirt.devirtualize(&direct)
-    assert(!direct_result.is_virtual())
-    print("Direct unchanged ✓")
-
-    // Stats
-    let (d, s, u) = devirt.stats()
-    assert(d == 2)  // dog + fish
-    assert(u == 2)  // unknown + direct
+    // Stats default
+    let s = DevirtStats.default()
+    assert(s.virtual_calls_found == 0)
+    assert(s.calls_devirtualized == 0)
     print("Stats ✓")
 
-    // devirtualize_all
-    let calls = vec![virtual_call.clone(), swim_call.clone(), unknown_call.clone()]
-    let results = devirt.devirtualize_all(&calls)
-    assert(results.len() == 3)
-    print("devirtualize_all ✓")
+    // Type names
+    let mut ta2 = TypeAnalysis.new()
+    ta2.register_type_name(10, "Circle")
+    ta2.register_type_name(20, "Rectangle")
+    assert(ta2.type_names.get(&10) == some(&"Circle".to_string()))
+    print("Type names ✓")
+
+    // Instruction variants
+    assert(Instruction.Const(1, 5) != Instruction.Const(2, 5))
+    print("Instruction variants ✓")
+
+    // VTableEntry
+    let vt = VTableEntry { type_id: 1, trait_id: 2, methods: vec![("m".into(), 3)] }
+    assert(vt.methods.len() == 1)
+    print("VTableEntry ✓")
+
+    // TraitMethod
+    let tm = TraitMethod { trait_id: 1, name: "foo".into(), func_id: 10 }
+    assert(tm.name == "foo")
+    print("TraitMethod ✓")
 
     print("Devirtualization complete ✓")
 }
