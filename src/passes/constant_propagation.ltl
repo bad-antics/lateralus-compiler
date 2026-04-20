@@ -1,0 +1,401 @@
+// Compiler Pass - Constant Propagation
+// Propagates known constant values through the IR, folding expressions at compile time.
+
+use std.collections.{HashMap, HashSet}
+
+type VarId = usize
+type BlockId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+enum Lattice {
+    Top,           // unknown
+    Constant(i64), // known value
+    Bottom,        // overdefined (multiple values)
+}
+
+impl Lattice {
+    fn meet(self, other: Lattice) -> Lattice {
+        match (self, other) {
+            (Lattice.Top, x) | (x, Lattice.Top) => x,
+            (Lattice.Bottom, _) | (_, Lattice.Bottom) => Lattice.Bottom,
+            (Lattice.Constant(a), Lattice.Constant(b)) => {
+                if a == b { Lattice.Constant(a) } else { Lattice.Bottom }
+            },
+        }
+    }
+
+    fn is_constant(self) -> bool { matches!(self, Lattice.Constant(_)) }
+    fn is_top(self) -> bool { matches!(self, Lattice.Top) }
+    fn is_bottom(self) -> bool { matches!(self, Lattice.Bottom) }
+
+    fn value(self) -> Option<i64> {
+        match self { Lattice.Constant(v) => some(v), _ => none }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Instruction {
+    Const(VarId, i64),
+    Copy(VarId, VarId),
+    BinOp(VarId, string, VarId, VarId),
+    UnaryOp(VarId, string, VarId),
+    Phi(VarId, [(BlockId, VarId)]),
+    Branch(VarId, BlockId, BlockId),
+    Jump(BlockId),
+    Return(VarId),
+    Call(VarId, string, [VarId]),
+}
+
+impl Instruction {
+    fn def_var(self) -> Option<VarId> {
+        match self {
+            Instruction.Const(d, _) | Instruction.Copy(d, _)
+            | Instruction.BinOp(d, ..) | Instruction.UnaryOp(d, ..)
+            | Instruction.Phi(d, _) | Instruction.Call(d, ..) => some(*d),
+            _ => none,
+        }
+    }
+
+    fn use_vars(self) -> [VarId] {
+        match self {
+            Instruction.Const(_, _) => vec![],
+            Instruction.Copy(_, s) => vec![*s],
+            Instruction.BinOp(_, _, a, b) => vec![*a, *b],
+            Instruction.UnaryOp(_, _, a) => vec![*a],
+            Instruction.Phi(_, args) => args.iter().map(|(_, v)| *v).collect(),
+            Instruction.Branch(c, _, _) => vec![*c],
+            Instruction.Jump(_) => vec![],
+            Instruction.Return(v) => vec![*v],
+            Instruction.Call(_, _, args) => args.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    id: BlockId,
+    instructions: [Instruction],
+    predecessors: [BlockId],
+}
+
+#[derive(Clone, Debug, Default)]
+struct PropagationStats {
+    constants_found: usize,
+    instructions_folded: usize,
+    branches_resolved: usize,
+    dead_blocks_found: usize,
+    phis_simplified: usize,
+}
+
+struct ConstantPropagator {
+    blocks: HashMap<BlockId, BasicBlock>,
+    lattice: HashMap<VarId, Lattice>,
+    worklist: [VarId],
+    stats: PropagationStats,
+}
+
+impl ConstantPropagator {
+    fn new() -> ConstantPropagator {
+        ConstantPropagator {
+            blocks: HashMap.new(),
+            lattice: HashMap.new(),
+            worklist: [],
+            stats: PropagationStats.default(),
+        }
+    }
+
+    fn add_block(mut self, block: BasicBlock) {
+        self.blocks.insert(block.id, block)
+    }
+
+    fn get_lattice(self, var: VarId) -> Lattice {
+        self.lattice.get(&var).cloned().unwrap_or(Lattice.Top)
+    }
+
+    fn set_lattice(mut self, var: VarId, val: Lattice) -> bool {
+        let old = self.get_lattice(var)
+        if old != val {
+            self.lattice.insert(var, val)
+            true
+        } else {
+            false
+        }
+    }
+
+    fn evaluate(self, inst: &Instruction) -> Option<Lattice> {
+        match inst {
+            Instruction.Const(_, n) => some(Lattice.Constant(*n)),
+            Instruction.Copy(_, src) => some(self.get_lattice(*src)),
+            Instruction.BinOp(_, op, a, b) => {
+                let la = self.get_lattice(*a)
+                let lb = self.get_lattice(*b)
+                match (la, lb) {
+                    (Lattice.Constant(va), Lattice.Constant(vb)) => {
+                        some(self.fold_binop(op, va, vb))
+                    },
+                    (Lattice.Bottom, _) | (_, Lattice.Bottom) => some(Lattice.Bottom),
+                    _ => some(Lattice.Top),
+                }
+            },
+            Instruction.UnaryOp(_, op, a) => {
+                match self.get_lattice(*a) {
+                    Lattice.Constant(v) => some(self.fold_unaryop(op, v)),
+                    Lattice.Bottom => some(Lattice.Bottom),
+                    Lattice.Top => some(Lattice.Top),
+                }
+            },
+            Instruction.Phi(_, args) => {
+                let mut result = Lattice.Top
+                for (_, var) in args {
+                    result = result.meet(self.get_lattice(*var))
+                }
+                some(result)
+            },
+            Instruction.Call(..) => some(Lattice.Bottom),
+            _ => none,
+        }
+    }
+
+    fn fold_binop(self, op: &str, a: i64, b: i64) -> Lattice {
+        let result = match op {
+            "+" => some(a + b),
+            "-" => some(a - b),
+            "*" => some(a * b),
+            "/" => if b != 0 { some(a / b) } else { none },
+            "%" => if b != 0 { some(a % b) } else { none },
+            "&" => some(a & b),
+            "|" => some(a | b),
+            "^" => some(a ^ b),
+            "<<" => some(a << b),
+            ">>" => some(a >> b),
+            "==" => some(if a == b { 1 } else { 0 }),
+            "!=" => some(if a != b { 1 } else { 0 }),
+            "<" => some(if a < b { 1 } else { 0 }),
+            ">" => some(if a > b { 1 } else { 0 }),
+            "<=" => some(if a <= b { 1 } else { 0 }),
+            ">=" => some(if a >= b { 1 } else { 0 }),
+            _ => none,
+        }
+        match result {
+            some(v) => Lattice.Constant(v),
+            none => Lattice.Bottom,
+        }
+    }
+
+    fn fold_unaryop(self, op: &str, v: i64) -> Lattice {
+        match op {
+            "-" => Lattice.Constant(-v),
+            "!" => Lattice.Constant(if v == 0 { 1 } else { 0 }),
+            "~" => Lattice.Constant(!v),
+            _ => Lattice.Bottom,
+        }
+    }
+
+    fn propagate(mut self) {
+        // Initialize: evaluate all instructions
+        for (_, block) in &self.blocks {
+            for inst in &block.instructions {
+                if let some(def) = inst.def_var() {
+                    if let some(val) = self.evaluate(inst) {
+                        if self.set_lattice(def, val.clone()) {
+                            self.worklist.push(def)
+                            if val.is_constant() {
+                                self.stats.constants_found += 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fixed-point iteration
+        while let some(var) = self.worklist.pop() {
+            for (_, block) in &self.blocks {
+                for inst in &block.instructions {
+                    if inst.use_vars().contains(&var) {
+                        if let some(def) = inst.def_var() {
+                            if let some(val) = self.evaluate(inst) {
+                                if self.set_lattice(def, val) {
+                                    self.worklist.push(def)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn rewrite(mut self) -> [Instruction] {
+        let mut result = []
+        let block_ids: [BlockId] = self.blocks.keys().cloned().collect()
+        for bid in block_ids.iter().sorted() {
+            let block = self.blocks.get(bid).unwrap()
+            for inst in &block.instructions {
+                let rewritten = self.rewrite_instruction(inst)
+                result.push(rewritten)
+            }
+        }
+        result
+    }
+
+    fn rewrite_instruction(mut self, inst: &Instruction) -> Instruction {
+        match inst {
+            Instruction.BinOp(dest, op, a, b) => {
+                if let Lattice.Constant(v) = self.get_lattice(*dest) {
+                    self.stats.instructions_folded += 1
+                    Instruction.Const(*dest, v)
+                } else { inst.clone() }
+            },
+            Instruction.UnaryOp(dest, _, _) => {
+                if let Lattice.Constant(v) = self.get_lattice(*dest) {
+                    self.stats.instructions_folded += 1
+                    Instruction.Const(*dest, v)
+                } else { inst.clone() }
+            },
+            Instruction.Branch(cond, t, f) => {
+                match self.get_lattice(*cond) {
+                    Lattice.Constant(v) => {
+                        self.stats.branches_resolved += 1
+                        if v != 0 { Instruction.Jump(*t) }
+                        else { Instruction.Jump(*f) }
+                    },
+                    _ => inst.clone(),
+                }
+            },
+            Instruction.Phi(dest, args) => {
+                if let Lattice.Constant(v) = self.get_lattice(*dest) {
+                    self.stats.phis_simplified += 1
+                    Instruction.Const(*dest, v)
+                } else { inst.clone() }
+            },
+            _ => inst.clone(),
+        }
+    }
+
+    fn stats(self) -> &PropagationStats { &self.stats }
+}
+
+fn main() {
+    // Lattice basics
+    assert(Lattice.Top.is_top())
+    assert(Lattice.Constant(42).is_constant())
+    assert(Lattice.Bottom.is_bottom())
+    assert(Lattice.Constant(5).value() == some(5))
+    assert(Lattice.Top.value().is_none())
+    print("Lattice ✓")
+
+    // Lattice meet
+    assert(Lattice.Constant(5).meet(Lattice.Constant(5)) == Lattice.Constant(5))
+    assert(Lattice.Constant(5).meet(Lattice.Constant(6)) == Lattice.Bottom)
+    assert(Lattice.Top.meet(Lattice.Constant(5)) == Lattice.Constant(5))
+    assert(Lattice.Bottom.meet(Lattice.Constant(5)) == Lattice.Bottom)
+    assert(Lattice.Top.meet(Lattice.Top) == Lattice.Top)
+    print("Meet ✓")
+
+    // Simple constant propagation: x = 5; y = 10; z = x + y
+    let mut cp = ConstantPropagator.new()
+    cp.add_block(BasicBlock {
+        id: 0,
+        instructions: vec![
+            Instruction.Const(1, 5),
+            Instruction.Const(2, 10),
+            Instruction.BinOp(3, "+".into(), 1, 2),
+            Instruction.Return(3),
+        ],
+        predecessors: vec![],
+    })
+    cp.propagate()
+    assert(cp.get_lattice(1) == Lattice.Constant(5))
+    assert(cp.get_lattice(2) == Lattice.Constant(10))
+    assert(cp.get_lattice(3) == Lattice.Constant(15))
+    print("Constant fold ✓")
+
+    // Rewrite
+    let rewritten = cp.rewrite()
+    let folded = rewritten.iter().filter(|i| matches!(i, Instruction.Const(..))).count()
+    assert(folded >= 3)  // all became Const
+    assert(cp.stats().instructions_folded >= 1)
+    print("Rewrite ✓")
+
+    // Branch resolution
+    let mut cp2 = ConstantPropagator.new()
+    cp2.add_block(BasicBlock {
+        id: 0,
+        instructions: vec![
+            Instruction.Const(1, 1),  // true
+            Instruction.Branch(1, 1, 2),
+        ],
+        predecessors: vec![],
+    })
+    cp2.propagate()
+    let rewritten2 = cp2.rewrite()
+    assert(cp2.stats().branches_resolved == 1)
+    // Branch should become Jump(1)
+    let last = rewritten2.last().unwrap()
+    assert(*last == Instruction.Jump(1))
+    print("Branch resolution ✓")
+
+    // BinOp folding
+    let cp3 = ConstantPropagator.new()
+    assert(cp3.fold_binop("+", 3, 4) == Lattice.Constant(7))
+    assert(cp3.fold_binop("-", 10, 3) == Lattice.Constant(7))
+    assert(cp3.fold_binop("*", 3, 4) == Lattice.Constant(12))
+    assert(cp3.fold_binop("/", 10, 3) == Lattice.Constant(3))
+    assert(cp3.fold_binop("/", 10, 0) == Lattice.Bottom)
+    assert(cp3.fold_binop("==", 5, 5) == Lattice.Constant(1))
+    assert(cp3.fold_binop("==", 5, 6) == Lattice.Constant(0))
+    assert(cp3.fold_binop("<", 3, 5) == Lattice.Constant(1))
+    print("BinOp fold ✓")
+
+    // UnaryOp
+    assert(cp3.fold_unaryop("-", 5) == Lattice.Constant(-5))
+    assert(cp3.fold_unaryop("!", 0) == Lattice.Constant(1))
+    assert(cp3.fold_unaryop("!", 1) == Lattice.Constant(0))
+    print("UnaryOp fold ✓")
+
+    // Call -> Bottom (unknown)
+    let mut cp4 = ConstantPropagator.new()
+    cp4.add_block(BasicBlock {
+        id: 0,
+        instructions: vec![
+            Instruction.Call(1, "foo".into(), vec![]),
+        ],
+        predecessors: vec![],
+    })
+    cp4.propagate()
+    assert(cp4.get_lattice(1) == Lattice.Bottom)
+    print("Call -> Bottom ✓")
+
+    // Instruction def/use
+    let inst = Instruction.BinOp(3, "+".into(), 1, 2)
+    assert(inst.def_var() == some(3))
+    assert(inst.use_vars() == vec![1, 2])
+    let ret = Instruction.Return(5)
+    assert(ret.def_var().is_none())
+    assert(ret.use_vars() == vec![5])
+    print("Def/use ✓")
+
+    // Stats default
+    let s = PropagationStats.default()
+    assert(s.constants_found == 0)
+    assert(s.instructions_folded == 0)
+    print("Stats ✓")
+
+    // Copy propagation
+    let mut cp5 = ConstantPropagator.new()
+    cp5.add_block(BasicBlock {
+        id: 0,
+        instructions: vec![
+            Instruction.Const(1, 42),
+            Instruction.Copy(2, 1),
+            Instruction.Return(2),
+        ],
+        predecessors: vec![],
+    })
+    cp5.propagate()
+    assert(cp5.get_lattice(2) == Lattice.Constant(42))
+    print("Copy propagation ✓")
+
+    print("Constant Propagation complete ✓")
+}
