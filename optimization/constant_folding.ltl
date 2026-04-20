@@ -1,0 +1,234 @@
+
+// Constant Folding Optimization Pass
+// Evaluates constant expressions at compile time, propagates known values.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug, PartialEq)]
+enum Const {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(string),
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+enum Expr {
+    Literal(Const),
+    Var(string),
+    BinOp(BinOp, Box<Expr>, Box<Expr>),
+    UnaryOp(UnaryOp, Box<Expr>),
+    Call(string, [Expr]),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BinOp { Add, Sub, Mul, Div, Mod, And, Or, Eq, Ne, Lt, Gt, Le, Ge, Shl, Shr, BitAnd, BitOr, BitXor }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UnaryOp { Neg, Not, BitNot }
+
+struct ConstFolder {
+    env: HashMap<string, Const>,
+    folded_count: usize,
+}
+
+impl ConstFolder {
+    fn new() -> ConstFolder {
+        ConstFolder { env: HashMap.new(), folded_count: 0 }
+    }
+
+    fn bind(mut self, name: &str, val: Const) {
+        self.env.insert(name.into(), val)
+    }
+
+    fn fold(mut self, expr: &Expr) -> Expr {
+        match expr {
+            Expr.Literal(_) => expr.clone(),
+            Expr.Var(name) => {
+                if let Some(val) = self.env.get(name) {
+                    if *val != Const.Unknown {
+                        self.folded_count += 1
+                        return Expr.Literal(val.clone())
+                    }
+                }
+                expr.clone()
+            }
+            Expr.BinOp(op, lhs, rhs) => {
+                let l = self.fold(lhs)
+                let r = self.fold(rhs)
+                if let (Expr.Literal(lv), Expr.Literal(rv)) = (&l, &r) {
+                    if let Some(result) = self.eval_binop(*op, lv, rv) {
+                        self.folded_count += 1
+                        return Expr.Literal(result)
+                    }
+                }
+                Expr.BinOp(*op, Box.new(l), Box.new(r))
+            }
+            Expr.UnaryOp(op, operand) => {
+                let inner = self.fold(operand)
+                if let Expr.Literal(val) = &inner {
+                    if let Some(result) = self.eval_unary(*op, val) {
+                        self.folded_count += 1
+                        return Expr.Literal(result)
+                    }
+                }
+                Expr.UnaryOp(*op, Box.new(inner))
+            }
+            Expr.If(cond, then_br, else_br) => {
+                let c = self.fold(cond)
+                if let Expr.Literal(Const.Bool(b)) = &c {
+                    self.folded_count += 1
+                    return if *b { self.fold(then_br) } else { self.fold(else_br) }
+                }
+                Expr.If(Box.new(c), Box.new(self.fold(then_br)), Box.new(self.fold(else_br)))
+            }
+            Expr.Call(name, args) => {
+                let folded_args: [Expr] = args.iter().map(|a| self.fold(a)).collect()
+                Expr.Call(name.clone(), folded_args)
+            }
+        }
+    }
+
+    fn eval_binop(self, op: BinOp, lhs: &Const, rhs: &Const) -> Option<Const> {
+        match (op, lhs, rhs) {
+            (BinOp.Add, Const.Int(a), Const.Int(b)) => Some(Const.Int(a + b)),
+            (BinOp.Sub, Const.Int(a), Const.Int(b)) => Some(Const.Int(a - b)),
+            (BinOp.Mul, Const.Int(a), Const.Int(b)) => Some(Const.Int(a * b)),
+            (BinOp.Div, Const.Int(a), Const.Int(b)) if *b != 0 => Some(Const.Int(a / b)),
+            (BinOp.Mod, Const.Int(a), Const.Int(b)) if *b != 0 => Some(Const.Int(a % b)),
+            (BinOp.Shl, Const.Int(a), Const.Int(b)) => Some(Const.Int(a << b)),
+            (BinOp.Shr, Const.Int(a), Const.Int(b)) => Some(Const.Int(a >> b)),
+            (BinOp.BitAnd, Const.Int(a), Const.Int(b)) => Some(Const.Int(a & b)),
+            (BinOp.BitOr, Const.Int(a), Const.Int(b)) => Some(Const.Int(a | b)),
+            (BinOp.BitXor, Const.Int(a), Const.Int(b)) => Some(Const.Int(a ^ b)),
+            (BinOp.Add, Const.Float(a), Const.Float(b)) => Some(Const.Float(a + b)),
+            (BinOp.Sub, Const.Float(a), Const.Float(b)) => Some(Const.Float(a - b)),
+            (BinOp.Mul, Const.Float(a), Const.Float(b)) => Some(Const.Float(a * b)),
+            (BinOp.Div, Const.Float(a), Const.Float(b)) if *b != 0.0 => Some(Const.Float(a / b)),
+            (BinOp.Eq, Const.Int(a), Const.Int(b)) => Some(Const.Bool(a == b)),
+            (BinOp.Ne, Const.Int(a), Const.Int(b)) => Some(Const.Bool(a != b)),
+            (BinOp.Lt, Const.Int(a), Const.Int(b)) => Some(Const.Bool(a < b)),
+            (BinOp.Gt, Const.Int(a), Const.Int(b)) => Some(Const.Bool(a > b)),
+            (BinOp.Le, Const.Int(a), Const.Int(b)) => Some(Const.Bool(a <= b)),
+            (BinOp.Ge, Const.Int(a), Const.Int(b)) => Some(Const.Bool(a >= b)),
+            (BinOp.And, Const.Bool(a), Const.Bool(b)) => Some(Const.Bool(*a && *b)),
+            (BinOp.Or, Const.Bool(a), Const.Bool(b)) => Some(Const.Bool(*a || *b)),
+            (BinOp.Add, Const.Str(a), Const.Str(b)) => Some(Const.Str(format!("{}{}", a, b))),
+            _ => None,
+        }
+    }
+
+    fn eval_unary(self, op: UnaryOp, val: &Const) -> Option<Const> {
+        match (op, val) {
+            (UnaryOp.Neg, Const.Int(v)) => Some(Const.Int(-v)),
+            (UnaryOp.Neg, Const.Float(v)) => Some(Const.Float(-v)),
+            (UnaryOp.Not, Const.Bool(v)) => Some(Const.Bool(!v)),
+            (UnaryOp.BitNot, Const.Int(v)) => Some(Const.Int(!v)),
+            _ => None,
+        }
+    }
+
+    fn is_constant(self, expr: &Expr) -> bool {
+        matches!(self.fold(expr), Expr.Literal(_))
+    }
+}
+
+fn lit_int(v: i64) -> Expr { Expr.Literal(Const.Int(v)) }
+fn lit_bool(v: bool) -> Expr { Expr.Literal(Const.Bool(v)) }
+fn var(name: &str) -> Expr { Expr.Var(name.into()) }
+fn add(a: Expr, b: Expr) -> Expr { Expr.BinOp(BinOp.Add, Box.new(a), Box.new(b)) }
+fn mul(a: Expr, b: Expr) -> Expr { Expr.BinOp(BinOp.Mul, Box.new(a), Box.new(b)) }
+fn neg(a: Expr) -> Expr { Expr.UnaryOp(UnaryOp.Neg, Box.new(a)) }
+
+fn main() {
+    let mut cf = ConstFolder.new()
+
+    // Literal passthrough
+    let e = cf.fold(&lit_int(42))
+    assert(e == Expr.Literal(Const.Int(42)))
+    print("Literal ✓")
+
+    // Integer arithmetic
+    let e2 = cf.fold(&add(lit_int(3), lit_int(4)))
+    assert(e2 == Expr.Literal(Const.Int(7)))
+    print("Int add ✓")
+
+    // Nested folding: (2 + 3) * (4 + 1) = 25
+    let e3 = cf.fold(&mul(add(lit_int(2), lit_int(3)), add(lit_int(4), lit_int(1))))
+    assert(e3 == Expr.Literal(Const.Int(25)))
+    print("Nested fold ✓")
+
+    // Unary negation
+    let e4 = cf.fold(&neg(lit_int(5)))
+    assert(e4 == Expr.Literal(Const.Int(-5)))
+    print("Negation ✓")
+
+    // Boolean not
+    let mut cf2 = ConstFolder.new()
+    let e5 = cf2.fold(&Expr.UnaryOp(UnaryOp.Not, Box.new(lit_bool(true))))
+    assert(e5 == Expr.Literal(Const.Bool(false)))
+    print("Bool not ✓")
+
+    // Variable binding
+    let mut cf3 = ConstFolder.new()
+    cf3.bind("x", Const.Int(10))
+    let e6 = cf3.fold(&add(var("x"), lit_int(5)))
+    assert(e6 == Expr.Literal(Const.Int(15)))
+    print("Var binding ✓")
+
+    // Unknown variable stays
+    let mut cf4 = ConstFolder.new()
+    let e7 = cf4.fold(&add(var("y"), lit_int(1)))
+    assert(matches!(e7, Expr.BinOp(..)))
+    print("Unknown var ✓")
+
+    // If with known condition
+    let mut cf5 = ConstFolder.new()
+    let e8 = cf5.fold(&Expr.If(
+        Box.new(lit_bool(true)),
+        Box.new(lit_int(1)),
+        Box.new(lit_int(2)),
+    ))
+    assert(e8 == Expr.Literal(Const.Int(1)))
+    print("If fold ✓")
+
+    // String concat
+    let mut cf6 = ConstFolder.new()
+    let e9 = cf6.fold(&Expr.BinOp(
+        BinOp.Add,
+        Box.new(Expr.Literal(Const.Str("hello ".into()))),
+        Box.new(Expr.Literal(Const.Str("world".into()))),
+    ))
+    assert(e9 == Expr.Literal(Const.Str("hello world".into())))
+    print("String concat ✓")
+
+    // Comparison
+    let mut cf7 = ConstFolder.new()
+    let e10 = cf7.fold(&Expr.BinOp(BinOp.Lt, Box.new(lit_int(3)), Box.new(lit_int(5))))
+    assert(e10 == Expr.Literal(Const.Bool(true)))
+    print("Comparison ✓")
+
+    // Division by zero stays
+    let mut cf8 = ConstFolder.new()
+    let e11 = cf8.fold(&Expr.BinOp(BinOp.Div, Box.new(lit_int(5)), Box.new(lit_int(0))))
+    assert(matches!(e11, Expr.BinOp(..)))
+    print("Div zero ✓")
+
+    // Fold count
+    let mut cf9 = ConstFolder.new()
+    cf9.fold(&add(lit_int(1), lit_int(2)))
+    assert(cf9.folded_count == 1)
+    cf9.fold(&mul(add(lit_int(1), lit_int(2)), lit_int(3)))
+    assert(cf9.folded_count >= 3)
+    print("Fold count ✓")
+
+    // Bitwise
+    let mut cf10 = ConstFolder.new()
+    let e12 = cf10.fold(&Expr.BinOp(BinOp.BitAnd, Box.new(lit_int(0xFF)), Box.new(lit_int(0x0F))))
+    assert(e12 == Expr.Literal(Const.Int(0x0F)))
+    print("Bitwise ✓")
+
+    print("Constant folding complete ✓")
+}
