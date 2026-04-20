@@ -1,0 +1,196 @@
+
+// Register Allocator - Linear scan register allocation
+// Maps virtual registers to physical registers with spill handling.
+
+use std.collections.{HashMap, HashSet, BTreeSet}
+
+type VReg = u32
+type PReg = u8
+
+const NUM_REGS: usize = 16
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LiveInterval {
+    vreg: VReg,
+    start: u32,
+    end: u32,
+}
+
+impl LiveInterval {
+    fn new(vreg: VReg, start: u32, end: u32) -> LiveInterval { LiveInterval { vreg, start, end } }
+    fn overlaps(self, other: &LiveInterval) -> bool { self.start < other.end && other.start < self.end }
+    fn length(self) -> u32 { self.end - self.start }
+    fn contains(self, point: u32) -> bool { point >= self.start && point < self.end }
+}
+
+#[derive(Clone, Debug)]
+enum Allocation { Register(PReg), Spill(i32) }
+
+impl Allocation {
+    fn is_register(self) -> bool { matches!(self, Allocation.Register(_)) }
+    fn is_spill(self) -> bool { matches!(self, Allocation.Spill(_)) }
+    fn reg(self) -> PReg { match self { Allocation.Register(r) => *r, _ => panic("not a register") } }
+    fn slot(self) -> i32 { match self { Allocation.Spill(s) => *s, _ => panic("not a spill") } }
+}
+
+struct LinearScan {
+    intervals: [LiveInterval],
+    allocations: HashMap<VReg, Allocation>,
+    active: [LiveInterval],
+    free_regs: [PReg],
+    next_spill_slot: i32,
+    spill_count: u32,
+    reserved_regs: HashSet<PReg>,
+}
+
+impl LinearScan {
+    fn new(num_regs: usize) -> LinearScan {
+        let free_regs: [PReg] = (0..num_regs as u8).collect()
+        LinearScan {
+            intervals: [], allocations: HashMap.new(),
+            active: [], free_regs,
+            next_spill_slot: -8, spill_count: 0,
+            reserved_regs: HashSet.new(),
+        }
+    }
+
+    fn reserve(mut self, reg: PReg) {
+        self.reserved_regs.insert(reg)
+        self.free_regs.retain(|r| *r != reg)
+    }
+
+    fn add_interval(mut self, vreg: VReg, start: u32, end: u32) {
+        self.intervals.push(LiveInterval.new(vreg, start, end))
+    }
+
+    fn allocate(mut self) {
+        self.intervals.sort_by_key(|i| i.start)
+
+        for interval in self.intervals.clone() {
+            // Expire old intervals
+            self.active.retain(|a| {
+                if a.end <= interval.start {
+                    if let Some(Allocation.Register(r)) = self.allocations.get(&a.vreg) {
+                        self.free_regs.push(*r)
+                    }
+                    false
+                } else { true }
+            });
+
+            if let Some(reg) = self.free_regs.pop() {
+                self.allocations.insert(interval.vreg, Allocation.Register(reg))
+                self.active.push(interval)
+                self.active.sort_by_key(|a| a.end)
+            } else {
+                // Spill the longest active interval or current
+                if !self.active.is_empty() {
+                    let last = self.active.last().unwrap().clone()
+                    if last.end > interval.end {
+                        let reg = self.allocations.get(&last.vreg).unwrap().reg()
+                        self.allocations.insert(last.vreg, Allocation.Spill(self.next_spill_slot))
+                        self.next_spill_slot -= 8
+                        self.spill_count += 1
+                        self.allocations.insert(interval.vreg, Allocation.Register(reg))
+                        self.active.pop();
+                        self.active.push(interval)
+                        self.active.sort_by_key(|a| a.end)
+                    } else {
+                        self.allocations.insert(interval.vreg, Allocation.Spill(self.next_spill_slot))
+                        self.next_spill_slot -= 8
+                        self.spill_count += 1
+                    }
+                } else {
+                    self.allocations.insert(interval.vreg, Allocation.Spill(self.next_spill_slot))
+                    self.next_spill_slot -= 8
+                    self.spill_count += 1
+                }
+            }
+        }
+    }
+
+    fn get_allocation(self, vreg: VReg) -> Option<&Allocation> { self.allocations.get(&vreg) }
+    fn total_spills(self) -> u32 { self.spill_count }
+    fn allocated_count(self) -> usize { self.allocations.len() }
+
+    fn register_pressure_at(self, point: u32) -> usize {
+        self.intervals.iter().filter(|i| i.contains(point)).count()
+    }
+}
+
+fn main() {
+    // LiveInterval
+    let i1 = LiveInterval.new(0, 0, 10)
+    let i2 = LiveInterval.new(1, 5, 15)
+    let i3 = LiveInterval.new(2, 10, 20)
+    assert(i1.overlaps(&i2))
+    assert(!i1.overlaps(&i3))
+    assert(i2.overlaps(&i3))
+    assert(i1.length() == 10)
+    assert(i1.contains(5))
+    assert(!i1.contains(10))
+    print("LiveInterval ✓")
+
+    // Allocation types
+    let ar = Allocation.Register(3)
+    assert(ar.is_register())
+    assert(ar.reg() == 3)
+    let as_ = Allocation.Spill(-8)
+    assert(as_.is_spill())
+    assert(as_.slot() == -8)
+    print("Allocation ✓")
+
+    // Simple allocation (no spills needed)
+    let mut scan = LinearScan.new(4)
+    scan.add_interval(0, 0, 5)
+    scan.add_interval(1, 2, 8)
+    scan.add_interval(2, 6, 10)
+    scan.allocate()
+    assert(scan.allocated_count() == 3)
+    assert(scan.total_spills() == 0)
+    assert(scan.get_allocation(0).unwrap().is_register())
+    assert(scan.get_allocation(1).unwrap().is_register())
+    print("No spill ✓")
+
+    // Allocation with spills (more intervals than registers)
+    let mut scan2 = LinearScan.new(2)
+    scan2.add_interval(0, 0, 10)
+    scan2.add_interval(1, 0, 10)
+    scan2.add_interval(2, 0, 10)
+    scan2.allocate()
+    assert(scan2.allocated_count() == 3)
+    assert(scan2.total_spills() == 1)
+    print("Spill ✓")
+
+    // Reserved registers
+    let mut scan3 = LinearScan.new(4)
+    scan3.reserve(0)  // reserve reg 0 (e.g., stack pointer)
+    scan3.add_interval(0, 0, 5)
+    scan3.add_interval(1, 0, 5)
+    scan3.add_interval(2, 0, 5)
+    scan3.add_interval(3, 0, 5)
+    scan3.allocate()
+    // With 4 regs but 1 reserved, 3 available for 4 intervals = 1 spill
+    assert(scan3.total_spills() == 1)
+    print("Reserved ✓")
+
+    // Non-overlapping reuse
+    let mut scan4 = LinearScan.new(1)
+    scan4.add_interval(0, 0, 5)
+    scan4.add_interval(1, 5, 10)
+    scan4.add_interval(2, 10, 15)
+    scan4.allocate()
+    assert(scan4.total_spills() == 0)  // all sequential, 1 reg enough
+    print("Reuse ✓")
+
+    // Register pressure
+    let mut scan5 = LinearScan.new(4)
+    scan5.add_interval(0, 0, 10)
+    scan5.add_interval(1, 2, 8)
+    scan5.add_interval(2, 4, 12)
+    assert(scan5.register_pressure_at(5) == 3)
+    assert(scan5.register_pressure_at(0) == 1)
+    assert(scan5.register_pressure_at(11) == 1)
+    print("Pressure ✓")
+
+    print("Register allocator complete ✓")
+}
