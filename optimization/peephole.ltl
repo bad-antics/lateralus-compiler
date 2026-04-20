@@ -1,35 +1,285 @@
-// Peephole Optimization
-module compiler.optimization.peephole
 
-pub struct PeepholePass {
-    name: str
-    errors: list
-    warnings: list
+// Peephole Optimizer - Local instruction pattern matching and replacement
+// Applies small window optimizations to IR instructions.
+
+#[derive(Clone, Debug, PartialEq)]
+enum Opcode {
+    Add, Sub, Mul, Div, Mod,
+    And, Or, Xor, Not, Shl, Shr,
+    Mov, Load, Store,
+    Cmp, Jmp, Jz, Jnz,
+    Call, Ret, Nop, Push, Pop,
 }
 
-impl PeepholePass {
-    pub fn new() -> PeepholePass {
-        return PeepholePass { name: "Peephole Optimization", errors: [], warnings: [] }
+#[derive(Clone, Debug, PartialEq)]
+enum Operand {
+    Reg(u32),
+    Imm(i64),
+    Mem(u32, i32),  // base_reg, offset
+    Label(string),
+    None,
+}
+
+#[derive(Clone, Debug)]
+struct Instruction {
+    op: Opcode,
+    dst: Operand,
+    src1: Operand,
+    src2: Operand,
+}
+
+impl Instruction {
+    fn new(op: Opcode, dst: Operand, src1: Operand, src2: Operand) -> Instruction {
+        Instruction { op, dst, src1, src2 }
     }
-    pub fn run(self, input: any) -> any {
-        return input
+    fn unary(op: Opcode, dst: Operand, src: Operand) -> Instruction {
+        Instruction { op, dst, src1: src, src2: Operand.None }
     }
-    pub fn add_error(self, msg: str, line: int, col: int) {
-        self.errors = push(self.errors, {"msg": msg, "line": line, "col": col})
+    fn nullary(op: Opcode) -> Instruction {
+        Instruction { op, dst: Operand.None, src1: Operand.None, src2: Operand.None }
     }
-    pub fn add_warning(self, msg: str, line: int) {
-        self.warnings = push(self.warnings, {"msg": msg, "line": line})
+    fn is_nop(self) -> bool { self.op == Opcode.Nop }
+    fn uses_reg(self, r: u32) -> bool {
+        matches!(self.src1, Operand.Reg(x) if x == r) ||
+        matches!(self.src2, Operand.Reg(x) if x == r) ||
+        matches!(self.dst, Operand.Reg(x) if x == r)
     }
-    pub fn ok(self) -> bool { return len(self.errors) == 0 }
-    pub fn report(self) -> str {
-        let mut s = self.name + ": "
-        if self.ok() { s += "OK" } else { s += len(self.errors) as str + " error(s)" }
-        return s
+}
+
+struct PeepholeOptimizer {
+    instructions: [Instruction],
+    changes: u32,
+    passes: u32,
+}
+
+impl PeepholeOptimizer {
+    fn new(instructions: [Instruction]) -> PeepholeOptimizer {
+        PeepholeOptimizer { instructions, changes: 0, passes: 0 }
+    }
+
+    fn len(self) -> usize { self.instructions.len() }
+    fn total_changes(self) -> u32 { self.changes }
+    fn total_passes(self) -> u32 { self.passes }
+
+    fn optimize(mut self) -> [Instruction] {
+        let mut changed = true
+        while changed {
+            changed = false
+            self.passes += 1
+            changed |= self.remove_nops()
+            changed |= self.strength_reduce()
+            changed |= self.identity_ops()
+            changed |= self.dead_mov()
+            changed |= self.constant_fold()
+        }
+        self.instructions.clone()
+    }
+
+    fn remove_nops(mut self) -> bool {
+        let before = self.instructions.len()
+        self.instructions.retain(|i| !i.is_nop())
+        let removed = before - self.instructions.len()
+        self.changes += removed as u32
+        removed > 0
+    }
+
+    fn strength_reduce(mut self) -> bool {
+        let mut changed = false
+        for inst in &mut self.instructions {
+            // Multiply by power of 2 -> shift left
+            if inst.op == Opcode.Mul {
+                if let Operand.Imm(n) = inst.src2 {
+                    if n > 0 && (n & (n - 1)) == 0 {
+                        let shift = (n as f64).log2() as i64
+                        inst.op = Opcode.Shl
+                        inst.src2 = Operand.Imm(shift)
+                        self.changes += 1
+                        changed = true
+                    }
+                }
+            }
+            // Divide by power of 2 -> shift right
+            if inst.op == Opcode.Div {
+                if let Operand.Imm(n) = inst.src2 {
+                    if n > 0 && (n & (n - 1)) == 0 {
+                        let shift = (n as f64).log2() as i64
+                        inst.op = Opcode.Shr
+                        inst.src2 = Operand.Imm(shift)
+                        self.changes += 1
+                        changed = true
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn identity_ops(mut self) -> bool {
+        let mut changed = false
+        for inst in &mut self.instructions {
+            let is_identity = match inst.op {
+                Opcode.Add => matches!(inst.src2, Operand.Imm(0)),
+                Opcode.Sub => matches!(inst.src2, Operand.Imm(0)),
+                Opcode.Mul => matches!(inst.src2, Operand.Imm(1)),
+                Opcode.Div => matches!(inst.src2, Operand.Imm(1)),
+                Opcode.Shl => matches!(inst.src2, Operand.Imm(0)),
+                Opcode.Shr => matches!(inst.src2, Operand.Imm(0)),
+                Opcode.Or => matches!(inst.src2, Operand.Imm(0)),
+                Opcode.Xor => matches!(inst.src2, Operand.Imm(0)),
+                _ => false,
+            };
+            if is_identity {
+                // Replace with mov
+                inst.op = Opcode.Mov
+                inst.src2 = Operand.None
+                self.changes += 1
+                changed = true
+            }
+            // Multiply by 0 -> mov 0
+            if inst.op == Opcode.Mul && matches!(inst.src2, Operand.Imm(0)) {
+                inst.op = Opcode.Mov
+                inst.src1 = Operand.Imm(0)
+                inst.src2 = Operand.None
+                self.changes += 1
+                changed = true
+            }
+        }
+        changed
+    }
+
+    fn dead_mov(mut self) -> bool {
+        let mut changed = false
+        let mut to_remove = []
+        for i in 0..self.instructions.len() {
+            if self.instructions[i].op == Opcode.Mov {
+                if self.instructions[i].dst == self.instructions[i].src1 {
+                    to_remove.push(i)
+                    changed = true
+                }
+            }
+        }
+        for (offset, idx) in to_remove.iter().enumerate() {
+            self.instructions.remove(idx - offset)
+            self.changes += 1
+        }
+        changed
+    }
+
+    fn constant_fold(mut self) -> bool {
+        let mut changed = false
+        for inst in &mut self.instructions {
+            if let (Operand.Imm(a), Operand.Imm(b)) = (&inst.src1, &inst.src2) {
+                let result = match inst.op {
+                    Opcode.Add => Some(a + b),
+                    Opcode.Sub => Some(a - b),
+                    Opcode.Mul => Some(a * b),
+                    Opcode.And => Some(a & b),
+                    Opcode.Or => Some(a | b),
+                    Opcode.Xor => Some(a ^ b),
+                    _ => None,
+                };
+                if let Some(val) = result {
+                    inst.op = Opcode.Mov
+                    inst.src1 = Operand.Imm(val)
+                    inst.src2 = Operand.None
+                    self.changes += 1
+                    changed = true
+                }
+            }
+        }
+        changed
     }
 }
 
 fn main() {
-    let pass = PeepholePass.new()
-    let result = pass.run("fn main() { println(\"hello\") }")
-    println(pass.report())
+    // Instruction
+    let inst = Instruction.new(Opcode.Add, Operand.Reg(0), Operand.Reg(1), Operand.Imm(5))
+    assert(inst.op == Opcode.Add)
+    assert(inst.uses_reg(0))
+    assert(inst.uses_reg(1))
+    assert(!inst.uses_reg(2))
+    print("Instruction ✓")
+
+    // Nop removal
+    let instrs = [
+        Instruction.new(Opcode.Add, Operand.Reg(0), Operand.Reg(1), Operand.Imm(1)),
+        Instruction.nullary(Opcode.Nop),
+        Instruction.nullary(Opcode.Nop),
+        Instruction.unary(Opcode.Ret, Operand.None, Operand.Reg(0)),
+    ];
+    let mut opt = PeepholeOptimizer.new(instrs)
+    let result = opt.optimize()
+    assert(result.len() == 2)  // nops removed
+    assert(opt.total_changes() >= 2)
+    print("Nop removal ✓")
+
+    // Strength reduction: mul by 8 -> shl by 3
+    let instrs2 = [
+        Instruction.new(Opcode.Mul, Operand.Reg(0), Operand.Reg(1), Operand.Imm(8)),
+    ];
+    let mut opt2 = PeepholeOptimizer.new(instrs2)
+    let result2 = opt2.optimize()
+    assert(result2[0].op == Opcode.Shl)
+    assert(result2[0].src2 == Operand.Imm(3))
+    print("Strength reduce ✓")
+
+    // Div by 4 -> shr by 2
+    let instrs3 = [
+        Instruction.new(Opcode.Div, Operand.Reg(0), Operand.Reg(1), Operand.Imm(4)),
+    ];
+    let mut opt3 = PeepholeOptimizer.new(instrs3)
+    let result3 = opt3.optimize()
+    assert(result3[0].op == Opcode.Shr)
+    assert(result3[0].src2 == Operand.Imm(2))
+    print("Div reduce ✓")
+
+    // Identity: add 0, mul 1
+    let instrs4 = [
+        Instruction.new(Opcode.Add, Operand.Reg(0), Operand.Reg(1), Operand.Imm(0)),
+        Instruction.new(Opcode.Mul, Operand.Reg(2), Operand.Reg(3), Operand.Imm(1)),
+    ];
+    let mut opt4 = PeepholeOptimizer.new(instrs4)
+    let result4 = opt4.optimize()
+    assert(result4[0].op == Opcode.Mov)
+    assert(result4[1].op == Opcode.Mov)
+    print("Identity ✓")
+
+    // Constant folding: add 3, 5 -> mov 8
+    let instrs5 = [
+        Instruction.new(Opcode.Add, Operand.Reg(0), Operand.Imm(3), Operand.Imm(5)),
+    ];
+    let mut opt5 = PeepholeOptimizer.new(instrs5)
+    let result5 = opt5.optimize()
+    assert(result5[0].op == Opcode.Mov)
+    assert(result5[0].src1 == Operand.Imm(8))
+    print("Constant fold ✓")
+
+    // Dead mov removal (mov r0, r0)
+    let instrs6 = [
+        Instruction.unary(Opcode.Mov, Operand.Reg(0), Operand.Reg(0)),
+        Instruction.new(Opcode.Add, Operand.Reg(1), Operand.Reg(0), Operand.Imm(1)),
+    ];
+    let mut opt6 = PeepholeOptimizer.new(instrs6)
+    let result6 = opt6.optimize()
+    assert(result6.len() == 1)
+    assert(result6[0].op == Opcode.Add)
+    print("Dead mov ✓")
+
+    // Combined optimizations
+    let instrs7 = [
+        Instruction.nullary(Opcode.Nop),
+        Instruction.new(Opcode.Mul, Operand.Reg(0), Operand.Reg(1), Operand.Imm(16)),
+        Instruction.new(Opcode.Add, Operand.Reg(2), Operand.Imm(10), Operand.Imm(20)),
+        Instruction.unary(Opcode.Mov, Operand.Reg(3), Operand.Reg(3)),
+        Instruction.nullary(Opcode.Nop),
+    ];
+    let mut opt7 = PeepholeOptimizer.new(instrs7)
+    let result7 = opt7.optimize()
+    assert(result7.len() == 2)
+    assert(result7[0].op == Opcode.Shl)  // mul 16 -> shl 4
+    assert(result7[1].src1 == Operand.Imm(30))  // 10 + 20 folded
+    assert(opt7.total_passes() > 1)
+    print("Combined ✓")
+
+    print("Peephole optimizer complete ✓")
 }
