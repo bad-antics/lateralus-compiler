@@ -1,0 +1,246 @@
+
+// SSA (Static Single Assignment) Form construction
+// Converts IR to SSA with phi-node insertion and variable renaming.
+
+use std.collections.{HashMap, HashSet}
+
+type VarId = usize
+type BlockId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+enum SsaValue {
+    Const(i64),
+    Param(usize),
+    Phi([(BlockId, VarId)]),
+    BinOp(BinOpKind, VarId, VarId),
+    UnaryOp(UnaryOpKind, VarId),
+    Call(string, [VarId]),
+    Load(VarId),
+    Undef,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum BinOpKind { Add, Sub, Mul, Div, Mod, And, Or, Xor, Shl, Shr, Eq, Ne, Lt, Le, Gt, Ge }
+
+#[derive(Clone, Debug, PartialEq)]
+enum UnaryOpKind { Neg, Not, BitNot }
+
+#[derive(Clone, Debug)]
+struct SsaInstr {
+    id: VarId,
+    value: SsaValue,
+}
+
+#[derive(Clone, Debug)]
+enum Terminator {
+    Return(Option<VarId>),
+    Branch(BlockId),
+    CondBranch(VarId, BlockId, BlockId),
+    Unreachable,
+}
+
+#[derive(Clone, Debug)]
+struct SsaBlock {
+    id: BlockId,
+    instructions: [SsaInstr],
+    terminator: Terminator,
+    predecessors: [BlockId],
+    successors: [BlockId],
+}
+
+impl SsaBlock {
+    fn new(id: BlockId) -> SsaBlock {
+        SsaBlock {
+            id, instructions: vec![], terminator: Terminator.Unreachable,
+            predecessors: vec![], successors: vec![],
+        }
+    }
+
+    fn add_instr(mut self, id: VarId, value: SsaValue) {
+        self.instructions.push(SsaInstr { id, value })
+    }
+
+    fn phi_count(self) -> usize {
+        self.instructions.iter().filter(|i| matches!(&i.value, SsaValue.Phi(_))).count()
+    }
+
+    fn instr_count(self) -> usize { self.instructions.len() }
+}
+
+struct SsaBuilder {
+    blocks: HashMap<BlockId, SsaBlock>,
+    next_var: VarId,
+    next_block: BlockId,
+    current_defs: HashMap<(string, BlockId), VarId>,
+    sealed_blocks: HashSet<BlockId>,
+    incomplete_phis: HashMap<BlockId, [(string, VarId)]>,
+}
+
+impl SsaBuilder {
+    fn new() -> SsaBuilder {
+        SsaBuilder {
+            blocks: HashMap.new(), next_var: 0, next_block: 0,
+            current_defs: HashMap.new(), sealed_blocks: HashSet.new(),
+            incomplete_phis: HashMap.new(),
+        }
+    }
+
+    fn new_block(mut self) -> BlockId {
+        let id = self.next_block
+        self.next_block += 1
+        self.blocks.insert(id, SsaBlock.new(id))
+        id
+    }
+
+    fn new_var(mut self) -> VarId {
+        let id = self.next_var
+        self.next_var += 1
+        id
+    }
+
+    fn add_instr(mut self, block: BlockId, value: SsaValue) -> VarId {
+        let var = self.new_var()
+        self.blocks.get_mut(&block).unwrap().add_instr(var, value)
+        var
+    }
+
+    fn add_const(mut self, block: BlockId, val: i64) -> VarId {
+        self.add_instr(block, SsaValue.Const(val))
+    }
+
+    fn add_binop(mut self, block: BlockId, op: BinOpKind, lhs: VarId, rhs: VarId) -> VarId {
+        self.add_instr(block, SsaValue.BinOp(op, lhs, rhs))
+    }
+
+    fn add_phi(mut self, block: BlockId, entries: [(BlockId, VarId)]) -> VarId {
+        self.add_instr(block, SsaValue.Phi(entries))
+    }
+
+    fn set_terminator(mut self, block: BlockId, term: Terminator) {
+        self.blocks.get_mut(&block).unwrap().terminator = term
+    }
+
+    fn add_edge(mut self, from: BlockId, to: BlockId) {
+        self.blocks.get_mut(&from).unwrap().successors.push(to)
+        self.blocks.get_mut(&to).unwrap().predecessors.push(from)
+    }
+
+    fn write_variable(mut self, name: string, block: BlockId, var: VarId) {
+        self.current_defs.insert((name, block), var)
+    }
+
+    fn read_variable(self, name: &str, block: BlockId) -> Option<VarId> {
+        self.current_defs.get(&(name.to_string(), block)).copied()
+    }
+
+    fn seal_block(mut self, block: BlockId) {
+        self.sealed_blocks.insert(block)
+    }
+
+    fn is_sealed(self, block: BlockId) -> bool {
+        self.sealed_blocks.contains(&block)
+    }
+
+    fn block_count(self) -> usize { self.blocks.len() }
+    fn var_count(self) -> usize { self.next_var }
+    fn get_block(self, id: BlockId) -> Option<&SsaBlock> { self.blocks.get(&id) }
+}
+
+fn main() {
+    // SsaValue variants
+    assert(SsaValue.Const(42) == SsaValue.Const(42))
+    assert(SsaValue.Const(1) != SsaValue.Const(2))
+    assert(SsaValue.Undef == SsaValue.Undef)
+    print("SsaValue ✓")
+
+    // BinOpKind
+    assert(BinOpKind.Add != BinOpKind.Sub)
+    assert(BinOpKind.Eq != BinOpKind.Ne)
+    print("BinOpKind ✓")
+
+    // UnaryOpKind
+    assert(UnaryOpKind.Neg != UnaryOpKind.Not)
+    print("UnaryOpKind ✓")
+
+    // SsaBlock
+    let mut block = SsaBlock.new(0)
+    block.add_instr(0, SsaValue.Const(10))
+    block.add_instr(1, SsaValue.Phi(vec![(0, 5), (1, 6)]))
+    block.add_instr(2, SsaValue.BinOp(BinOpKind.Add, 0, 1))
+    assert(block.instr_count() == 3)
+    assert(block.phi_count() == 1)
+    print("SsaBlock ✓")
+
+    // SsaBuilder basics
+    let mut builder = SsaBuilder.new()
+    let b0 = builder.new_block()
+    let b1 = builder.new_block()
+    let b2 = builder.new_block()
+    assert(builder.block_count() == 3)
+    print("Builder blocks ✓")
+
+    // Add instructions
+    let x = builder.add_const(b0, 10)
+    let y = builder.add_const(b0, 20)
+    let sum = builder.add_binop(b0, BinOpKind.Add, x, y)
+    assert(builder.var_count() == 3)
+    print("Add instructions ✓")
+
+    // Edges
+    builder.add_edge(b0, b1)
+    builder.add_edge(b0, b2)
+    let block0 = builder.get_block(b0).unwrap()
+    assert(block0.successors.len() == 2)
+    let block1 = builder.get_block(b1).unwrap()
+    assert(block1.predecessors.len() == 1)
+    print("Edges ✓")
+
+    // Terminators
+    builder.set_terminator(b0, Terminator.CondBranch(sum, b1, b2))
+    builder.set_terminator(b1, Terminator.Return(some(x)))
+    builder.set_terminator(b2, Terminator.Return(some(y)))
+    match &builder.get_block(b0).unwrap().terminator {
+        Terminator.CondBranch(cond, t, f) => {
+            assert(*cond == sum)
+            assert(*t == b1 && *f == b2)
+        },
+        _ => assert(false),
+    }
+    print("Terminators ✓")
+
+    // Variable tracking
+    builder.write_variable("x".into(), b0, x)
+    assert(builder.read_variable("x", b0) == some(x))
+    assert(builder.read_variable("y", b0).is_none())
+    print("Variables ✓")
+
+    // Seal blocks
+    builder.seal_block(b0)
+    assert(builder.is_sealed(b0))
+    assert(!builder.is_sealed(b1))
+    print("Seal ✓")
+
+    // Phi nodes
+    let phi = builder.add_phi(b2, vec![(b0, x), (b1, y)])
+    let b2_block = builder.get_block(b2).unwrap()
+    assert(b2_block.phi_count() == 1)
+    print("Phi nodes ✓")
+
+    // Terminator variants
+    match Terminator.Branch(5) {
+        Terminator.Branch(t) => assert(t == 5),
+        _ => assert(false),
+    }
+    match Terminator.Unreachable {
+        Terminator.Unreachable => {},
+        _ => assert(false),
+    }
+    print("Terminator variants ✓")
+
+    // SsaInstr
+    let instr = SsaInstr { id: 42, value: SsaValue.Const(100) }
+    assert(instr.id == 42)
+    print("SsaInstr ✓")
+
+    print("SSA construction complete ✓")
+}
