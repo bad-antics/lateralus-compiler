@@ -1,0 +1,378 @@
+// Compiler Pass - Phi Elimination
+// Converts SSA phi nodes into copies during register allocation lowering.
+
+use std.collections.{HashMap, HashSet}
+use std.fmt.{Display, Formatter}
+
+type VarId = usize
+type BlockId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+struct PhiNode {
+    dest: VarId,
+    args: [(BlockId, VarId)],  // (predecessor block, variable)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Instruction {
+    Copy(VarId, VarId),           // dest = src
+    Swap(VarId, VarId),           // swap a, b
+    Phi(PhiNode),
+    Op(string, VarId, [VarId]),   // generic op: dest = op(args)
+    Jump(BlockId),
+    Branch(VarId, BlockId, BlockId),
+    Return(Option<VarId>),
+}
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    id: BlockId,
+    phis: [PhiNode],
+    instructions: [Instruction],
+    predecessors: [BlockId],
+    successors: [BlockId],
+}
+
+impl BasicBlock {
+    fn new(id: BlockId) -> BasicBlock {
+        BasicBlock {
+            id, phis: [], instructions: [],
+            predecessors: [], successors: [],
+        }
+    }
+
+    fn add_phi(mut self, phi: PhiNode) { self.phis.push(phi) }
+    fn add_inst(mut self, inst: Instruction) { self.instructions.push(inst) }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CopyPair {
+    src: VarId,
+    dest: VarId,
+    pred_block: BlockId,
+    target_block: BlockId,
+}
+
+struct PhiEliminator {
+    blocks: HashMap<BlockId, BasicBlock>,
+    copies: [CopyPair],
+    next_temp: VarId,
+    stats: EliminationStats,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EliminationStats {
+    phis_eliminated: usize,
+    copies_inserted: usize,
+    swaps_inserted: usize,
+    temps_created: usize,
+    critical_edges_split: usize,
+}
+
+impl PhiEliminator {
+    fn new(next_temp: VarId) -> PhiEliminator {
+        PhiEliminator {
+            blocks: HashMap.new(),
+            copies: [],
+            next_temp,
+            stats: EliminationStats.default(),
+        }
+    }
+
+    fn add_block(mut self, block: BasicBlock) {
+        self.blocks.insert(block.id, block)
+    }
+
+    fn fresh_temp(mut self) -> VarId {
+        let t = self.next_temp
+        self.next_temp += 1
+        self.stats.temps_created += 1
+        t
+    }
+
+    fn needs_edge_split(self, pred: BlockId, succ: BlockId) -> bool {
+        // Critical edge: pred has multiple successors AND succ has multiple predecessors
+        let pred_block = self.blocks.get(&pred).unwrap()
+        let succ_block = self.blocks.get(&succ).unwrap()
+        pred_block.successors.len() > 1 && succ_block.predecessors.len() > 1
+    }
+
+    fn split_critical_edge(mut self, pred: BlockId, succ: BlockId) -> BlockId {
+        let new_id = self.next_temp * 1000 + pred * 100 + succ
+        let mut new_block = BasicBlock.new(new_id)
+        new_block.predecessors = vec![pred]
+        new_block.successors = vec![succ]
+        new_block.instructions.push(Instruction.Jump(succ))
+
+        // Update pred: replace succ with new_id in successors
+        let pred_block = self.blocks.get_mut(&pred).unwrap()
+        for s in &mut pred_block.successors {
+            if *s == succ { *s = new_id }
+        }
+        // Update any branch/jump instructions
+        for inst in &mut pred_block.instructions {
+            match inst {
+                Instruction.Jump(target) if *target == succ => *target = new_id,
+                Instruction.Branch(_, t, f) => {
+                    if *t == succ { *t = new_id }
+                    if *f == succ { *f = new_id }
+                },
+                _ => {},
+            }
+        }
+
+        // Update succ: replace pred with new_id in predecessors
+        let succ_block = self.blocks.get_mut(&succ).unwrap()
+        for p in &mut succ_block.predecessors {
+            if *p == pred { *p = new_id }
+        }
+        // Update phi args
+        for phi in &mut succ_block.phis {
+            for (block, _) in &mut phi.args {
+                if *block == pred { *block = new_id }
+            }
+        }
+
+        self.blocks.insert(new_id, new_block)
+        self.stats.critical_edges_split += 1
+        new_id
+    }
+
+    fn collect_copies(mut self) {
+        let block_ids: [BlockId] = self.blocks.keys().cloned().collect()
+
+        for block_id in &block_ids {
+            let phis: [PhiNode] = self.blocks.get(block_id).unwrap().phis.clone()
+
+            for phi in &phis {
+                for (pred, src) in &phi.args {
+                    let actual_pred = if self.needs_edge_split(*pred, *block_id) {
+                        self.split_critical_edge(*pred, *block_id)
+                    } else {
+                        *pred
+                    }
+
+                    self.copies.push(CopyPair {
+                        src: *src,
+                        dest: phi.dest,
+                        pred_block: actual_pred,
+                        target_block: *block_id,
+                    })
+                }
+                self.stats.phis_eliminated += 1
+            }
+        }
+    }
+
+    fn sequentialize_copies(mut self) -> HashMap<BlockId, [Instruction]> {
+        // Group copies by predecessor block
+        let mut by_block: HashMap<BlockId, [CopyPair]> = HashMap.new()
+        for cp in &self.copies {
+            by_block.entry(cp.pred_block).or_insert(vec![]).push(cp.clone())
+        }
+
+        let mut result: HashMap<BlockId, [Instruction]> = HashMap.new()
+
+        for (block_id, copies) in &by_block {
+            let instructions = self.parallel_copy_to_sequential(copies)
+            result.insert(*block_id, instructions)
+        }
+        result
+    }
+
+    fn parallel_copy_to_sequential(mut self, copies: &[CopyPair]) -> [Instruction] {
+        // Detect cycles and break them with temps
+        let mut instructions = []
+        let mut remaining: [CopyPair] = copies.to_vec()
+        let mut done = HashSet.new()
+
+        // First: emit copies that don't have their dest used as src by others
+        loop {
+            let mut progress = false
+            let mut i = 0
+            while i < remaining.len() {
+                let cp = &remaining[i]
+                let dest_used_as_src = remaining.iter()
+                    .enumerate()
+                    .any(|(j, other)| j != i && other.src == cp.dest && !done.contains(&j))
+
+                if !dest_used_as_src {
+                    if cp.src != cp.dest {
+                        instructions.push(Instruction.Copy(cp.dest, cp.src))
+                        self.stats.copies_inserted += 1
+                    }
+                    done.insert(i)
+                    progress = true
+                }
+                i += 1
+            }
+            if !progress { break }
+            remaining = remaining.iter().enumerate()
+                .filter(|(i, _)| !done.contains(i))
+                .map(|(_, cp)| cp.clone())
+                .collect()
+            done.clear()
+            if remaining.is_empty() { break }
+        }
+
+        // Remaining copies form cycles: break with swap or temp
+        while !remaining.is_empty() {
+            if remaining.len() == 2 && remaining[0].src == remaining[1].dest
+                && remaining[0].dest == remaining[1].src
+            {
+                instructions.push(Instruction.Swap(remaining[0].dest, remaining[0].src))
+                self.stats.swaps_inserted += 1
+                remaining.clear()
+            } else {
+                // Break cycle with a temp
+                let temp = self.fresh_temp()
+                let first = remaining.remove(0)
+                instructions.push(Instruction.Copy(temp, first.dest))
+                instructions.push(Instruction.Copy(first.dest, first.src))
+                self.stats.copies_inserted += 2
+                // Replace all uses of first.dest as src with temp
+                for cp in &mut remaining {
+                    if cp.src == first.dest { cp.src = temp }
+                }
+            }
+        }
+        instructions
+    }
+
+    fn eliminate(mut self) -> HashMap<BlockId, [Instruction]> {
+        self.collect_copies()
+        let insertions = self.sequentialize_copies()
+
+        // Remove phi nodes from all blocks
+        for (_, block) in &mut self.blocks {
+            block.phis.clear()
+        }
+        insertions
+    }
+
+    fn stats(self) -> &EliminationStats { &self.stats }
+}
+
+fn main() {
+    // Basic phi elimination: one phi with two args
+    let mut elim = PhiEliminator.new(100)
+    let mut b0 = BasicBlock.new(0)
+    b0.successors = vec![2]
+    b0.instructions.push(Instruction.Jump(2))
+
+    let mut b1 = BasicBlock.new(1)
+    b1.successors = vec![2]
+    b1.instructions.push(Instruction.Jump(2))
+
+    let mut b2 = BasicBlock.new(2)
+    b2.predecessors = vec![0, 1]
+    b2.add_phi(PhiNode { dest: 3, args: vec![(0, 1), (1, 2)] })
+    b2.instructions.push(Instruction.Return(some(3)))
+
+    elim.add_block(b0)
+    elim.add_block(b1)
+    elim.add_block(b2)
+
+    let insertions = elim.eliminate()
+    assert(elim.stats().phis_eliminated == 1)
+    assert(elim.stats().copies_inserted >= 2)
+    assert(insertions.contains_key(&0) || insertions.contains_key(&1))
+    print("Basic phi elimination ✓")
+
+    // Self-copy elimination (src == dest should produce no copy)
+    let mut elim2 = PhiEliminator.new(200)
+    let mut a0 = BasicBlock.new(0)
+    a0.successors = vec![1]
+    a0.instructions.push(Instruction.Jump(1))
+
+    let mut a1 = BasicBlock.new(1)
+    a1.predecessors = vec![0]
+    a1.add_phi(PhiNode { dest: 5, args: vec![(0, 5)] })  // self-copy
+
+    elim2.add_block(a0)
+    elim2.add_block(a1)
+    let ins2 = elim2.eliminate()
+    // Self-copy should not generate a copy instruction
+    let total_copies = ins2.values().flat_map(|v| v.iter()).count()
+    assert(total_copies == 0)
+    print("Self-copy elision ✓")
+
+    // Cycle detection: a->b, b->a requires swap or temp
+    let mut elim3 = PhiEliminator.new(300)
+    let mut c0 = BasicBlock.new(0)
+    c0.successors = vec![1]
+    c0.instructions.push(Instruction.Jump(1))
+
+    let mut c1 = BasicBlock.new(1)
+    c1.predecessors = vec![0]
+    c1.add_phi(PhiNode { dest: 10, args: vec![(0, 11)] })
+    c1.add_phi(PhiNode { dest: 11, args: vec![(0, 10)] })
+
+    elim3.add_block(c0)
+    elim3.add_block(c1)
+    let ins3 = elim3.eliminate()
+    assert(elim3.stats().phis_eliminated == 2)
+    // Should use swap or temp+copies
+    let has_swap = ins3.values().flat_map(|v| v.iter()).any(|i| matches!(i, Instruction.Swap(..)))
+    let has_temp = elim3.stats().temps_created > 0
+    assert(has_swap || has_temp)
+    print("Cycle breaking ✓")
+
+    // CopyPair
+    let cp = CopyPair { src: 1, dest: 2, pred_block: 0, target_block: 1 }
+    assert(cp.src == 1 && cp.dest == 2)
+    print("CopyPair ✓")
+
+    // BasicBlock
+    let mut bb = BasicBlock.new(42)
+    assert(bb.id == 42)
+    bb.add_inst(Instruction.Return(none))
+    assert(bb.instructions.len() == 1)
+    print("BasicBlock ✓")
+
+    // Stats
+    let s = EliminationStats.default()
+    assert(s.phis_eliminated == 0)
+    assert(s.copies_inserted == 0)
+    assert(s.swaps_inserted == 0)
+    print("Stats default ✓")
+
+    // PhiNode
+    let pn = PhiNode { dest: 5, args: vec![(0, 1), (1, 2), (2, 3)] }
+    assert(pn.args.len() == 3)
+    assert(pn.dest == 5)
+    print("PhiNode ✓")
+
+    // Instruction variants
+    let copy = Instruction.Copy(1, 2)
+    let swap = Instruction.Swap(3, 4)
+    let jump = Instruction.Jump(0)
+    let ret = Instruction.Return(some(5))
+    assert(copy != swap)
+    assert(jump != ret)
+    print("Instruction variants ✓")
+
+    // Critical edge detection
+    let mut elim4 = PhiEliminator.new(400)
+    let mut d0 = BasicBlock.new(0)
+    d0.successors = vec![2, 3]  // multiple successors
+    let mut d1 = BasicBlock.new(1)
+    d1.successors = vec![2]
+    let mut d2 = BasicBlock.new(2)
+    d2.predecessors = vec![0, 1]  // multiple predecessors
+    d2.successors = []
+    let mut d3 = BasicBlock.new(3)
+    d3.predecessors = vec![0]
+    d3.successors = []
+
+    elim4.add_block(d0)
+    elim4.add_block(d1)
+    elim4.add_block(d2)
+    elim4.add_block(d3)
+    assert(elim4.needs_edge_split(0, 2))    // critical: 0 has 2 succs, 2 has 2 preds
+    assert(!elim4.needs_edge_split(1, 2))   // not critical: 1 has 1 succ
+    assert(!elim4.needs_edge_split(0, 3))   // not critical: 3 has 1 pred
+    print("Critical edge detection ✓")
+
+    print("Phi Elimination complete ✓")
+}
