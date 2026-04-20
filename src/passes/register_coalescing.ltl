@@ -1,0 +1,269 @@
+
+// Register Coalescing - Eliminates unnecessary register-to-register moves
+// by merging live ranges that don't interfere.
+
+use std.collections.{HashMap, HashSet}
+
+type RegId = usize
+type VarId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+struct LiveRange {
+    var: VarId,
+    start: usize,
+    end: usize,
+    reg: Option<RegId>,
+}
+
+impl LiveRange {
+    fn new(var: VarId, start: usize, end: usize) -> LiveRange {
+        LiveRange { var, start, end, reg: none }
+    }
+
+    fn overlaps(self, other: &LiveRange) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+
+    fn contains(self, point: usize) -> bool {
+        point >= self.start && point < self.end
+    }
+
+    fn length(self) -> usize { self.end - self.start }
+
+    fn merge(self, other: &LiveRange) -> LiveRange {
+        LiveRange {
+            var: self.var,
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+            reg: self.reg.or(other.reg),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MoveInstr {
+    dst: VarId,
+    src: VarId,
+    position: usize,
+}
+
+#[derive(Clone, Debug)]
+struct InterferenceGraph {
+    nodes: HashSet<VarId>,
+    edges: HashSet<(VarId, VarId)>,
+}
+
+impl InterferenceGraph {
+    fn new() -> InterferenceGraph {
+        InterferenceGraph { nodes: HashSet.new(), edges: HashSet.new() }
+    }
+
+    fn add_node(mut self, v: VarId) { self.nodes.insert(v); }
+
+    fn add_edge(mut self, a: VarId, b: VarId) {
+        if a != b {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) }
+            self.edges.insert((lo, hi))
+        }
+    }
+
+    fn interferes(self, a: VarId, b: VarId) -> bool {
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) }
+        self.edges.contains(&(lo, hi))
+    }
+
+    fn degree(self, v: VarId) -> usize {
+        self.edges.iter()
+            .filter(|(a, b)| *a == v || *b == v)
+            .count()
+    }
+
+    fn neighbors(self, v: VarId) -> HashSet<VarId> {
+        let mut result = HashSet.new()
+        for (a, b) in &self.edges {
+            if *a == v { result.insert(*b); }
+            if *b == v { result.insert(*a); }
+        }
+        result
+    }
+
+    fn node_count(self) -> usize { self.nodes.len() }
+    fn edge_count(self) -> usize { self.edges.len() }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CoalescingStats {
+    moves_examined: usize,
+    moves_coalesced: usize,
+    moves_constrained: usize,
+    live_ranges_merged: usize,
+}
+
+struct RegisterCoalescer {
+    ig: InterferenceGraph,
+    ranges: HashMap<VarId, LiveRange>,
+    moves: [MoveInstr],
+    stats: CoalescingStats,
+}
+
+impl RegisterCoalescer {
+    fn new(ig: InterferenceGraph, ranges: HashMap<VarId, LiveRange>, moves: [MoveInstr]) -> RegisterCoalescer {
+        RegisterCoalescer { ig, ranges, moves, stats: CoalescingStats.default() }
+    }
+
+    fn coalesce(mut self) -> [MoveInstr] {
+        let mut remaining = vec![]
+
+        for mv in &self.moves {
+            self.stats.moves_examined += 1
+
+            if self.ig.interferes(mv.src, mv.dst) {
+                self.stats.moves_constrained += 1
+                remaining.push(mv.clone())
+                continue
+            }
+
+            // Briggs criterion: coalesce if merged node has < K high-degree neighbors
+            let k = 16  // typical register count
+            let combined_neighbors = self.ig.neighbors(mv.src)
+                .union(&self.ig.neighbors(mv.dst))
+                .copied()
+                .collect::<HashSet<_>>()
+
+            let high_degree = combined_neighbors.iter()
+                .filter(|&&n| self.ig.degree(n) >= k)
+                .count()
+
+            if high_degree < k {
+                // Safe to coalesce
+                self.merge_vars(mv.src, mv.dst)
+                self.stats.moves_coalesced += 1
+                self.stats.live_ranges_merged += 1
+            } else {
+                self.stats.moves_constrained += 1
+                remaining.push(mv.clone())
+            }
+        }
+
+        remaining
+    }
+
+    fn merge_vars(mut self, a: VarId, b: VarId) {
+        if let (some(ra), some(rb)) = (self.ranges.get(&a), self.ranges.get(&b)) {
+            let merged = ra.merge(rb)
+            self.ranges.insert(a, merged)
+            self.ranges.remove(&b)
+        }
+
+        // Update interference graph
+        let b_neighbors = self.ig.neighbors(b)
+        for n in b_neighbors {
+            self.ig.add_edge(a, n)
+        }
+        self.ig.nodes.remove(&b)
+        self.ig.edges.retain(|(x, y)| *x != b && *y != b)
+    }
+
+    fn stats(self) -> &CoalescingStats { &self.stats }
+}
+
+fn main() {
+    // LiveRange basics
+    let r1 = LiveRange.new(1, 0, 10)
+    let r2 = LiveRange.new(2, 5, 15)
+    assert(r1.overlaps(&r2))
+    assert(r2.overlaps(&r1))
+    assert(r1.contains(5))
+    assert(!r1.contains(10))
+    assert(r1.length() == 10)
+    print("LiveRange ✓")
+
+    // Non-overlapping
+    let r3 = LiveRange.new(3, 20, 30)
+    assert(!r1.overlaps(&r3))
+    assert(!r3.overlaps(&r1))
+    print("Non-overlapping ✓")
+
+    // Merge
+    let merged = r1.merge(&r2)
+    assert(merged.start == 0)
+    assert(merged.end == 15)
+    assert(merged.length() == 15)
+    print("Merge ✓")
+
+    // InterferenceGraph
+    let mut ig = InterferenceGraph.new()
+    ig.add_node(1); ig.add_node(2); ig.add_node(3); ig.add_node(4)
+    ig.add_edge(1, 2)
+    ig.add_edge(1, 3)
+    ig.add_edge(2, 3)
+    assert(ig.node_count() == 4)
+    assert(ig.edge_count() == 3)
+    assert(ig.interferes(1, 2))
+    assert(ig.interferes(2, 1))  // symmetric
+    assert(!ig.interferes(1, 4))
+    assert(ig.degree(1) == 2)
+    assert(ig.degree(4) == 0)
+    print("InterferenceGraph ✓")
+
+    // Neighbors
+    let n1 = ig.neighbors(1)
+    assert(n1.len() == 2)
+    assert(n1.contains(&2))
+    assert(n1.contains(&3))
+    print("Neighbors ✓")
+
+    // Self-edge ignored
+    ig.add_edge(1, 1)
+    assert(ig.edge_count() == 3)  // unchanged
+    print("Self-edge ✓")
+
+    // Coalescing - non-interfering move
+    let mut ig2 = InterferenceGraph.new()
+    ig2.add_node(10); ig2.add_node(20); ig2.add_node(30)
+    ig2.add_edge(10, 30)  // 10 and 30 interfere, but 10 and 20 do not
+
+    let mut ranges = HashMap.new()
+    ranges.insert(10, LiveRange.new(10, 0, 5))
+    ranges.insert(20, LiveRange.new(20, 6, 10))
+    ranges.insert(30, LiveRange.new(30, 0, 10))
+
+    let moves = vec![MoveInstr { dst: 10, src: 20, position: 5 }]
+    let mut coalescer = RegisterCoalescer.new(ig2, ranges, moves)
+    let remaining = coalescer.coalesce()
+
+    assert(remaining.len() == 0)
+    assert(coalescer.stats().moves_coalesced == 1)
+    assert(coalescer.stats().moves_examined == 1)
+    print("Coalescing ✓")
+
+    // Constrained move - interfering vars
+    let mut ig3 = InterferenceGraph.new()
+    ig3.add_node(1); ig3.add_node(2)
+    ig3.add_edge(1, 2)
+
+    let mut ranges2 = HashMap.new()
+    ranges2.insert(1, LiveRange.new(1, 0, 10))
+    ranges2.insert(2, LiveRange.new(2, 5, 15))
+
+    let moves2 = vec![MoveInstr { dst: 1, src: 2, position: 5 }]
+    let mut coalescer2 = RegisterCoalescer.new(ig3, ranges2, moves2)
+    let remaining2 = coalescer2.coalesce()
+
+    assert(remaining2.len() == 1)
+    assert(coalescer2.stats().moves_constrained == 1)
+    print("Constrained ✓")
+
+    // Stats default
+    let s = CoalescingStats.default()
+    assert(s.moves_examined == 0)
+    assert(s.moves_coalesced == 0)
+    print("Stats ✓")
+
+    // MoveInstr
+    let mv = MoveInstr { dst: 5, src: 10, position: 42 }
+    assert(mv.dst == 5 && mv.src == 10 && mv.position == 42)
+    print("MoveInstr ✓")
+
+    print("Register coalescing complete ✓")
+}
