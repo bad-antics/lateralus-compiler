@@ -1,0 +1,246 @@
+
+// Strength Reduction Optimization
+// Replaces expensive operations with cheaper equivalents.
+// mul by power of 2 -> shift, div by power of 2 -> shift, mod by power of 2 -> AND.
+
+use std.collections.HashMap
+
+#[derive(Clone, Debug, PartialEq)]
+enum Op {
+    Add(string, string, string),       // dst = a + b
+    Sub(string, string, string),       // dst = a - b
+    Mul(string, string, string),       // dst = a * b
+    Div(string, string, string),       // dst = a / b
+    Mod(string, string, string),       // dst = a % b
+    Shl(string, string, string),       // dst = a << b
+    Shr(string, string, string),       // dst = a >> b
+    And(string, string, string),       // dst = a & b
+    Mov(string, string),               // dst = src
+    LoadImm(string, i64),              // dst = imm
+    Nop,
+}
+
+impl Op {
+    fn dst(self) -> Option<&str> {
+        match self {
+            Op.Add(d,..) | Op.Sub(d,..) | Op.Mul(d,..) |
+            Op.Div(d,..) | Op.Mod(d,..) | Op.Shl(d,..) |
+            Op.Shr(d,..) | Op.And(d,..) => Some(d),
+            Op.Mov(d, _) | Op.LoadImm(d, _) => Some(d),
+            Op.Nop => None,
+        }
+    }
+}
+
+fn is_power_of_two(n: i64) -> bool { n > 0 && (n & (n - 1)) == 0 }
+fn log2(n: i64) -> i64 {
+    let mut v = n
+    let mut r = 0
+    while v > 1 { v >>= 1; r += 1 }
+    r
+}
+
+struct StrengthReducer {
+    constants: HashMap<string, i64>,
+    reductions: usize,
+}
+
+impl StrengthReducer {
+    fn new() -> StrengthReducer {
+        StrengthReducer { constants: HashMap.new(), reductions: 0 }
+    }
+
+    fn reduce(mut self, ops: &[Op]) -> [Op] {
+        // First pass: collect constants
+        for op in ops {
+            if let Op.LoadImm(name, val) = op {
+                self.constants.insert(name.clone(), *val)
+            }
+        }
+
+        // Second pass: reduce
+        ops.iter().map(|op| self.reduce_op(op)).collect()
+    }
+
+    fn reduce_op(mut self, op: &Op) -> Op {
+        match op {
+            // Multiply by power of 2 -> shift left
+            Op.Mul(dst, a, b) => {
+                if let Some(&val) = self.constants.get(b) {
+                    if is_power_of_two(val) {
+                        self.reductions += 1
+                        let shift = log2(val)
+                        return Op.Shl(dst.clone(), a.clone(), format!("#{}", shift))
+                    }
+                    if val == 0 { self.reductions += 1; return Op.LoadImm(dst.clone(), 0) }
+                    if val == 1 { self.reductions += 1; return Op.Mov(dst.clone(), a.clone()) }
+                }
+                if let Some(&val) = self.constants.get(a) {
+                    if is_power_of_two(val) {
+                        self.reductions += 1
+                        return Op.Shl(dst.clone(), b.clone(), format!("#{}", log2(val)))
+                    }
+                }
+                op.clone()
+            }
+            // Divide by power of 2 -> shift right
+            Op.Div(dst, a, b) => {
+                if let Some(&val) = self.constants.get(b) {
+                    if is_power_of_two(val) && val > 1 {
+                        self.reductions += 1
+                        return Op.Shr(dst.clone(), a.clone(), format!("#{}", log2(val)))
+                    }
+                    if val == 1 { self.reductions += 1; return Op.Mov(dst.clone(), a.clone()) }
+                }
+                op.clone()
+            }
+            // Mod by power of 2 -> AND (n-1)
+            Op.Mod(dst, a, b) => {
+                if let Some(&val) = self.constants.get(b) {
+                    if is_power_of_two(val) {
+                        self.reductions += 1
+                        return Op.And(dst.clone(), a.clone(), format!("#{}", val - 1))
+                    }
+                }
+                op.clone()
+            }
+            // Add 0 -> mov
+            Op.Add(dst, a, b) => {
+                if self.constants.get(b) == Some(&0) {
+                    self.reductions += 1
+                    return Op.Mov(dst.clone(), a.clone())
+                }
+                if self.constants.get(a) == Some(&0) {
+                    self.reductions += 1
+                    return Op.Mov(dst.clone(), b.clone())
+                }
+                op.clone()
+            }
+            // Sub 0 -> mov
+            Op.Sub(dst, a, b) => {
+                if self.constants.get(b) == Some(&0) {
+                    self.reductions += 1
+                    return Op.Mov(dst.clone(), a.clone())
+                }
+                // a - a = 0
+                if a == b {
+                    self.reductions += 1
+                    return Op.LoadImm(dst.clone(), 0)
+                }
+                op.clone()
+            }
+            _ => op.clone(),
+        }
+    }
+
+    fn reduction_count(self) -> usize { self.reductions }
+}
+
+fn main() {
+    // Power of two checks
+    assert(is_power_of_two(1))
+    assert(is_power_of_two(2))
+    assert(is_power_of_two(256))
+    assert(!is_power_of_two(3))
+    assert(!is_power_of_two(0))
+    assert(!is_power_of_two(-4))
+    print("Power of two ✓")
+
+    // Log2
+    assert(log2(1) == 0)
+    assert(log2(2) == 1)
+    assert(log2(8) == 3)
+    assert(log2(256) == 8)
+    print("Log2 ✓")
+
+    // Mul by power of 2 -> shift
+    let mut sr = StrengthReducer.new()
+    let ops = [
+        Op.LoadImm("c8".into(), 8),
+        Op.Mul("r".into(), "x".into(), "c8".into()),
+    ]
+    let reduced = sr.reduce(&ops)
+    assert(reduced[1] == Op.Shl("r".into(), "x".into(), "#3".into()))
+    assert(sr.reduction_count() == 1)
+    print("Mul -> Shl ✓")
+
+    // Div by power of 2 -> shift
+    let mut sr2 = StrengthReducer.new()
+    let ops2 = [
+        Op.LoadImm("c4".into(), 4),
+        Op.Div("r".into(), "x".into(), "c4".into()),
+    ]
+    let reduced2 = sr2.reduce(&ops2)
+    assert(reduced2[1] == Op.Shr("r".into(), "x".into(), "#2".into()))
+    print("Div -> Shr ✓")
+
+    // Mod by power of 2 -> AND
+    let mut sr3 = StrengthReducer.new()
+    let ops3 = [
+        Op.LoadImm("c16".into(), 16),
+        Op.Mod("r".into(), "x".into(), "c16".into()),
+    ]
+    let reduced3 = sr3.reduce(&ops3)
+    assert(reduced3[1] == Op.And("r".into(), "x".into(), "#15".into()))
+    print("Mod -> And ✓")
+
+    // Mul by 0 -> load 0
+    let mut sr4 = StrengthReducer.new()
+    let ops4 = [
+        Op.LoadImm("c0".into(), 0),
+        Op.Mul("r".into(), "x".into(), "c0".into()),
+    ]
+    let reduced4 = sr4.reduce(&ops4)
+    assert(reduced4[1] == Op.LoadImm("r".into(), 0))
+    print("Mul x0 ✓")
+
+    // Mul by 1 -> mov
+    let mut sr5 = StrengthReducer.new()
+    let ops5 = [
+        Op.LoadImm("c1".into(), 1),
+        Op.Mul("r".into(), "x".into(), "c1".into()),
+    ]
+    let reduced5 = sr5.reduce(&ops5)
+    assert(reduced5[1] == Op.Mov("r".into(), "x".into()))
+    print("Mul x1 ✓")
+
+    // Div by 1 -> mov
+    let mut sr6 = StrengthReducer.new()
+    let ops6 = [
+        Op.LoadImm("c1".into(), 1),
+        Op.Div("r".into(), "x".into(), "c1".into()),
+    ]
+    let reduced6 = sr6.reduce(&ops6)
+    assert(reduced6[1] == Op.Mov("r".into(), "x".into()))
+    print("Div /1 ✓")
+
+    // Add 0 -> mov
+    let mut sr7 = StrengthReducer.new()
+    let ops7 = [
+        Op.LoadImm("c0".into(), 0),
+        Op.Add("r".into(), "x".into(), "c0".into()),
+    ]
+    let reduced7 = sr7.reduce(&ops7)
+    assert(reduced7[1] == Op.Mov("r".into(), "x".into()))
+    print("Add +0 ✓")
+
+    // Sub self -> 0
+    let mut sr8 = StrengthReducer.new()
+    let ops8 = [Op.Sub("r".into(), "x".into(), "x".into())]
+    let reduced8 = sr8.reduce(&ops8)
+    assert(reduced8[0] == Op.LoadImm("r".into(), 0))
+    print("Sub self ✓")
+
+    // Non-power not reduced
+    let mut sr9 = StrengthReducer.new()
+    let ops9 = [
+        Op.LoadImm("c3".into(), 3),
+        Op.Mul("r".into(), "x".into(), "c3".into()),
+    ]
+    let reduced9 = sr9.reduce(&ops9)
+    assert(reduced9[1] == Op.Mul("r".into(), "x".into(), "c3".into()))
+    assert(sr9.reduction_count() == 0)
+    print("Non-power ✓")
+
+    print("Strength reduction complete ✓")
+}
