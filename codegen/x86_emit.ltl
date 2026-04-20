@@ -1,0 +1,277 @@
+
+// x86-64 Code Emitter - Generates x86-64 machine code instructions
+// Supports register allocation hints, common ALU ops, and function prologue/epilogue.
+
+use std.collections.HashMap
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Reg {
+    RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP,
+    R8, R9, R10, R11, R12, R13, R14, R15,
+}
+
+impl Reg {
+    fn encoding(self) -> u8 {
+        match self {
+            Reg.RAX => 0, Reg.RCX => 1, Reg.RDX => 2, Reg.RBX => 3,
+            Reg.RSP => 4, Reg.RBP => 5, Reg.RSI => 6, Reg.RDI => 7,
+            Reg.R8 => 8, Reg.R9 => 9, Reg.R10 => 10, Reg.R11 => 11,
+            Reg.R12 => 12, Reg.R13 => 13, Reg.R14 => 14, Reg.R15 => 15,
+        }
+    }
+
+    fn needs_rex(self) -> bool { self.encoding() >= 8 }
+    fn low_bits(self) -> u8 { self.encoding() & 0x07 }
+
+    fn name(self) -> &str {
+        match self {
+            Reg.RAX => "rax", Reg.RBX => "rbx", Reg.RCX => "rcx", Reg.RDX => "rdx",
+            Reg.RSI => "rsi", Reg.RDI => "rdi", Reg.RBP => "rbp", Reg.RSP => "rsp",
+            Reg.R8 => "r8", Reg.R9 => "r9", Reg.R10 => "r10", Reg.R11 => "r11",
+            Reg.R12 => "r12", Reg.R13 => "r13", Reg.R14 => "r14", Reg.R15 => "r15",
+        }
+    }
+
+    fn is_callee_saved(self) -> bool {
+        match self {
+            Reg.RBX | Reg.RBP | Reg.R12 | Reg.R13 | Reg.R14 | Reg.R15 => true,
+            _ => false,
+        }
+    }
+
+    fn is_arg_reg(self, idx: usize) -> bool {
+        let arg_regs = [Reg.RDI, Reg.RSI, Reg.RDX, Reg.RCX, Reg.R8, Reg.R9]
+        idx < arg_regs.len() && arg_regs[idx] == self
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Operand {
+    Register(Reg),
+    Immediate(i64),
+    Memory(Reg, i32),  // base + offset
+    Label(string),
+}
+
+#[derive(Clone, Debug)]
+enum X86Inst {
+    Mov(Operand, Operand),
+    Add(Operand, Operand),
+    Sub(Operand, Operand),
+    Imul(Operand, Operand),
+    Xor(Operand, Operand),
+    Cmp(Operand, Operand),
+    Push(Reg),
+    Pop(Reg),
+    Call(string),
+    Ret,
+    Je(string),
+    Jne(string),
+    Jmp(string),
+    Label(string),
+    Nop,
+}
+
+struct X86Emitter {
+    instructions: [X86Inst],
+    bytes: [u8],
+    labels: HashMap<string, usize>,
+    stack_size: usize,
+}
+
+impl X86Emitter {
+    fn new() -> X86Emitter {
+        X86Emitter { instructions: [], bytes: [], labels: HashMap.new(), stack_size: 0 }
+    }
+
+    fn emit(mut self, inst: X86Inst) { self.instructions.push(inst) }
+    fn inst_count(self) -> usize { self.instructions.len() }
+    fn code_size(self) -> usize { self.bytes.len() }
+
+    fn emit_prologue(mut self, local_bytes: usize) {
+        self.emit(X86Inst.Push(Reg.RBP))
+        self.emit(X86Inst.Mov(Operand.Register(Reg.RBP), Operand.Register(Reg.RSP)))
+        if local_bytes > 0 {
+            let aligned = (local_bytes + 15) & !15  // 16-byte align
+            self.emit(X86Inst.Sub(Operand.Register(Reg.RSP), Operand.Immediate(aligned as i64)))
+            self.stack_size = aligned
+        }
+    }
+
+    fn emit_epilogue(mut self) {
+        if self.stack_size > 0 {
+            self.emit(X86Inst.Add(Operand.Register(Reg.RSP), Operand.Immediate(self.stack_size as i64)))
+        }
+        self.emit(X86Inst.Pop(Reg.RBP))
+        self.emit(X86Inst.Ret)
+    }
+
+    fn emit_mov_reg_imm(mut self, dst: Reg, imm: i64) {
+        self.emit(X86Inst.Mov(Operand.Register(dst), Operand.Immediate(imm)))
+    }
+
+    fn emit_mov_reg_reg(mut self, dst: Reg, src: Reg) {
+        if dst != src {
+            self.emit(X86Inst.Mov(Operand.Register(dst), Operand.Register(src)))
+        }
+    }
+
+    fn emit_add_reg_reg(mut self, dst: Reg, src: Reg) {
+        self.emit(X86Inst.Add(Operand.Register(dst), Operand.Register(src)))
+    }
+
+    fn emit_sub_reg_imm(mut self, dst: Reg, imm: i64) {
+        self.emit(X86Inst.Sub(Operand.Register(dst), Operand.Immediate(imm)))
+    }
+
+    fn emit_call(mut self, name: &str) { self.emit(X86Inst.Call(name.into())) }
+
+    fn emit_label(mut self, name: &str) {
+        self.labels.insert(name.into(), self.instructions.len())
+        self.emit(X86Inst.Label(name.into()))
+    }
+
+    fn emit_rex(mut self, w: bool, r: Reg, b: Reg) {
+        let mut rex: u8 = 0x40
+        if w { rex |= 0x08 }
+        if r.needs_rex() { rex |= 0x04 }
+        if b.needs_rex() { rex |= 0x01 }
+        if rex != 0x40 { self.bytes.push(rex) }
+    }
+
+    fn emit_modrm(mut self, mode: u8, reg: u8, rm: u8) {
+        self.bytes.push((mode << 6) | ((reg & 7) << 3) | (rm & 7))
+    }
+
+    fn encode_mov_reg_reg(mut self, dst: Reg, src: Reg) {
+        self.emit_rex(true, src, dst)
+        self.bytes.push(0x89)
+        self.emit_modrm(0b11, src.low_bits(), dst.low_bits())
+    }
+
+    fn encode_ret(mut self) { self.bytes.push(0xC3) }
+    fn encode_nop(mut self) { self.bytes.push(0x90) }
+
+    fn to_asm(self) -> string {
+        let mut lines = []
+        for inst in &self.instructions {
+            match inst {
+                X86Inst.Label(name) => lines.push(format!("{}:", name)),
+                X86Inst.Ret => lines.push("  ret".into()),
+                X86Inst.Nop => lines.push("  nop".into()),
+                X86Inst.Push(r) => lines.push(format!("  push {}", r.name())),
+                X86Inst.Pop(r) => lines.push(format!("  pop {}", r.name())),
+                X86Inst.Call(name) => lines.push(format!("  call {}", name)),
+                X86Inst.Mov(dst, src) => lines.push(format!("  mov {}, {}", fmt_op(dst), fmt_op(src))),
+                X86Inst.Add(dst, src) => lines.push(format!("  add {}, {}", fmt_op(dst), fmt_op(src))),
+                X86Inst.Sub(dst, src) => lines.push(format!("  sub {}, {}", fmt_op(dst), fmt_op(src))),
+                _ => lines.push("  ; unhandled".into()),
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+fn fmt_op(op: &Operand) -> string {
+    match op {
+        Operand.Register(r) => r.name().into(),
+        Operand.Immediate(v) => format!("{}", v),
+        Operand.Memory(base, off) => format!("[{} + {}]", base.name(), off),
+        Operand.Label(l) => l.clone(),
+    }
+}
+
+fn main() {
+    // Register encoding
+    assert(Reg.RAX.encoding() == 0)
+    assert(Reg.R8.encoding() == 8)
+    assert(Reg.R15.encoding() == 15)
+    assert(!Reg.RAX.needs_rex())
+    assert(Reg.R8.needs_rex())
+    print("Register encoding ✓")
+
+    // Callee saved
+    assert(Reg.RBX.is_callee_saved())
+    assert(Reg.RBP.is_callee_saved())
+    assert(!Reg.RAX.is_callee_saved())
+    assert(!Reg.RCX.is_callee_saved())
+    print("Callee saved ✓")
+
+    // Arg registers
+    assert(Reg.RDI.is_arg_reg(0))
+    assert(Reg.RSI.is_arg_reg(1))
+    assert(Reg.R9.is_arg_reg(5))
+    assert(!Reg.RAX.is_arg_reg(0))
+    print("Arg registers ✓")
+
+    // Emitter
+    let mut em = X86Emitter.new()
+    assert(em.inst_count() == 0)
+    em.emit_prologue(32)
+    assert(em.inst_count() == 3)  // push, mov, sub
+    assert(em.stack_size == 32)
+    print("Prologue ✓")
+
+    em.emit_mov_reg_imm(Reg.RAX, 42)
+    em.emit_add_reg_reg(Reg.RAX, Reg.RBX)
+    em.emit_call("printf")
+    em.emit_epilogue()
+    assert(em.inst_count() == 9)  // prologue(3) + 3 + epilogue(3)
+    print("Instructions ✓")
+
+    // ASM output
+    let asm = em.to_asm()
+    assert(asm.contains("push rbp"))
+    assert(asm.contains("mov rbp, rsp"))
+    assert(asm.contains("call printf"))
+    assert(asm.contains("ret"))
+    print("ASM output ✓")
+
+    // Labels
+    let mut em2 = X86Emitter.new()
+    em2.emit_label("loop_start")
+    em2.emit(X86Inst.Nop)
+    assert(em2.labels.contains_key("loop_start"))
+    assert(*em2.labels.get("loop_start").unwrap() == 0)
+    print("Labels ✓")
+
+    // Binary encoding
+    let mut em3 = X86Emitter.new()
+    em3.encode_ret()
+    assert(em3.bytes == [0xC3])
+    em3.encode_nop()
+    assert(em3.bytes == [0xC3, 0x90])
+    print("Binary encoding ✓")
+
+    // ModRM
+    let mut em4 = X86Emitter.new()
+    em4.emit_modrm(0b11, 0, 0)
+    assert(em4.bytes[0] == 0xC0)
+    print("ModRM ✓")
+
+    // REX prefix
+    let mut em5 = X86Emitter.new()
+    em5.emit_rex(true, Reg.RAX, Reg.RAX)
+    assert(em5.bytes[0] == 0x48)  // REX.W
+    print("REX ✓")
+
+    // mov reg,reg encoding
+    let mut em6 = X86Emitter.new()
+    em6.encode_mov_reg_reg(Reg.RAX, Reg.RBX)
+    assert(em6.bytes.len() == 3)  // REX + opcode + modrm
+    print("Mov encoding ✓")
+
+    // No self-move
+    let mut em7 = X86Emitter.new()
+    em7.emit_mov_reg_reg(Reg.RAX, Reg.RAX)
+    assert(em7.inst_count() == 0)
+    print("Self-move elide ✓")
+
+    // fmt_op
+    assert(fmt_op(&Operand.Register(Reg.RAX)) == "rax")
+    assert(fmt_op(&Operand.Immediate(42)) == "42")
+    assert(fmt_op(&Operand.Memory(Reg.RBP, -8)).contains("rbp"))
+    print("fmt_op ✓")
+
+    print("x86 emitter complete ✓")
+}
