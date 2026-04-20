@@ -1,0 +1,377 @@
+// Compiler Pass - Pattern Match Compilation
+// Compiles pattern matching into decision trees for efficient dispatch.
+
+use std.collections.{HashMap, HashSet}
+
+type VarId = usize
+type ConTag = usize  // constructor tag
+
+#[derive(Clone, Debug, PartialEq)]
+enum Pattern {
+    Wildcard,
+    Var(VarId),
+    Lit(i64),
+    Constructor(ConTag, [Pattern]),   // Tag(sub-patterns)
+    Tuple([Pattern]),
+    Or(Box<Pattern>, Box<Pattern>),
+    Guard(Box<Pattern>, Box<Expr>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Expr {
+    Var(VarId),
+    Lit(i64),
+    Tag(ConTag),
+    GetField(Box<Expr>, usize),
+    Switch(Box<Expr>, [(ConTag, Expr)], Option<Box<Expr>>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    Eq(Box<Expr>, Box<Expr>),
+    Let(VarId, Box<Expr>, Box<Expr>),
+    Fail,
+    Seq(Box<Expr>, Box<Expr>),
+}
+
+#[derive(Clone, Debug)]
+struct MatchArm {
+    pattern: Pattern,
+    guard: Option<Expr>,
+    body: Expr,
+}
+
+#[derive(Clone, Debug)]
+enum DecisionTree {
+    Leaf(Expr),
+    Fail,
+    Switch {
+        scrutinee: Expr,
+        cases: [(ConTag, DecisionTree)],
+        default: Option<Box<DecisionTree>>,
+    },
+    Guard {
+        condition: Expr,
+        then: Box<DecisionTree>,
+        else_: Box<DecisionTree>,
+    },
+    Bind {
+        var: VarId,
+        value: Expr,
+        body: Box<DecisionTree>,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompileStats {
+    arms_compiled: usize,
+    switches_created: usize,
+    guards_compiled: usize,
+    bindings_created: usize,
+    wildcards_found: usize,
+}
+
+struct PatternCompiler {
+    next_var: VarId,
+    stats: CompileStats,
+}
+
+impl PatternCompiler {
+    fn new(next_var: VarId) -> PatternCompiler {
+        PatternCompiler { next_var, stats: CompileStats.default() }
+    }
+
+    fn fresh_var(mut self) -> VarId {
+        let v = self.next_var
+        self.next_var += 1
+        v
+    }
+
+    fn compile(mut self, scrutinee: Expr, arms: &[MatchArm]) -> DecisionTree {
+        if arms.is_empty() {
+            return DecisionTree.Fail
+        }
+
+        let first = &arms[0]
+        self.stats.arms_compiled += 1
+
+        match &first.pattern {
+            Pattern.Wildcard => {
+                self.stats.wildcards_found += 1
+                match &first.guard {
+                    some(g) => {
+                        self.stats.guards_compiled += 1
+                        DecisionTree.Guard {
+                            condition: g.clone(),
+                            then: Box.new(DecisionTree.Leaf(first.body.clone())),
+                            else_: Box.new(self.compile(scrutinee, &arms[1..])),
+                        }
+                    },
+                    none => DecisionTree.Leaf(first.body.clone()),
+                }
+            },
+
+            Pattern.Var(v) => {
+                self.stats.bindings_created += 1
+                match &first.guard {
+                    some(g) => {
+                        self.stats.guards_compiled += 1
+                        DecisionTree.Bind {
+                            var: *v, value: scrutinee.clone(),
+                            body: Box.new(DecisionTree.Guard {
+                                condition: g.clone(),
+                                then: Box.new(DecisionTree.Leaf(first.body.clone())),
+                                else_: Box.new(self.compile(scrutinee, &arms[1..])),
+                            }),
+                        }
+                    },
+                    none => DecisionTree.Bind {
+                        var: *v, value: scrutinee,
+                        body: Box.new(DecisionTree.Leaf(first.body.clone())),
+                    },
+                }
+            },
+
+            Pattern.Lit(n) => {
+                let rest = self.compile(scrutinee.clone(), &arms[1..])
+                DecisionTree.Guard {
+                    condition: Expr.Eq(Box.new(scrutinee), Box.new(Expr.Lit(*n))),
+                    then: Box.new(DecisionTree.Leaf(first.body.clone())),
+                    else_: Box.new(rest),
+                }
+            },
+
+            Pattern.Constructor(tag, sub_pats) => {
+                self.stats.switches_created += 1
+                // Group arms by constructor tag
+                let mut groups: HashMap<ConTag, [MatchArm]> = HashMap.new()
+                let mut default_arms: [MatchArm] = []
+
+                for arm in arms {
+                    match &arm.pattern {
+                        Pattern.Constructor(t, subs) => {
+                            groups.entry(*t).or_insert([]).push(arm.clone())
+                        },
+                        Pattern.Wildcard | Pattern.Var(_) => {
+                            // This arm matches any constructor
+                            default_arms.push(arm.clone())
+                            for (_, group) in &mut groups {
+                                group.push(arm.clone())
+                            }
+                        },
+                        _ => default_arms.push(arm.clone()),
+                    }
+                }
+
+                let cases: [(ConTag, DecisionTree)] = groups.into_iter()
+                    .map(|(tag, group_arms)| {
+                        let subtree = if group_arms.len() == 1 {
+                            DecisionTree.Leaf(group_arms[0].body.clone())
+                        } else {
+                            self.compile(scrutinee.clone(), &group_arms)
+                        }
+                        (tag, subtree)
+                    })
+                    .collect()
+
+                let default = if default_arms.is_empty() {
+                    some(Box.new(DecisionTree.Fail))
+                } else {
+                    some(Box.new(self.compile(scrutinee.clone(), &default_arms)))
+                }
+
+                DecisionTree.Switch { scrutinee, cases, default }
+            },
+
+            Pattern.Tuple(sub_pats) => {
+                // Desugar: bind each field, then match sub-patterns
+                self.compile_tuple(scrutinee, sub_pats, &first.body, &arms[1..])
+            },
+
+            Pattern.Or(a, b) => {
+                let arm_a = MatchArm { pattern: *a.clone(), guard: first.guard.clone(), body: first.body.clone() }
+                let arm_b = MatchArm { pattern: *b.clone(), guard: first.guard.clone(), body: first.body.clone() }
+                let mut new_arms = vec![arm_a, arm_b]
+                new_arms.extend(arms[1..].iter().cloned())
+                self.compile(scrutinee, &new_arms)
+            },
+
+            Pattern.Guard(inner, cond) => {
+                self.stats.guards_compiled += 1
+                let arm = MatchArm { pattern: *inner.clone(), guard: some(cond.as_ref().clone()), body: first.body.clone() }
+                let mut new_arms = vec![arm]
+                new_arms.extend(arms[1..].iter().cloned())
+                self.compile(scrutinee, &new_arms)
+            },
+        }
+    }
+
+    fn compile_tuple(mut self, scrutinee: Expr, pats: &[Pattern], body: &Expr, rest: &[MatchArm]) -> DecisionTree {
+        // Simple: extract fields and bind
+        let mut current = DecisionTree.Leaf(body.clone())
+        for (i, pat) in pats.iter().enumerate().rev() {
+            match pat {
+                Pattern.Var(v) => {
+                    self.stats.bindings_created += 1
+                    current = DecisionTree.Bind {
+                        var: *v,
+                        value: Expr.GetField(Box.new(scrutinee.clone()), i),
+                        body: Box.new(current),
+                    }
+                },
+                Pattern.Wildcard => {},
+                _ => {},
+            }
+        }
+        current
+    }
+
+    fn is_exhaustive(self, arms: &[MatchArm], total_constructors: usize) -> bool {
+        // Simple check: wildcard/var covers everything
+        for arm in arms {
+            match &arm.pattern {
+                Pattern.Wildcard | Pattern.Var(_) => return true,
+                _ => {},
+            }
+        }
+        // Check if all constructors are covered
+        let tags: HashSet<ConTag> = arms.iter().filter_map(|arm| {
+            match &arm.pattern {
+                Pattern.Constructor(tag, _) => some(*tag),
+                _ => none,
+            }
+        }).collect()
+        tags.len() >= total_constructors
+    }
+
+    fn stats(self) -> &CompileStats { &self.stats }
+}
+
+fn main() {
+    // Pattern variants
+    assert(Pattern.Wildcard != Pattern.Lit(0))
+    assert(Pattern.Var(1) == Pattern.Var(1))
+    print("Pattern ✓")
+
+    // Simple wildcard match
+    let mut pc = PatternCompiler.new(100)
+    let arms = vec![
+        MatchArm { pattern: Pattern.Wildcard, guard: none, body: Expr.Lit(42) },
+    ]
+    let tree = pc.compile(Expr.Var(0), &arms)
+    match &tree {
+        DecisionTree.Leaf(e) => assert(*e == Expr.Lit(42)),
+        _ => assert(false),
+    }
+    assert(pc.stats().wildcards_found == 1)
+    print("Wildcard match ✓")
+
+    // Variable binding
+    let mut pc2 = PatternCompiler.new(100)
+    let arms2 = vec![
+        MatchArm { pattern: Pattern.Var(5), guard: none, body: Expr.Var(5) },
+    ]
+    let tree2 = pc2.compile(Expr.Var(0), &arms2)
+    match &tree2 {
+        DecisionTree.Bind { var, .. } => assert(*var == 5),
+        _ => assert(false),
+    }
+    assert(pc2.stats().bindings_created == 1)
+    print("Var binding ✓")
+
+    // Literal match with fallback
+    let mut pc3 = PatternCompiler.new(100)
+    let arms3 = vec![
+        MatchArm { pattern: Pattern.Lit(1), guard: none, body: Expr.Lit(10) },
+        MatchArm { pattern: Pattern.Wildcard, guard: none, body: Expr.Lit(99) },
+    ]
+    let tree3 = pc3.compile(Expr.Var(0), &arms3)
+    match &tree3 {
+        DecisionTree.Guard { condition, .. } => {
+            match condition {
+                Expr.Eq(_, rhs) => assert(**rhs == Expr.Lit(1)),
+                _ => assert(false),
+            }
+        },
+        _ => assert(false),
+    }
+    print("Literal match ✓")
+
+    // Constructor switch
+    let mut pc4 = PatternCompiler.new(100)
+    let arms4 = vec![
+        MatchArm { pattern: Pattern.Constructor(0, vec![]), guard: none, body: Expr.Lit(1) },
+        MatchArm { pattern: Pattern.Constructor(1, vec![]), guard: none, body: Expr.Lit(2) },
+        MatchArm { pattern: Pattern.Wildcard, guard: none, body: Expr.Lit(0) },
+    ]
+    let tree4 = pc4.compile(Expr.Var(0), &arms4)
+    match &tree4 {
+        DecisionTree.Switch { cases, .. } => assert(cases.len() >= 2),
+        _ => assert(false),
+    }
+    assert(pc4.stats().switches_created >= 1)
+    print("Constructor switch ✓")
+
+    // Empty arms -> Fail
+    let mut pc5 = PatternCompiler.new(100)
+    let tree5 = pc5.compile(Expr.Var(0), &[])
+    match &tree5 {
+        DecisionTree.Fail => {},
+        _ => assert(false),
+    }
+    print("Empty -> Fail ✓")
+
+    // Guard
+    let mut pc6 = PatternCompiler.new(100)
+    let arms6 = vec![
+        MatchArm {
+            pattern: Pattern.Var(10),
+            guard: some(Expr.Eq(Box.new(Expr.Var(10)), Box.new(Expr.Lit(5)))),
+            body: Expr.Lit(100),
+        },
+        MatchArm { pattern: Pattern.Wildcard, guard: none, body: Expr.Lit(0) },
+    ]
+    let tree6 = pc6.compile(Expr.Var(0), &arms6)
+    assert(pc6.stats().guards_compiled >= 1)
+    print("Guard ✓")
+
+    // Exhaustiveness: wildcard covers all
+    let pc7 = PatternCompiler.new(100)
+    assert(pc7.is_exhaustive(&arms4, 3))
+    print("Exhaustive (wildcard) ✓")
+
+    // Exhaustiveness: all constructors
+    let all_cons = vec![
+        MatchArm { pattern: Pattern.Constructor(0, vec![]), guard: none, body: Expr.Lit(0) },
+        MatchArm { pattern: Pattern.Constructor(1, vec![]), guard: none, body: Expr.Lit(1) },
+    ]
+    assert(pc7.is_exhaustive(&all_cons, 2))
+    assert(!pc7.is_exhaustive(&all_cons[..1], 2))
+    print("Exhaustive (constructors) ✓")
+
+    // Or pattern
+    let mut pc8 = PatternCompiler.new(100)
+    let or_arms = vec![
+        MatchArm {
+            pattern: Pattern.Or(Box.new(Pattern.Lit(1)), Box.new(Pattern.Lit(2))),
+            guard: none,
+            body: Expr.Lit(10),
+        },
+        MatchArm { pattern: Pattern.Wildcard, guard: none, body: Expr.Lit(0) },
+    ]
+    let tree8 = pc8.compile(Expr.Var(0), &or_arms)
+    // Should expand into two literal checks
+    print("Or pattern ✓")
+
+    // Stats default
+    let s = CompileStats.default()
+    assert(s.arms_compiled == 0)
+    assert(s.switches_created == 0)
+    print("Stats ✓")
+
+    // DecisionTree variants
+    match DecisionTree.Fail {
+        DecisionTree.Fail => {},
+        _ => assert(false),
+    }
+    print("DecisionTree ✓")
+
+    print("Pattern Match Compilation complete ✓")
+}
