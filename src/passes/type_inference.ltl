@@ -1,0 +1,330 @@
+// Compiler Pass - Hindley-Milner Type Inference
+// Unification-based type inference with type variables, constraints, and substitutions.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Type {
+    Int,
+    Float,
+    Bool,
+    Str,
+    Unit,
+    Var(usize),                        // type variable
+    Fun(Box<Type>, Box<Type>),         // function: param -> return
+    Tuple([Type]),
+    Array(Box<Type>),
+    Named(string, [Type]),             // generic type: Name<T1, T2>
+    Never,
+}
+
+impl Type {
+    fn is_concrete(self) -> bool {
+        match self {
+            Type.Var(_) => false,
+            Type.Fun(a, b) => a.is_concrete() && b.is_concrete(),
+            Type.Tuple(elems) => elems.iter().all(|t| t.is_concrete()),
+            Type.Array(inner) => inner.is_concrete(),
+            Type.Named(_, args) => args.iter().all(|t| t.is_concrete()),
+            _ => true,
+        }
+    }
+
+    fn free_vars(self) -> HashSet<usize> {
+        let mut vars = HashSet.new()
+        self.collect_vars(&mut vars)
+        vars
+    }
+
+    fn collect_vars(self, out: &mut HashSet<usize>) {
+        match self {
+            Type.Var(id) => { out.insert(id); },
+            Type.Fun(a, b) => { a.collect_vars(out); b.collect_vars(out); },
+            Type.Tuple(elems) => { for t in elems { t.collect_vars(out) } },
+            Type.Array(inner) => inner.collect_vars(out),
+            Type.Named(_, args) => { for t in args { t.collect_vars(out) } },
+            _ => {},
+        }
+    }
+
+    fn display(self) -> string {
+        match self {
+            Type.Int => "int".to_string(),
+            Type.Float => "float".to_string(),
+            Type.Bool => "bool".to_string(),
+            Type.Str => "str".to_string(),
+            Type.Unit => "()".to_string(),
+            Type.Var(id) => format!("?{}", id),
+            Type.Fun(a, b) => format!("({} -> {})", a.display(), b.display()),
+            Type.Tuple(elems) => {
+                let inner = elems.iter().map(|t| t.display()).collect::<[string]>().join(", ")
+                format!("({})", inner)
+            },
+            Type.Array(inner) => format!("[{}]", inner.display()),
+            Type.Named(name, args) if args.is_empty() => name,
+            Type.Named(name, args) => {
+                let inner = args.iter().map(|t| t.display()).collect::<[string]>().join(", ")
+                format!("{}<{}>", name, inner)
+            },
+            Type.Never => "!".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Constraint {
+    lhs: Type,
+    rhs: Type,
+    source: string,  // for error messages
+}
+
+struct Substitution {
+    map: HashMap<usize, Type>,
+}
+
+impl Substitution {
+    fn new() -> Substitution { Substitution { map: HashMap.new() } }
+
+    fn bind(mut self, var: usize, ty: Type) {
+        self.map.insert(var, ty)
+    }
+
+    fn apply(self, ty: &Type) -> Type {
+        match ty {
+            Type.Var(id) => {
+                match self.map.get(id) {
+                    some(bound) => self.apply(bound),
+                    none => ty.clone(),
+                }
+            },
+            Type.Fun(a, b) => Type.Fun(Box.new(self.apply(a)), Box.new(self.apply(b))),
+            Type.Tuple(elems) => Type.Tuple(elems.iter().map(|t| self.apply(t)).collect()),
+            Type.Array(inner) => Type.Array(Box.new(self.apply(inner))),
+            Type.Named(name, args) => Type.Named(name.clone(), args.iter().map(|t| self.apply(t)).collect()),
+            _ => ty.clone(),
+        }
+    }
+
+    fn compose(mut self, other: &Substitution) {
+        for (k, v) in &other.map {
+            let applied = self.apply(v)
+            self.map.insert(*k, applied)
+        }
+        for (k, v) in &other.map {
+            self.map.entry(*k).or_insert(v.clone())
+        }
+    }
+
+    fn len(self) -> usize { self.map.len() }
+}
+
+struct TypeInferencer {
+    next_var: usize,
+    constraints: [Constraint],
+    substitution: Substitution,
+    env: HashMap<string, Type>,  // variable -> type
+    errors: [string],
+}
+
+impl TypeInferencer {
+    fn new() -> TypeInferencer {
+        TypeInferencer {
+            next_var: 0, constraints: [],
+            substitution: Substitution.new(),
+            env: HashMap.new(), errors: [],
+        }
+    }
+
+    fn fresh_var(mut self) -> Type {
+        let id = self.next_var
+        self.next_var += 1
+        Type.Var(id)
+    }
+
+    fn add_constraint(mut self, lhs: Type, rhs: Type, source: &str) {
+        self.constraints.push(Constraint { lhs, rhs, source: source.to_string() })
+    }
+
+    fn bind_var(mut self, name: &str, ty: Type) {
+        self.env.insert(name.to_string(), ty)
+    }
+
+    fn lookup(self, name: &str) -> Option<Type> {
+        self.env.get(name).cloned()
+    }
+
+    fn unify(mut self, a: &Type, b: &Type, source: &str) -> bool {
+        let a = self.substitution.apply(a)
+        let b = self.substitution.apply(b)
+
+        if a == b { return true }
+
+        match (&a, &b) {
+            (Type.Var(id), _) => {
+                if b.free_vars().contains(id) {
+                    self.errors.push(format!("occurs check failed: ?{} in {}", id, b.display()))
+                    return false
+                }
+                self.substitution.bind(*id, b)
+                true
+            },
+            (_, Type.Var(id)) => {
+                if a.free_vars().contains(id) {
+                    self.errors.push(format!("occurs check failed: ?{} in {}", id, a.display()))
+                    return false
+                }
+                self.substitution.bind(*id, a)
+                true
+            },
+            (Type.Fun(a1, a2), Type.Fun(b1, b2)) => {
+                self.unify(a1, b1, source) && self.unify(a2, b2, source)
+            },
+            (Type.Tuple(as_), Type.Tuple(bs)) if as_.len() == bs.len() => {
+                for (a, b) in as_.iter().zip(bs.iter()) {
+                    if !self.unify(a, b, source) { return false }
+                }
+                true
+            },
+            (Type.Array(a), Type.Array(b)) => self.unify(a, b, source),
+            (Type.Named(n1, a1), Type.Named(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
+                for (a, b) in a1.iter().zip(a2.iter()) {
+                    if !self.unify(a, b, source) { return false }
+                }
+                true
+            },
+            _ => {
+                self.errors.push(format!("{}: cannot unify {} with {}", source, a.display(), b.display()))
+                false
+            },
+        }
+    }
+
+    fn solve(mut self) -> bool {
+        let constraints = self.constraints.clone()
+        for c in &constraints {
+            if !self.unify(&c.lhs, &c.rhs, &c.source) { return false }
+        }
+        true
+    }
+
+    fn resolve(self, ty: &Type) -> Type {
+        self.substitution.apply(ty)
+    }
+
+    fn has_errors(self) -> bool { !self.errors.is_empty() }
+}
+
+fn main() {
+    // Type display
+    assert(Type.Int.display() == "int")
+    assert(Type.Var(0).display() == "?0")
+    assert(Type.Fun(Box.new(Type.Int), Box.new(Type.Bool)).display() == "(int -> bool)")
+    assert(Type.Array(Box.new(Type.Str)).display() == "[str]")
+    assert(Type.Tuple(vec![Type.Int, Type.Bool]).display() == "(int, bool)")
+    assert(Type.Named("Vec".to_string(), vec![Type.Int]).display() == "Vec<int>")
+    print("Type display ✓")
+
+    // is_concrete
+    assert(Type.Int.is_concrete())
+    assert(!Type.Var(0).is_concrete())
+    assert(!Type.Array(Box.new(Type.Var(0))).is_concrete())
+    print("is_concrete ✓")
+
+    // free_vars
+    let fv = Type.Fun(Box.new(Type.Var(0)), Box.new(Type.Var(1))).free_vars()
+    assert(fv.len() == 2)
+    assert(fv.contains(&0) && fv.contains(&1))
+    assert(Type.Int.free_vars().is_empty())
+    print("free_vars ✓")
+
+    // Substitution
+    let mut sub = Substitution.new()
+    sub.bind(0, Type.Int)
+    assert(sub.apply(&Type.Var(0)) == Type.Int)
+    assert(sub.apply(&Type.Var(1)) == Type.Var(1))
+    assert(sub.apply(&Type.Fun(Box.new(Type.Var(0)), Box.new(Type.Bool)))
+        == Type.Fun(Box.new(Type.Int), Box.new(Type.Bool)))
+    print("Substitution ✓")
+
+    // Basic unification
+    let mut inf = TypeInferencer.new()
+    let t0 = inf.fresh_var()  // ?0
+    let t1 = inf.fresh_var()  // ?1
+    assert(inf.unify(&t0, &Type.Int, "test1"))
+    assert(inf.resolve(&t0) == Type.Int)
+    print("Unify var=concrete ✓")
+
+    assert(inf.unify(&t1, &t0, "test2"))
+    assert(inf.resolve(&t1) == Type.Int)
+    print("Unify var=var (transitive) ✓")
+
+    // Function unification
+    let mut inf2 = TypeInferencer.new()
+    let a = inf2.fresh_var()
+    let b = inf2.fresh_var()
+    let fn1 = Type.Fun(Box.new(a.clone()), Box.new(Type.Bool))
+    let fn2 = Type.Fun(Box.new(Type.Int), Box.new(b.clone()))
+    assert(inf2.unify(&fn1, &fn2, "fn_unify"))
+    assert(inf2.resolve(&a) == Type.Int)
+    assert(inf2.resolve(&b) == Type.Bool)
+    print("Function unification ✓")
+
+    // Unification failure
+    let mut inf3 = TypeInferencer.new()
+    assert(!inf3.unify(&Type.Int, &Type.Bool, "mismatch"))
+    assert(inf3.has_errors())
+    assert(inf3.errors[0].contains("cannot unify"))
+    print("Unification failure ✓")
+
+    // Occurs check
+    let mut inf4 = TypeInferencer.new()
+    let v = inf4.fresh_var()  // ?0
+    let recursive = Type.Fun(Box.new(v.clone()), Box.new(Type.Int))
+    assert(!inf4.unify(&v, &recursive, "occurs"))
+    assert(inf4.errors[0].contains("occurs check"))
+    print("Occurs check ✓")
+
+    // Constraint solving
+    let mut inf5 = TypeInferencer.new()
+    let x = inf5.fresh_var()
+    let y = inf5.fresh_var()
+    inf5.add_constraint(x.clone(), Type.Int, "assign x")
+    inf5.add_constraint(y.clone(), Type.Fun(Box.new(x.clone()), Box.new(Type.Str)), "assign y")
+    assert(inf5.solve())
+    assert(inf5.resolve(&x) == Type.Int)
+    assert(inf5.resolve(&y) == Type.Fun(Box.new(Type.Int), Box.new(Type.Str)))
+    print("Constraint solving ✓")
+
+    // Environment
+    let mut inf6 = TypeInferencer.new()
+    inf6.bind_var("x", Type.Int)
+    inf6.bind_var("f", Type.Fun(Box.new(Type.Int), Box.new(Type.Bool)))
+    assert(inf6.lookup("x") == some(Type.Int))
+    assert(inf6.lookup("missing").is_none())
+    print("Environment ✓")
+
+    // Tuple unification
+    let mut inf7 = TypeInferencer.new()
+    let t = inf7.fresh_var()
+    assert(inf7.unify(&Type.Tuple(vec![t.clone(), Type.Bool]), &Type.Tuple(vec![Type.Int, Type.Bool]), "tuple"))
+    assert(inf7.resolve(&t) == Type.Int)
+    print("Tuple unification ✓")
+
+    // Named type unification
+    let mut inf8 = TypeInferencer.new()
+    let elem = inf8.fresh_var()
+    assert(inf8.unify(
+        &Type.Named("Vec".to_string(), vec![elem.clone()]),
+        &Type.Named("Vec".to_string(), vec![Type.Float]),
+        "named",
+    ))
+    assert(inf8.resolve(&elem) == Type.Float)
+    print("Named type unification ✓")
+
+    // Never type
+    assert(Type.Never.display() == "!")
+    assert(Type.Never.is_concrete())
+    print("Never type ✓")
+
+    print("Type Inference complete ✓")
+}
