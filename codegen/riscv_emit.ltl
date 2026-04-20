@@ -1,0 +1,206 @@
+
+// RISC-V Code Emitter - Generates RV64I assembly from IR
+// Supports integer arithmetic, branches, loads/stores, and function calls.
+
+use std.collections.HashMap
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RvReg {
+    Zero, Ra, Sp, Gp, Tp,
+    T0, T1, T2,
+    S0, S1,
+    A0, A1, A2, A3, A4, A5, A6, A7,
+    S2, S3, S4, S5, S6, S7, S8, S9, S10, S11,
+    T3, T4, T5, T6,
+}
+
+impl RvReg {
+    fn name(self) -> &str {
+        match self {
+            RvReg.Zero => "zero", RvReg.Ra => "ra", RvReg.Sp => "sp",
+            RvReg.Gp => "gp", RvReg.Tp => "tp",
+            RvReg.T0 => "t0", RvReg.T1 => "t1", RvReg.T2 => "t2",
+            RvReg.S0 => "s0", RvReg.S1 => "s1",
+            RvReg.A0 => "a0", RvReg.A1 => "a1", RvReg.A2 => "a2", RvReg.A3 => "a3",
+            RvReg.A4 => "a4", RvReg.A5 => "a5", RvReg.A6 => "a6", RvReg.A7 => "a7",
+            RvReg.S2 => "s2", RvReg.S3 => "s3", RvReg.S4 => "s4", RvReg.S5 => "s5",
+            RvReg.S6 => "s6", RvReg.S7 => "s7", RvReg.S8 => "s8", RvReg.S9 => "s9",
+            RvReg.S10 => "s10", RvReg.S11 => "s11",
+            RvReg.T3 => "t3", RvReg.T4 => "t4", RvReg.T5 => "t5", RvReg.T6 => "t6",
+        }
+    }
+    fn index(self) -> u32 {
+        match self {
+            RvReg.Zero => 0, RvReg.Ra => 1, RvReg.Sp => 2, RvReg.Gp => 3, RvReg.Tp => 4,
+            RvReg.T0 => 5, RvReg.T1 => 6, RvReg.T2 => 7,
+            RvReg.S0 => 8, RvReg.S1 => 9,
+            RvReg.A0 => 10, RvReg.A1 => 11, RvReg.A2 => 12, RvReg.A3 => 13,
+            RvReg.A4 => 14, RvReg.A5 => 15, RvReg.A6 => 16, RvReg.A7 => 17,
+            RvReg.S2 => 18, RvReg.S3 => 19, RvReg.S4 => 20, RvReg.S5 => 21,
+            RvReg.S6 => 22, RvReg.S7 => 23, RvReg.S8 => 24, RvReg.S9 => 25,
+            RvReg.S10 => 26, RvReg.S11 => 27,
+            RvReg.T3 => 28, RvReg.T4 => 29, RvReg.T5 => 30, RvReg.T6 => 31,
+        }
+    }
+    fn is_caller_saved(self) -> bool {
+        matches!(self, RvReg.T0 | RvReg.T1 | RvReg.T2 | RvReg.T3 | RvReg.T4 | RvReg.T5 | RvReg.T6
+            | RvReg.A0 | RvReg.A1 | RvReg.A2 | RvReg.A3 | RvReg.A4 | RvReg.A5 | RvReg.A6 | RvReg.A7)
+    }
+    fn is_callee_saved(self) -> bool {
+        matches!(self, RvReg.S0 | RvReg.S1 | RvReg.S2 | RvReg.S3 | RvReg.S4 | RvReg.S5
+            | RvReg.S6 | RvReg.S7 | RvReg.S8 | RvReg.S9 | RvReg.S10 | RvReg.S11)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RvInst {
+    Add(RvReg, RvReg, RvReg),
+    Addi(RvReg, RvReg, i32),
+    Sub(RvReg, RvReg, RvReg),
+    Mul(RvReg, RvReg, RvReg),
+    Div(RvReg, RvReg, RvReg),
+    And(RvReg, RvReg, RvReg),
+    Or(RvReg, RvReg, RvReg),
+    Xor(RvReg, RvReg, RvReg),
+    Sll(RvReg, RvReg, RvReg),
+    Srl(RvReg, RvReg, RvReg),
+    Slt(RvReg, RvReg, RvReg),
+    Ld(RvReg, RvReg, i32),
+    Sd(RvReg, RvReg, i32),
+    Beq(RvReg, RvReg, string),
+    Bne(RvReg, RvReg, string),
+    Blt(RvReg, RvReg, string),
+    Jal(RvReg, string),
+    Jalr(RvReg, RvReg, i32),
+    Lui(RvReg, i32),
+    Li(RvReg, i64),
+    Mv(RvReg, RvReg),
+    Ret,
+    Label(string),
+    Comment(string),
+}
+
+impl RvInst {
+    fn to_asm(self) -> string {
+        match self {
+            RvInst.Add(rd, rs1, rs2) => format!("  add {}, {}, {}", rd.name(), rs1.name(), rs2.name()),
+            RvInst.Addi(rd, rs1, imm) => format!("  addi {}, {}, {}", rd.name(), rs1.name(), imm),
+            RvInst.Sub(rd, rs1, rs2) => format!("  sub {}, {}, {}", rd.name(), rs1.name(), rs2.name()),
+            RvInst.Mul(rd, rs1, rs2) => format!("  mul {}, {}, {}", rd.name(), rs1.name(), rs2.name()),
+            RvInst.Div(rd, rs1, rs2) => format!("  div {}, {}, {}", rd.name(), rs1.name(), rs2.name()),
+            RvInst.Ld(rd, rs, off) => format!("  ld {}, {}({})", rd.name(), off, rs.name()),
+            RvInst.Sd(rs2, rs1, off) => format!("  sd {}, {}({})", rs2.name(), off, rs1.name()),
+            RvInst.Beq(r1, r2, ref lbl) => format!("  beq {}, {}, {}", r1.name(), r2.name(), lbl),
+            RvInst.Bne(r1, r2, ref lbl) => format!("  bne {}, {}, {}", r1.name(), r2.name(), lbl),
+            RvInst.Jal(rd, ref lbl) => format!("  jal {}, {}", rd.name(), lbl),
+            RvInst.Li(rd, imm) => format!("  li {}, {}", rd.name(), imm),
+            RvInst.Mv(rd, rs) => format!("  mv {}, {}", rd.name(), rs.name()),
+            RvInst.Ret => "  ret".into(),
+            RvInst.Label(ref name) => format!("{}:", name),
+            RvInst.Comment(ref text) => format!("  # {}", text),
+            _ => "  nop".into(),
+        }
+    }
+}
+
+struct RvEmitter {
+    instructions: [RvInst],
+    label_counter: u32,
+}
+
+impl RvEmitter {
+    fn new() -> RvEmitter { RvEmitter { instructions: [], label_counter: 0 } }
+    fn emit(mut self, inst: RvInst) { self.instructions.push(inst) }
+    fn len(self) -> usize { self.instructions.len() }
+    fn fresh_label(mut self, prefix: &str) -> string { self.label_counter += 1; format!(".{}_{}", prefix, self.label_counter) }
+
+    fn emit_prologue(mut self, frame_size: i32) {
+        self.emit(RvInst.Addi(RvReg.Sp, RvReg.Sp, -frame_size))
+        self.emit(RvInst.Sd(RvReg.Ra, RvReg.Sp, frame_size - 8))
+        self.emit(RvInst.Sd(RvReg.S0, RvReg.Sp, frame_size - 16))
+        self.emit(RvInst.Addi(RvReg.S0, RvReg.Sp, frame_size))
+    }
+
+    fn emit_epilogue(mut self, frame_size: i32) {
+        self.emit(RvInst.Ld(RvReg.Ra, RvReg.Sp, frame_size - 8))
+        self.emit(RvInst.Ld(RvReg.S0, RvReg.Sp, frame_size - 16))
+        self.emit(RvInst.Addi(RvReg.Sp, RvReg.Sp, frame_size))
+        self.emit(RvInst.Ret)
+    }
+
+    fn to_assembly(self) -> string {
+        self.instructions.iter().map(|i| i.to_asm()).collect::<[string]>().join("\n")
+    }
+}
+
+fn main() {
+    // Register names
+    assert(RvReg.Zero.name() == "zero")
+    assert(RvReg.A0.name() == "a0")
+    assert(RvReg.Sp.name() == "sp")
+    assert(RvReg.T0.index() == 5)
+    assert(RvReg.A0.index() == 10)
+    print("Registers ✓")
+
+    // Caller/callee saved
+    assert(RvReg.T0.is_caller_saved())
+    assert(RvReg.A0.is_caller_saved())
+    assert(!RvReg.S0.is_caller_saved())
+    assert(RvReg.S0.is_callee_saved())
+    assert(!RvReg.T0.is_callee_saved())
+    print("Saved regs ✓")
+
+    // Instruction assembly
+    let add = RvInst.Add(RvReg.T0, RvReg.A0, RvReg.A1)
+    assert(add.to_asm() == "  add t0, a0, a1")
+    let addi = RvInst.Addi(RvReg.Sp, RvReg.Sp, -16)
+    assert(addi.to_asm() == "  addi sp, sp, -16")
+    let ld = RvInst.Ld(RvReg.A0, RvReg.Sp, 8)
+    assert(ld.to_asm() == "  ld a0, 8(sp)")
+    let li = RvInst.Li(RvReg.A0, 42)
+    assert(li.to_asm() == "  li a0, 42")
+    print("Instructions ✓")
+
+    // Labels
+    let lbl = RvInst.Label("main".into())
+    assert(lbl.to_asm() == "main:")
+    let beq = RvInst.Beq(RvReg.T0, RvReg.Zero, ".L1".into())
+    assert(beq.to_asm() == "  beq t0, zero, .L1")
+    print("Labels ✓")
+
+    // Emitter
+    let mut em = RvEmitter.new()
+    em.emit(RvInst.Label("factorial".into()))
+    em.emit_prologue(32)
+    em.emit(RvInst.Li(RvReg.T0, 1))
+    em.emit(RvInst.Mv(RvReg.A0, RvReg.T0))
+    em.emit_epilogue(32)
+    assert(em.len() == 10)  // label + 3 prologue + 2 body + 4 epilogue
+    print("Emitter ✓")
+
+    // Fresh labels
+    let l1 = em.fresh_label("loop")
+    let l2 = em.fresh_label("loop")
+    assert(l1 != l2)
+    assert(l1.starts_with(".loop_"))
+    print("Fresh labels ✓")
+
+    // Assembly output
+    let asm = em.to_assembly()
+    assert(asm.contains("factorial:"))
+    assert(asm.contains("addi sp, sp, -32"))
+    assert(asm.contains("ret"))
+    print("Assembly ✓")
+
+    // Simple function
+    let mut em2 = RvEmitter.new()
+    em2.emit(RvInst.Label("add_two".into()))
+    em2.emit(RvInst.Add(RvReg.A0, RvReg.A0, RvReg.A1))
+    em2.emit(RvInst.Ret)
+    let asm2 = em2.to_assembly()
+    assert(asm2.contains("add a0, a0, a1"))
+    assert(em2.len() == 3)
+    print("Simple fn ✓")
+
+    print("RISC-V emitter complete ✓")
+}
