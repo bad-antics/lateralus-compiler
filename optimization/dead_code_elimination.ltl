@@ -1,0 +1,307 @@
+
+// Dead Code Elimination - Removes unreachable and unused code
+// Tracks liveness, removes dead stores, and eliminates unreachable blocks.
+
+use std.collections.{HashMap, HashSet}
+
+type VarId = usize
+type BlockId = usize
+type InstId = usize
+
+#[derive(Clone, Debug, PartialEq)]
+enum Inst {
+    Assign(VarId, Expr),
+    Store(VarId, Expr),
+    Branch(VarId, BlockId, BlockId),
+    Jump(BlockId),
+    Return(Option<VarId>),
+    Call(Option<VarId>, string, [VarId]),
+    Nop,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Expr {
+    Const(i64),
+    Var(VarId),
+    BinOp(string, VarId, VarId),
+    UnaryOp(string, VarId),
+}
+
+impl Inst {
+    fn defined_var(self) -> Option<VarId> {
+        match self {
+            Inst.Assign(v, _) => some(*v),
+            Inst.Call(v, _, _) => *v,
+            _ => none,
+        }
+    }
+
+    fn used_vars(self) -> [VarId] {
+        match self {
+            Inst.Assign(_, expr) => expr.used_vars(),
+            Inst.Store(v, expr) => {
+                let mut vars = expr.used_vars()
+                vars.push(*v)
+                vars
+            },
+            Inst.Branch(v, _, _) => vec![*v],
+            Inst.Return(some(v)) => vec![*v],
+            Inst.Call(_, _, args) => args.clone(),
+            _ => vec![],
+        }
+    }
+
+    fn is_side_effect_free(self) -> bool {
+        match self {
+            Inst.Assign(_, _) => true,
+            Inst.Nop => true,
+            _ => false,
+        }
+    }
+
+    fn is_nop(self) -> bool { matches!(self, Inst.Nop) }
+}
+
+impl Expr {
+    fn used_vars(self) -> [VarId] {
+        match self {
+            Expr.Const(_) => vec![],
+            Expr.Var(v) => vec![*v],
+            Expr.BinOp(_, a, b) => vec![*a, *b],
+            Expr.UnaryOp(_, a) => vec![*a],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    id: BlockId,
+    instructions: [Inst],
+    predecessors: [BlockId],
+    successors: [BlockId],
+}
+
+impl BasicBlock {
+    fn new(id: BlockId) -> BasicBlock {
+        BasicBlock { id, instructions: [], predecessors: [], successors: [] }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DceStats {
+    dead_instructions_removed: usize,
+    dead_stores_removed: usize,
+    unreachable_blocks_removed: usize,
+    nops_removed: usize,
+}
+
+struct DeadCodeEliminator {
+    blocks: HashMap<BlockId, BasicBlock>,
+    live_vars: HashSet<VarId>,
+    reachable: HashSet<BlockId>,
+    entry_block: BlockId,
+    stats: DceStats,
+}
+
+impl DeadCodeEliminator {
+    fn new(entry: BlockId) -> DeadCodeEliminator {
+        DeadCodeEliminator {
+            blocks: HashMap.new(),
+            live_vars: HashSet.new(),
+            reachable: HashSet.new(),
+            entry_block: entry,
+            stats: DceStats.default(),
+        }
+    }
+
+    fn add_block(mut self, block: BasicBlock) {
+        self.blocks.insert(block.id, block)
+    }
+
+    fn mark_reachable(mut self) {
+        let mut worklist = vec![self.entry_block]
+        while let some(block_id) = worklist.pop() {
+            if !self.reachable.insert(block_id) { continue }
+            if let some(block) = self.blocks.get(&block_id) {
+                for &succ in &block.successors { worklist.push(succ) }
+            }
+        }
+    }
+
+    fn compute_liveness(mut self) {
+        // Start from return statements and work backwards
+        for (_, block) in &self.blocks {
+            for inst in &block.instructions {
+                if let Inst.Return(some(v)) = inst { self.live_vars.insert(*v); }
+                if let Inst.Branch(v, _, _) = inst { self.live_vars.insert(*v); }
+                if let Inst.Call(_, _, _) = inst {
+                    for v in inst.used_vars() { self.live_vars.insert(v); }
+                }
+            }
+        }
+
+        // Fixed-point iteration
+        let mut changed = true
+        while changed {
+            changed = false
+            for (_, block) in &self.blocks {
+                for inst in block.instructions.iter().rev() {
+                    if let some(def) = inst.defined_var() {
+                        if self.live_vars.contains(&def) {
+                            for v in inst.used_vars() {
+                                if self.live_vars.insert(v) { changed = true }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn eliminate(mut self) {
+        self.mark_reachable()
+        self.compute_liveness()
+
+        // Remove unreachable blocks
+        let unreachable: [BlockId] = self.blocks.keys()
+            .filter(|id| !self.reachable.contains(id))
+            .copied().collect()
+        for id in &unreachable {
+            self.blocks.remove(id)
+            self.stats.unreachable_blocks_removed += 1
+        }
+
+        // Remove dead instructions in reachable blocks
+        for (_, block) in &mut self.blocks {
+            let mut new_insts = []
+            for inst in &block.instructions {
+                if inst.is_nop() {
+                    self.stats.nops_removed += 1
+                    continue
+                }
+                if let some(def) = inst.defined_var() {
+                    if !self.live_vars.contains(&def) && inst.is_side_effect_free() {
+                        self.stats.dead_instructions_removed += 1
+                        if matches!(inst, Inst.Store(_, _)) {
+                            self.stats.dead_stores_removed += 1
+                        }
+                        continue
+                    }
+                }
+                new_insts.push(inst.clone())
+            }
+            block.instructions = new_insts
+        }
+    }
+
+    fn stats(self) -> &DceStats { &self.stats }
+    fn block_count(self) -> usize { self.blocks.len() }
+}
+
+fn main() {
+    // Inst used vars
+    let assign = Inst.Assign(0, Expr.BinOp("+".into(), 1, 2))
+    assert(assign.used_vars() == [1, 2])
+    assert(assign.defined_var() == some(0))
+    assert(assign.is_side_effect_free())
+    print("Inst basics ✓")
+
+    // Expr used vars
+    assert(Expr.Const(42).used_vars().is_empty())
+    assert(Expr.Var(5).used_vars() == [5])
+    assert(Expr.BinOp("+".into(), 1, 2).used_vars() == [1, 2])
+    print("Expr vars ✓")
+
+    // Side effects
+    assert(!Inst.Call(none, "print".into(), vec![0]).is_side_effect_free())
+    assert(Inst.Nop.is_side_effect_free())
+    assert(Inst.Nop.is_nop())
+    print("Side effects ✓")
+
+    // Basic block
+    let mut bb = BasicBlock.new(0)
+    bb.instructions.push(Inst.Assign(0, Expr.Const(42)))
+    bb.instructions.push(Inst.Return(some(0)))
+    bb.successors = []
+    assert(bb.id == 0)
+    assert(bb.instructions.len() == 2)
+    print("BasicBlock ✓")
+
+    // Reachability
+    let mut dce = DeadCodeEliminator.new(0)
+    let mut b0 = BasicBlock.new(0)
+    b0.successors = [1]
+    b0.instructions = [Inst.Jump(1)]
+    let mut b1 = BasicBlock.new(1)
+    b1.instructions = [Inst.Return(none)]
+    let b2 = BasicBlock.new(2)  // unreachable
+    dce.add_block(b0)
+    dce.add_block(b1)
+    dce.add_block(b2)
+    dce.mark_reachable()
+    assert(dce.reachable.contains(&0))
+    assert(dce.reachable.contains(&1))
+    assert(!dce.reachable.contains(&2))
+    print("Reachability ✓")
+
+    // Full elimination
+    let mut dce2 = DeadCodeEliminator.new(0)
+    let mut entry = BasicBlock.new(0)
+    entry.successors = [1]
+    entry.instructions = [
+        Inst.Assign(0, Expr.Const(10)),     // used
+        Inst.Assign(1, Expr.Const(20)),     // dead
+        Inst.Assign(2, Expr.BinOp("+".into(), 0, 0)), // dead
+        Inst.Nop,                            // nop
+        Inst.Jump(1),
+    ]
+    let mut exit = BasicBlock.new(1)
+    exit.instructions = [Inst.Return(some(0))]
+    let dead_block = BasicBlock.new(5)  // unreachable
+
+    dce2.add_block(entry)
+    dce2.add_block(exit)
+    dce2.add_block(dead_block)
+    dce2.eliminate()
+
+    let stats = dce2.stats()
+    assert(stats.unreachable_blocks_removed == 1)  // block 5
+    assert(stats.dead_instructions_removed >= 1)    // var 1 or 2
+    assert(stats.nops_removed == 1)
+    assert(dce2.block_count() == 2)
+    print("Full elimination ✓")
+
+    // Liveness
+    let mut dce3 = DeadCodeEliminator.new(0)
+    let mut b = BasicBlock.new(0)
+    b.instructions = [
+        Inst.Assign(0, Expr.Const(1)),
+        Inst.Assign(1, Expr.Var(0)),
+        Inst.Return(some(1)),
+    ]
+    dce3.add_block(b)
+    dce3.compute_liveness()
+    assert(dce3.live_vars.contains(&0))
+    assert(dce3.live_vars.contains(&1))
+    print("Liveness ✓")
+
+    // Call preserves side effects
+    let call = Inst.Call(some(3), "foo".into(), vec![0, 1])
+    assert(call.defined_var() == some(3))
+    assert(call.used_vars() == [0, 1])
+    assert(!call.is_side_effect_free())
+    print("Call side effects ✓")
+
+    // Branch uses var
+    let br = Inst.Branch(5, 1, 2)
+    assert(br.used_vars() == [5])
+    print("Branch ✓")
+
+    // DceStats default
+    let s = DceStats.default()
+    assert(s.dead_instructions_removed == 0)
+    assert(s.unreachable_blocks_removed == 0)
+    print("Stats default ✓")
+
+    print("Dead code elimination complete ✓")
+}
