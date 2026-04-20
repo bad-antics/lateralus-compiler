@@ -1,0 +1,236 @@
+
+// DWARF Debug Info Emitter - Generates debug information for debuggers
+// Produces compilation unit, subprogram, and variable debug entries.
+
+use std.collections.HashMap
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DwarfTag {
+    CompileUnit,    // DW_TAG_compile_unit
+    Subprogram,     // DW_TAG_subprogram
+    Variable,       // DW_TAG_variable
+    FormalParam,    // DW_TAG_formal_parameter
+    BaseType,       // DW_TAG_base_type
+    PointerType,    // DW_TAG_pointer_type
+    StructType,     // DW_TAG_structure_type
+    Member,         // DW_TAG_member
+    LexicalBlock,   // DW_TAG_lexical_block
+    Namespace,      // DW_TAG_namespace
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DwarfAttr {
+    Name, Language, LowPc, HighPc, Type, Location,
+    ByteSize, Encoding, LineNo, ColNo, DeclFile,
+    External, Artificial, Inline,
+}
+
+#[derive(Clone, Debug)]
+enum AttrValue {
+    String(string),
+    Address(u64),
+    Unsigned(u64),
+    Signed(i64),
+    Flag(bool),
+    Reference(u32),  // offset to another DIE
+}
+
+#[derive(Clone, Debug)]
+struct DebugEntry {
+    id: u32,
+    tag: DwarfTag,
+    attributes: [(DwarfAttr, AttrValue)],
+    children: [u32],
+    parent: Option<u32>,
+}
+
+impl DebugEntry {
+    fn new(id: u32, tag: DwarfTag) -> DebugEntry {
+        DebugEntry { id, tag, attributes: [], children: [], parent: None }
+    }
+    fn attr(mut self, name: DwarfAttr, value: AttrValue) -> DebugEntry {
+        self.attributes.push((name, value)); self
+    }
+    fn has_attr(self, name: DwarfAttr) -> bool { self.attributes.iter().any(|(a, _)| *a == name) }
+    fn get_attr(self, name: DwarfAttr) -> Option<&AttrValue> {
+        self.attributes.iter().find(|(a, _)| *a == name).map(|(_, v)| v)
+    }
+    fn child_count(self) -> usize { self.children.len() }
+    fn has_children(self) -> bool { !self.children.is_empty() }
+}
+
+#[derive(Clone, Debug)]
+struct LineEntry {
+    address: u64,
+    file: string,
+    line: u32,
+    column: u32,
+    is_stmt: bool,
+    prologue_end: bool,
+}
+
+impl LineEntry {
+    fn new(address: u64, file: &str, line: u32, col: u32) -> LineEntry {
+        LineEntry { address, file: file.into(), line, column: col, is_stmt: true, prologue_end: false }
+    }
+    fn with_prologue_end(mut self) -> LineEntry { self.prologue_end = true; self }
+}
+
+struct DwarfEmitter {
+    entries: HashMap<u32, DebugEntry>,
+    line_table: [LineEntry],
+    next_id: u32,
+    producer: string,
+    language: u32,
+}
+
+impl DwarfEmitter {
+    fn new(producer: &str) -> DwarfEmitter {
+        DwarfEmitter {
+            entries: HashMap.new(), line_table: [],
+            next_id: 1, producer: producer.into(), language: 0x0001,  // DW_LANG_C
+        }
+    }
+
+    fn set_language(mut self, lang: u32) { self.language = lang }
+
+    fn alloc_id(mut self) -> u32 { let id = self.next_id; self.next_id += 1; id }
+
+    fn add_entry(mut self, entry: DebugEntry) -> u32 {
+        let id = entry.id
+        self.entries.insert(id, entry)
+        id
+    }
+
+    fn add_child(mut self, parent_id: u32, child_id: u32) {
+        if let Some(parent) = self.entries.get_mut(&parent_id) {
+            parent.children.push(child_id)
+        }
+        if let Some(child) = self.entries.get_mut(&child_id) {
+            child.parent = Some(parent_id)
+        }
+    }
+
+    fn emit_compile_unit(mut self, name: &str, low_pc: u64, high_pc: u64) -> u32 {
+        let id = self.alloc_id()
+        let entry = DebugEntry.new(id, DwarfTag.CompileUnit)
+            .attr(DwarfAttr.Name, AttrValue.String(name.into()))
+            .attr(DwarfAttr.LowPc, AttrValue.Address(low_pc))
+            .attr(DwarfAttr.HighPc, AttrValue.Address(high_pc))
+            .attr(DwarfAttr.Language, AttrValue.Unsigned(self.language as u64));
+        self.add_entry(entry)
+    }
+
+    fn emit_subprogram(mut self, name: &str, low_pc: u64, high_pc: u64, return_type: u32) -> u32 {
+        let id = self.alloc_id()
+        let entry = DebugEntry.new(id, DwarfTag.Subprogram)
+            .attr(DwarfAttr.Name, AttrValue.String(name.into()))
+            .attr(DwarfAttr.LowPc, AttrValue.Address(low_pc))
+            .attr(DwarfAttr.HighPc, AttrValue.Address(high_pc))
+            .attr(DwarfAttr.Type, AttrValue.Reference(return_type));
+        self.add_entry(entry)
+    }
+
+    fn emit_base_type(mut self, name: &str, byte_size: u64, encoding: u64) -> u32 {
+        let id = self.alloc_id()
+        let entry = DebugEntry.new(id, DwarfTag.BaseType)
+            .attr(DwarfAttr.Name, AttrValue.String(name.into()))
+            .attr(DwarfAttr.ByteSize, AttrValue.Unsigned(byte_size))
+            .attr(DwarfAttr.Encoding, AttrValue.Unsigned(encoding));
+        self.add_entry(entry)
+    }
+
+    fn emit_variable(mut self, name: &str, type_id: u32, line: u32) -> u32 {
+        let id = self.alloc_id()
+        let entry = DebugEntry.new(id, DwarfTag.Variable)
+            .attr(DwarfAttr.Name, AttrValue.String(name.into()))
+            .attr(DwarfAttr.Type, AttrValue.Reference(type_id))
+            .attr(DwarfAttr.LineNo, AttrValue.Unsigned(line as u64));
+        self.add_entry(entry)
+    }
+
+    fn emit_parameter(mut self, name: &str, type_id: u32) -> u32 {
+        let id = self.alloc_id()
+        let entry = DebugEntry.new(id, DwarfTag.FormalParam)
+            .attr(DwarfAttr.Name, AttrValue.String(name.into()))
+            .attr(DwarfAttr.Type, AttrValue.Reference(type_id));
+        self.add_entry(entry)
+    }
+
+    fn add_line(mut self, entry: LineEntry) { self.line_table.push(entry) }
+
+    fn entry_count(self) -> usize { self.entries.len() }
+    fn line_count(self) -> usize { self.line_table.len() }
+    fn get_entry(self, id: u32) -> Option<&DebugEntry> { self.entries.get(&id) }
+}
+
+fn main() {
+    // DebugEntry
+    let entry = DebugEntry.new(1, DwarfTag.Subprogram)
+        .attr(DwarfAttr.Name, AttrValue.String("main".into()))
+        .attr(DwarfAttr.LowPc, AttrValue.Address(0x1000))
+    assert(entry.tag == DwarfTag.Subprogram)
+    assert(entry.has_attr(DwarfAttr.Name))
+    assert(!entry.has_attr(DwarfAttr.ByteSize))
+    assert(!entry.has_children())
+    print("DebugEntry ✓")
+
+    // LineEntry
+    let le = LineEntry.new(0x1000, "main.ltl", 10, 5).with_prologue_end()
+    assert(le.line == 10)
+    assert(le.prologue_end)
+    print("LineEntry ✓")
+
+    // DwarfEmitter
+    let mut emitter = DwarfEmitter.new("lateralus-compiler 1.0")
+    emitter.set_language(0x0042)  // custom language
+
+    // Emit compile unit
+    let cu = emitter.emit_compile_unit("main.ltl", 0x1000, 0x2000)
+    assert(emitter.get_entry(cu).unwrap().tag == DwarfTag.CompileUnit)
+    print("Compile unit ✓")
+
+    // Emit types
+    let int_type = emitter.emit_base_type("i32", 4, 5)  // DW_ATE_signed
+    let bool_type = emitter.emit_base_type("bool", 1, 2)  // DW_ATE_boolean
+    assert(emitter.entry_count() == 3)
+    print("Types ✓")
+
+    // Emit function
+    let fn_id = emitter.emit_subprogram("factorial", 0x1000, 0x1080, int_type)
+    emitter.add_child(cu, fn_id)
+    let param = emitter.emit_parameter("n", int_type)
+    emitter.add_child(fn_id, param)
+    let local = emitter.emit_variable("result", int_type, 5)
+    emitter.add_child(fn_id, local)
+    print("Function ✓")
+
+    // Check parent-child
+    let fn_entry = emitter.get_entry(fn_id).unwrap()
+    assert(fn_entry.child_count() == 2)
+    assert(fn_entry.has_children())
+    let param_entry = emitter.get_entry(param).unwrap()
+    assert(param_entry.parent == Some(fn_id))
+    print("Hierarchy ✓")
+
+    // Line table
+    emitter.add_line(LineEntry.new(0x1000, "main.ltl", 1, 1))
+    emitter.add_line(LineEntry.new(0x1010, "main.ltl", 2, 5))
+    emitter.add_line(LineEntry.new(0x1020, "main.ltl", 3, 5))
+    assert(emitter.line_count() == 3)
+    print("Line table ✓")
+
+    // Entry count
+    assert(emitter.entry_count() == 6)  // CU + 2 types + fn + param + var
+    print("Count ✓")
+
+    // Attribute access
+    let cu_entry = emitter.get_entry(cu).unwrap()
+    match cu_entry.get_attr(DwarfAttr.Name) {
+        Some(AttrValue.String(ref s)) => assert(s == "main.ltl"),
+        _ => panic("expected string attr"),
+    }
+    print("Attr access ✓")
+
+    print("DWARF emitter complete ✓")
+}
