@@ -1,0 +1,265 @@
+
+// Phi Node Insertion - SSA construction with dominance frontiers
+// Places phi functions at join points in the control flow graph.
+
+use std.collections.{HashMap, HashSet}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PhiNode {
+    variable: string,
+    dest: string,        // SSA name (e.g., x_3)
+    operands: [(string, string)],  // (value, predecessor_block)
+}
+
+impl PhiNode {
+    fn new(variable: &str, dest: &str) -> PhiNode {
+        PhiNode { variable: variable.into(), dest: dest.into(), operands: [] }
+    }
+    fn add_operand(mut self, value: &str, block: &str) {
+        self.operands.push((value.into(), block.into()))
+    }
+    fn operand_count(self) -> usize { self.operands.len() }
+    fn has_predecessor(self, block: &str) -> bool {
+        self.operands.iter().any(|(_, b)| b == block)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    name: string,
+    defs: HashSet<string>,      // variables defined
+    uses: HashSet<string>,      // variables used
+    phis: [PhiNode],
+    successors: [string],
+    predecessors: [string],
+}
+
+impl BasicBlock {
+    fn new(name: &str) -> BasicBlock {
+        BasicBlock {
+            name: name.into(), defs: HashSet.new(), uses: HashSet.new(),
+            phis: [], successors: [], predecessors: [],
+        }
+    }
+    fn add_def(mut self, var: &str) { self.defs.insert(var.into()); }
+    fn add_use(mut self, var: &str) { self.uses.insert(var.into()); }
+    fn add_successor(mut self, s: &str) { self.successors.push(s.into()) }
+    fn add_predecessor(mut self, p: &str) { self.predecessors.push(p.into()) }
+    fn add_phi(mut self, phi: PhiNode) { self.phis.push(phi) }
+    fn phi_count(self) -> usize { self.phis.len() }
+    fn has_phi_for(self, var: &str) -> bool { self.phis.iter().any(|p| p.variable == var) }
+}
+
+struct DominanceInfo {
+    idom: HashMap<string, string>,        // immediate dominator
+    dom_frontier: HashMap<string, HashSet<string>>,  // dominance frontier
+    dom_tree_children: HashMap<string, [string]>,
+}
+
+impl DominanceInfo {
+    fn new() -> DominanceInfo {
+        DominanceInfo { idom: HashMap.new(), dom_frontier: HashMap.new(), dom_tree_children: HashMap.new() }
+    }
+
+    fn set_idom(mut self, block: &str, dom: &str) {
+        self.idom.insert(block.into(), dom.into())
+        self.dom_tree_children.entry(dom.into()).or_insert([]).push(block.into())
+    }
+
+    fn get_idom(self, block: &str) -> Option<&str> { self.idom.get(block).map(|s| s.as_str()) }
+
+    fn add_to_frontier(mut self, block: &str, frontier_block: &str) {
+        self.dom_frontier.entry(block.into()).or_insert(HashSet.new()).insert(frontier_block.into());
+    }
+
+    fn get_frontier(self, block: &str) -> HashSet<string> {
+        self.dom_frontier.get(block).cloned().unwrap_or(HashSet.new())
+    }
+
+    fn dominates(self, a: &str, b: &str) -> bool {
+        if a == b { return true }
+        let mut current = b
+        while let Some(dom) = self.get_idom(current) {
+            if dom == a { return true }
+            if dom == current { break }
+            current = dom
+        }
+        false
+    }
+}
+
+struct PhiInserter {
+    blocks: HashMap<string, BasicBlock>,
+    dom_info: DominanceInfo,
+    ssa_counter: HashMap<string, u32>,
+}
+
+impl PhiInserter {
+    fn new(dom_info: DominanceInfo) -> PhiInserter {
+        PhiInserter { blocks: HashMap.new(), dom_info, ssa_counter: HashMap.new() }
+    }
+
+    fn add_block(mut self, block: BasicBlock) { self.blocks.insert(block.name.clone(), block); }
+
+    fn next_ssa_name(mut self, var: &str) -> string {
+        let counter = self.ssa_counter.entry(var.into()).or_insert(0)
+        *counter += 1
+        format!("{}_{}", var, counter)
+    }
+
+    fn insert_phis(mut self) {
+        // Collect all defined variables and their defining blocks
+        let mut def_blocks: HashMap<string, [string]> = HashMap.new()
+        for (name, block) in &self.blocks {
+            for var in &block.defs {
+                def_blocks.entry(var.clone()).or_insert([]).push(name.clone())
+            }
+        }
+
+        // For each variable, place phis at dominance frontiers
+        for (var, defs) in &def_blocks {
+            let mut worklist: [string] = defs.clone()
+            let mut visited: HashSet<string> = HashSet.new()
+
+            while !worklist.is_empty() {
+                let block_name = worklist.pop().unwrap()
+                let frontier = self.dom_info.get_frontier(&block_name)
+                for f in &frontier {
+                    if !visited.contains(f) {
+                        visited.insert(f.clone())
+                        // Add phi node
+                        let ssa_name = self.next_ssa_name(var)
+                        let mut phi = PhiNode.new(var, &ssa_name)
+                        // Add operands from predecessors
+                        if let Some(fb) = self.blocks.get(f) {
+                            for pred in &fb.predecessors {
+                                phi.add_operand(&format!("{}?", var), pred)
+                            }
+                        }
+                        if let Some(fb) = self.blocks.get_mut(f) {
+                            if !fb.has_phi_for(var) {
+                                fb.add_phi(phi)
+                                worklist.push(f.clone())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn total_phis(self) -> usize {
+        self.blocks.values().map(|b| b.phi_count()).sum()
+    }
+}
+
+fn main() {
+    // PhiNode
+    let mut phi = PhiNode.new("x", "x_3")
+    phi.add_operand("x_1", "bb1")
+    phi.add_operand("x_2", "bb2")
+    assert(phi.variable == "x")
+    assert(phi.dest == "x_3")
+    assert(phi.operand_count() == 2)
+    assert(phi.has_predecessor("bb1"))
+    assert(!phi.has_predecessor("bb3"))
+    print("PhiNode ✓")
+
+    // BasicBlock
+    let mut bb = BasicBlock.new("entry")
+    bb.add_def("x")
+    bb.add_def("y")
+    bb.add_use("z")
+    bb.add_successor("bb1")
+    bb.add_predecessor("bb0")
+    assert(bb.defs.contains("x"))
+    assert(bb.uses.contains("z"))
+    assert(bb.phi_count() == 0)
+    print("BasicBlock ✓")
+
+    // DominanceInfo
+    let mut dom = DominanceInfo.new()
+    dom.set_idom("bb1", "entry")
+    dom.set_idom("bb2", "entry")
+    dom.set_idom("bb3", "bb1")
+    assert(dom.get_idom("bb1") == Some("entry"))
+    assert(dom.dominates("entry", "bb3"))
+    assert(dom.dominates("bb1", "bb3"))
+    assert(!dom.dominates("bb2", "bb3"))
+    assert(dom.dominates("entry", "entry"))
+    print("Dominance ✓")
+
+    // Dominance frontier
+    dom.add_to_frontier("bb1", "bb3")
+    dom.add_to_frontier("bb2", "bb3")
+    let f1 = dom.get_frontier("bb1")
+    assert(f1.contains("bb3"))
+    let empty = dom.get_frontier("entry")
+    assert(empty.is_empty())
+    print("Frontier ✓")
+
+    // Phi insertion - diamond CFG: entry -> bb1, bb2 -> bb3
+    let mut dom2 = DominanceInfo.new()
+    dom2.set_idom("bb1", "entry")
+    dom2.set_idom("bb2", "entry")
+    dom2.set_idom("bb3", "entry")
+    dom2.add_to_frontier("bb1", "bb3")
+    dom2.add_to_frontier("bb2", "bb3")
+
+    let mut inserter = PhiInserter.new(dom2)
+
+    let mut entry = BasicBlock.new("entry")
+    entry.add_def("x")
+    entry.add_successor("bb1")
+    entry.add_successor("bb2")
+
+    let mut bb1 = BasicBlock.new("bb1")
+    bb1.add_def("x")
+    bb1.add_predecessor("entry")
+    bb1.add_successor("bb3")
+
+    let mut bb2 = BasicBlock.new("bb2")
+    bb2.add_def("x")
+    bb2.add_predecessor("entry")
+    bb2.add_successor("bb3")
+
+    let mut bb3 = BasicBlock.new("bb3")
+    bb3.add_use("x")
+    bb3.add_predecessor("bb1")
+    bb3.add_predecessor("bb2")
+
+    inserter.add_block(entry)
+    inserter.add_block(bb1)
+    inserter.add_block(bb2)
+    inserter.add_block(bb3)
+
+    inserter.insert_phis()
+
+    // bb3 should have a phi for x
+    let bb3_result = inserter.blocks.get("bb3").unwrap()
+    assert(bb3_result.has_phi_for("x"))
+    assert(bb3_result.phi_count() == 1)
+    let phi_x = &bb3_result.phis[0]
+    assert(phi_x.operand_count() == 2)
+    assert(phi_x.has_predecessor("bb1"))
+    assert(phi_x.has_predecessor("bb2"))
+    print("Phi insertion ✓")
+
+    // No phi needed in bb1 or bb2
+    assert(inserter.blocks.get("bb1").unwrap().phi_count() == 0)
+    assert(inserter.blocks.get("bb2").unwrap().phi_count() == 0)
+    print("No spurious phis ✓")
+
+    // Total phis
+    assert(inserter.total_phis() == 1)
+    print("Total ✓")
+
+    // SSA naming
+    let mut inserter2 = PhiInserter.new(DominanceInfo.new())
+    assert(inserter2.next_ssa_name("x") == "x_1")
+    assert(inserter2.next_ssa_name("x") == "x_2")
+    assert(inserter2.next_ssa_name("y") == "y_1")
+    print("SSA naming ✓")
+
+    print("Phi insertion complete ✓")
+}
