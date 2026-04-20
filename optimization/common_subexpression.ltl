@@ -1,0 +1,241 @@
+
+// Common Subexpression Elimination (CSE) - Identifies and removes redundant computations
+// Uses value numbering to detect equivalent expressions in basic blocks.
+
+use std.collections.HashMap
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum IrOp { Add, Sub, Mul, Div, Mod, And, Or, Xor, Shl, Shr, Neg, Not, Load, Const }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ExprKey {
+    op: IrOp,
+    left: u32,   // value number
+    right: u32,  // value number (0 for unary)
+}
+
+impl ExprKey {
+    fn binary(op: IrOp, left: u32, right: u32) -> ExprKey { ExprKey { op, left, right } }
+    fn unary(op: IrOp, operand: u32) -> ExprKey { ExprKey { op, left: operand, right: 0 } }
+    fn is_commutative(self) -> bool { matches!(self.op, IrOp.Add | IrOp.Mul | IrOp.And | IrOp.Or | IrOp.Xor) }
+    fn canonical(self) -> ExprKey {
+        if self.is_commutative() && self.left > self.right {
+            ExprKey { op: self.op, left: self.right, right: self.left }
+        } else { self }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Instruction {
+    id: u32,
+    op: IrOp,
+    operands: [u32],  // instruction IDs
+    result: string,
+    const_val: Option<i64>,
+    eliminated: bool,
+    replaced_by: Option<u32>,
+}
+
+impl Instruction {
+    fn binary(id: u32, op: IrOp, left: u32, right: u32, result: &str) -> Instruction {
+        Instruction { id, op, operands: [left, right], result: result.into(), const_val: None, eliminated: false, replaced_by: None }
+    }
+    fn unary(id: u32, op: IrOp, operand: u32, result: &str) -> Instruction {
+        Instruction { id, op, operands: [operand], result: result.into(), const_val: None, eliminated: false, replaced_by: None }
+    }
+    fn constant(id: u32, value: i64, result: &str) -> Instruction {
+        Instruction { id, op: IrOp.Const, operands: [], result: result.into(), const_val: Some(value), eliminated: false, replaced_by: None }
+    }
+    fn is_binary(self) -> bool { self.operands.len() == 2 }
+    fn is_eliminated(self) -> bool { self.eliminated }
+    fn eliminate(mut self, replacement: u32) { self.eliminated = true; self.replaced_by = Some(replacement) }
+}
+
+struct ValueNumbering {
+    value_map: HashMap<u32, u32>,       // instr id -> value number
+    expr_map: HashMap<ExprKey, u32>,    // expression -> value number (first instr with this value)
+    const_map: HashMap<i64, u32>,       // constant -> value number
+    next_vn: u32,
+}
+
+impl ValueNumbering {
+    fn new() -> ValueNumbering {
+        ValueNumbering { value_map: HashMap.new(), expr_map: HashMap.new(), const_map: HashMap.new(), next_vn: 1 }
+    }
+
+    fn alloc_vn(mut self) -> u32 { let vn = self.next_vn; self.next_vn += 1; vn }
+
+    fn get_vn(self, instr_id: u32) -> u32 {
+        *self.value_map.get(&instr_id).unwrap_or(&0)
+    }
+
+    fn assign_vn(mut self, instr_id: u32, vn: u32) { self.value_map.insert(instr_id, vn); }
+
+    fn lookup_or_create(mut self, key: ExprKey) -> (u32, bool) {
+        let canonical = key.canonical()
+        if let Some(&vn) = self.expr_map.get(&canonical) {
+            return (vn, true)  // found existing
+        }
+        let vn = self.alloc_vn()
+        self.expr_map.insert(canonical, vn)
+        (vn, false)
+    }
+
+    fn lookup_const(mut self, value: i64) -> u32 {
+        if let Some(&vn) = self.const_map.get(&value) { return vn }
+        let vn = self.alloc_vn()
+        self.const_map.insert(value, vn)
+        vn
+    }
+}
+
+struct CsePass {
+    vn: ValueNumbering,
+    eliminations: u32,
+    instructions_processed: u32,
+}
+
+impl CsePass {
+    fn new() -> CsePass {
+        CsePass { vn: ValueNumbering.new(), eliminations: 0, instructions_processed: 0 }
+    }
+
+    fn run(mut self, instructions: &mut [Instruction]) {
+        // First pass: assign value numbers to all constants
+        for instr in instructions.iter() {
+            if instr.op == IrOp.Const {
+                let vn = self.vn.lookup_const(instr.const_val.unwrap())
+                self.vn.assign_vn(instr.id, vn)
+            }
+        }
+        // Second pass: process expressions
+        for i in 0..instructions.len() {
+            self.instructions_processed += 1
+            let instr = &instructions[i]
+            if instr.op == IrOp.Const { continue }
+
+            let key = if instr.is_binary() {
+                let left_vn = self.vn.get_vn(instr.operands[0])
+                let right_vn = self.vn.get_vn(instr.operands[1])
+                ExprKey.binary(instr.op, left_vn, right_vn)
+            } else {
+                let operand_vn = self.vn.get_vn(instr.operands[0])
+                ExprKey.unary(instr.op, operand_vn)
+            };
+
+            let (vn, found) = self.vn.lookup_or_create(key)
+            self.vn.assign_vn(instr.id, vn)
+
+            if found {
+                // Find the original instruction with this value number
+                for j in 0..i {
+                    if self.vn.get_vn(instructions[j].id) == vn && !instructions[j].eliminated {
+                        instructions[i].eliminate(instructions[j].id)
+                        self.eliminations += 1
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    fn elimination_count(self) -> u32 { self.eliminations }
+    fn processed_count(self) -> u32 { self.instructions_processed }
+}
+
+fn main() {
+    // ExprKey
+    let k1 = ExprKey.binary(IrOp.Add, 1, 2)
+    let k2 = ExprKey.binary(IrOp.Add, 2, 1)
+    assert(k1.canonical() == k2.canonical())
+    assert(!ExprKey.binary(IrOp.Sub, 1, 2).is_commutative())
+    assert(ExprKey.binary(IrOp.Mul, 1, 2).is_commutative())
+    print("ExprKey ✓")
+
+    // Instruction
+    let c1 = Instruction.constant(0, 42, "c1")
+    assert(c1.op == IrOp.Const)
+    assert(!c1.is_eliminated())
+    let b1 = Instruction.binary(1, IrOp.Add, 0, 0, "t1")
+    assert(b1.is_binary())
+    print("Instruction ✓")
+
+    // ValueNumbering
+    let mut vn = ValueNumbering.new()
+    let vn1 = vn.lookup_const(42)
+    let vn2 = vn.lookup_const(42)
+    assert(vn1 == vn2)  // same constant => same VN
+    let vn3 = vn.lookup_const(99)
+    assert(vn3 != vn1)
+    print("ValueNumbering ✓")
+
+    // CSE: a+b computed twice
+    let mut instrs = [
+        Instruction.constant(0, 10, "a"),
+        Instruction.constant(1, 20, "b"),
+        Instruction.binary(2, IrOp.Add, 0, 1, "t1"),  // a+b
+        Instruction.binary(3, IrOp.Add, 0, 1, "t2"),  // a+b (redundant)
+    ]
+    let mut cse = CsePass.new()
+    cse.run(&mut instrs)
+    assert(instrs[3].is_eliminated())
+    assert(instrs[3].replaced_by == Some(2))
+    assert(!instrs[2].is_eliminated())
+    assert(cse.elimination_count() == 1)
+    print("CSE basic ✓")
+
+    // CSE: commutative detection (a+b == b+a)
+    let mut instrs2 = [
+        Instruction.constant(0, 5, "x"),
+        Instruction.constant(1, 7, "y"),
+        Instruction.binary(2, IrOp.Add, 0, 1, "t1"),  // x+y
+        Instruction.binary(3, IrOp.Add, 1, 0, "t2"),  // y+x (same!)
+    ]
+    let mut cse2 = CsePass.new()
+    cse2.run(&mut instrs2)
+    assert(instrs2[3].is_eliminated())
+    assert(cse2.elimination_count() == 1)
+    print("CSE commutative ✓")
+
+    // No elimination for different ops
+    let mut instrs3 = [
+        Instruction.constant(0, 3, "a"),
+        Instruction.constant(1, 4, "b"),
+        Instruction.binary(2, IrOp.Add, 0, 1, "t1"),
+        Instruction.binary(3, IrOp.Sub, 0, 1, "t2"),
+    ]
+    let mut cse3 = CsePass.new()
+    cse3.run(&mut instrs3)
+    assert(!instrs3[2].is_eliminated())
+    assert(!instrs3[3].is_eliminated())
+    assert(cse3.elimination_count() == 0)
+    print("CSE different ✓")
+
+    // Non-commutative not confused
+    let mut instrs4 = [
+        Instruction.constant(0, 1, "a"),
+        Instruction.constant(1, 2, "b"),
+        Instruction.binary(2, IrOp.Sub, 0, 1, "t1"),  // a-b
+        Instruction.binary(3, IrOp.Sub, 1, 0, "t2"),  // b-a (different!)
+    ]
+    let mut cse4 = CsePass.new()
+    cse4.run(&mut instrs4)
+    assert(!instrs4[3].is_eliminated())
+    assert(cse4.elimination_count() == 0)
+    print("CSE non-commutative ✓")
+
+    // Multiple eliminations
+    let mut instrs5 = [
+        Instruction.constant(0, 1, "a"),
+        Instruction.constant(1, 2, "b"),
+        Instruction.binary(2, IrOp.Mul, 0, 1, "t1"),
+        Instruction.binary(3, IrOp.Mul, 0, 1, "t2"),
+        Instruction.binary(4, IrOp.Mul, 1, 0, "t3"),
+    ]
+    let mut cse5 = CsePass.new()
+    cse5.run(&mut instrs5)
+    assert(cse5.elimination_count() == 2)
+    print("CSE multiple ✓")
+
+    print("CSE complete ✓")
+}
