@@ -1,0 +1,271 @@
+
+// Dominator Tree - Computes dominators for control flow analysis
+// Implements the iterative dominator algorithm for SSA construction.
+
+use std.collections.{HashMap, HashSet}
+
+type BlockId = usize
+
+#[derive(Clone, Debug)]
+struct CFG {
+    entry: BlockId,
+    blocks: HashSet<BlockId>,
+    successors: HashMap<BlockId, [BlockId]>,
+    predecessors: HashMap<BlockId, [BlockId]>,
+}
+
+impl CFG {
+    fn new(entry: BlockId) -> CFG {
+        let mut blocks = HashSet.new()
+        blocks.insert(entry)
+        CFG {
+            entry, blocks,
+            successors: HashMap.new(),
+            predecessors: HashMap.new(),
+        }
+    }
+
+    fn add_edge(mut self, from: BlockId, to: BlockId) {
+        self.blocks.insert(from)
+        self.blocks.insert(to)
+        self.successors.entry(from).or_default().push(to)
+        self.predecessors.entry(to).or_default().push(from)
+    }
+
+    fn pred(self, block: BlockId) -> &[BlockId] {
+        self.predecessors.get(&block).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    fn succ(self, block: BlockId) -> &[BlockId] {
+        self.successors.get(&block).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    fn block_count(self) -> usize { self.blocks.len() }
+}
+
+struct DominatorTree {
+    idom: HashMap<BlockId, BlockId>,
+    dom_sets: HashMap<BlockId, HashSet<BlockId>>,
+    dom_frontier: HashMap<BlockId, HashSet<BlockId>>,
+    children: HashMap<BlockId, [BlockId]>,
+    depth: HashMap<BlockId, usize>,
+}
+
+impl DominatorTree {
+    fn compute(cfg: &CFG) -> DominatorTree {
+        let mut dom_sets: HashMap<BlockId, HashSet<BlockId>> = HashMap.new()
+
+        // Initialize: entry dominates only itself, all others dom'd by all
+        let all_blocks: HashSet<BlockId> = cfg.blocks.clone()
+        for &block in &cfg.blocks {
+            if block == cfg.entry {
+                let mut s = HashSet.new()
+                s.insert(cfg.entry)
+                dom_sets.insert(block, s)
+            } else {
+                dom_sets.insert(block, all_blocks.clone())
+            }
+        }
+
+        // Iterative fixed-point
+        let mut changed = true
+        while changed {
+            changed = false
+            for &block in &cfg.blocks {
+                if block == cfg.entry { continue }
+                let preds = cfg.pred(block)
+                if preds.is_empty() { continue }
+
+                let mut new_dom = dom_sets.get(&preds[0]).cloned().unwrap_or_default()
+                for &pred in &preds[1..] {
+                    if let some(pred_dom) = dom_sets.get(&pred) {
+                        new_dom = new_dom.intersection(pred_dom).copied().collect()
+                    }
+                }
+                new_dom.insert(block)
+
+                if new_dom != *dom_sets.get(&block).unwrap() {
+                    dom_sets.insert(block, new_dom)
+                    changed = true
+                }
+            }
+        }
+
+        // Compute immediate dominators
+        let mut idom = HashMap.new()
+        for (&block, doms) in &dom_sets {
+            if block == cfg.entry { continue }
+            // idom is the closest dominator (dom with largest dom set minus self)
+            let mut best: Option<BlockId> = none
+            for &d in doms {
+                if d == block { continue }
+                match best {
+                    none => best = some(d),
+                    some(b) => {
+                        if dom_sets.get(&d).map(|s| s.len()).unwrap_or(0) >
+                           dom_sets.get(&b).map(|s| s.len()).unwrap_or(0) {
+                            best = some(d)
+                        }
+                    }
+                }
+            }
+            if let some(b) = best { idom.insert(block, b); }
+        }
+
+        // Build children map
+        let mut children: HashMap<BlockId, [BlockId]> = HashMap.new()
+        for (&block, &parent) in &idom {
+            children.entry(parent).or_default().push(block)
+        }
+
+        // Compute depth
+        let mut depth = HashMap.new()
+        depth.insert(cfg.entry, 0)
+        let mut worklist: [BlockId] = vec![cfg.entry]
+        while let some(block) = worklist.pop() {
+            let d = *depth.get(&block).unwrap()
+            if let some(kids) = children.get(&block) {
+                for &kid in kids {
+                    depth.insert(kid, d + 1)
+                    worklist.push(kid)
+                }
+            }
+        }
+
+        // Compute dominance frontier
+        let mut dom_frontier: HashMap<BlockId, HashSet<BlockId>> = HashMap.new()
+        for &block in &cfg.blocks { dom_frontier.insert(block, HashSet.new()); }
+        for &block in &cfg.blocks {
+            let preds = cfg.pred(block)
+            if preds.len() >= 2 {
+                for &pred in preds {
+                    let mut runner = pred
+                    while some(&runner) != idom.get(&block) && runner != cfg.entry {
+                        dom_frontier.entry(runner).or_default().insert(block)
+                        match idom.get(&runner) {
+                            some(&next) => runner = next,
+                            none => break,
+                        }
+                    }
+                }
+            }
+        }
+
+        DominatorTree { idom, dom_sets, dom_frontier, children, depth }
+    }
+
+    fn dominates(self, a: BlockId, b: BlockId) -> bool {
+        self.dom_sets.get(&b).map(|s| s.contains(&a)).unwrap_or(false)
+    }
+
+    fn idom(self, block: BlockId) -> Option<BlockId> {
+        self.idom.get(&block).copied()
+    }
+
+    fn frontier(self, block: BlockId) -> &HashSet<BlockId> {
+        self.dom_frontier.get(&block).unwrap_or(&HashSet.new())
+    }
+
+    fn children(self, block: BlockId) -> &[BlockId] {
+        self.children.get(&block).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    fn depth(self, block: BlockId) -> usize {
+        *self.depth.get(&block).unwrap_or(&0)
+    }
+
+    fn dom_set(self, block: BlockId) -> &HashSet<BlockId> {
+        self.dom_sets.get(&block).unwrap()
+    }
+}
+
+fn main() {
+    // Simple CFG: 0 -> 1 -> 2, 0 -> 2
+    let mut cfg = CFG.new(0)
+    cfg.add_edge(0, 1)
+    cfg.add_edge(0, 2)
+    cfg.add_edge(1, 2)
+    assert(cfg.block_count() == 3)
+    assert(cfg.succ(0).len() == 2)
+    assert(cfg.pred(2).len() == 2)
+    print("CFG ✓")
+
+    let dt = DominatorTree.compute(&cfg)
+
+    // Entry dominates all
+    assert(dt.dominates(0, 0))
+    assert(dt.dominates(0, 1))
+    assert(dt.dominates(0, 2))
+    print("Entry dominates all ✓")
+
+    // Self-dominance
+    assert(dt.dominates(1, 1))
+    assert(dt.dominates(2, 2))
+    print("Self-dominance ✓")
+
+    // 1 does not dominate 2 (since 0->2 directly)
+    assert(!dt.dominates(1, 2))
+    print("Non-dominance ✓")
+
+    // Immediate dominator
+    assert(dt.idom(1) == some(0))
+    assert(dt.idom(2) == some(0))
+    print("Idom ✓")
+
+    // Depth
+    assert(dt.depth(0) == 0)
+    assert(dt.depth(1) == 1)
+    assert(dt.depth(2) == 1)
+    print("Depth ✓")
+
+    // Children
+    let kids = dt.children(0)
+    assert(kids.contains(&1))
+    assert(kids.contains(&2))
+    print("Children ✓")
+
+    // Diamond CFG: 0 -> {1, 2}, {1, 2} -> 3
+    let mut cfg2 = CFG.new(0)
+    cfg2.add_edge(0, 1)
+    cfg2.add_edge(0, 2)
+    cfg2.add_edge(1, 3)
+    cfg2.add_edge(2, 3)
+
+    let dt2 = DominatorTree.compute(&cfg2)
+    assert(dt2.dominates(0, 3))
+    assert(!dt2.dominates(1, 3))
+    assert(!dt2.dominates(2, 3))
+    assert(dt2.idom(3) == some(0))
+    print("Diamond CFG ✓")
+
+    // Dominance frontier
+    let frontier1 = dt2.frontier(1)
+    assert(frontier1.contains(&3))
+    let frontier2 = dt2.frontier(2)
+    assert(frontier2.contains(&3))
+    print("Dominance frontier ✓")
+
+    // Linear chain: 0 -> 1 -> 2 -> 3
+    let mut cfg3 = CFG.new(0)
+    cfg3.add_edge(0, 1)
+    cfg3.add_edge(1, 2)
+    cfg3.add_edge(2, 3)
+    let dt3 = DominatorTree.compute(&cfg3)
+    assert(dt3.dominates(0, 3))
+    assert(dt3.dominates(1, 3))
+    assert(dt3.dominates(2, 3))
+    assert(dt3.idom(3) == some(2))
+    assert(dt3.depth(3) == 3)
+    print("Linear chain ✓")
+
+    // Dom set
+    let ds = dt3.dom_set(3)
+    assert(ds.contains(&0))
+    assert(ds.contains(&1))
+    assert(ds.contains(&2))
+    assert(ds.contains(&3))
+    assert(ds.len() == 4)
+    print("Dom set ✓")
+
+    print("Dominator tree complete ✓")
+}
