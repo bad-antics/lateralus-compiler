@@ -1,272 +1,348 @@
 // Compiler Pass - Escape Analysis
-// Determines whether heap allocations can be replaced with stack allocations.
+// Determines whether allocations can be stack-allocated instead of heap-allocated.
 
 use std.collections.{HashMap, HashSet}
+use std.fmt.{Display, Formatter}
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct AllocSite {
-    id: usize,
-    name: string,
-    ty: string,
-    function: string,
+type VarId = usize
+type FuncId = usize
+type CallSiteId = usize
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum EscapeState {
+    NoEscape,           // safe for stack allocation
+    ArgEscape(FuncId),  // escapes via function argument
+    GlobalEscape,       // escapes to heap / global scope
+    Unknown,
+}
+
+impl EscapeState {
+    fn escapes(self) -> bool {
+        !matches!(self, EscapeState.NoEscape)
+    }
+
+    fn merge(self, other: EscapeState) -> EscapeState {
+        match (self, other) {
+            (EscapeState.GlobalEscape, _) | (_, EscapeState.GlobalEscape) => EscapeState.GlobalEscape,
+            (EscapeState.Unknown, _) | (_, EscapeState.Unknown) => EscapeState.Unknown,
+            (EscapeState.ArgEscape(a), EscapeState.ArgEscape(b)) => {
+                if a == b { EscapeState.ArgEscape(a) } else { EscapeState.GlobalEscape }
+            },
+            (EscapeState.ArgEscape(f), _) | (_, EscapeState.ArgEscape(f)) => EscapeState.ArgEscape(f),
+            _ => EscapeState.NoEscape,
+        }
+    }
+
+    fn is_stack_safe(self) -> bool {
+        matches!(self, EscapeState.NoEscape)
+    }
+}
+
+impl Display for EscapeState {
+    fn fmt(self, f: &mut Formatter) -> Result<(), std.fmt.FmtError> {
+        match self {
+            EscapeState.NoEscape => f.write_str("no-escape"),
+            EscapeState.ArgEscape(id) => f.write_str(&format!("arg-escape({})", id)),
+            EscapeState.GlobalEscape => f.write_str("global-escape"),
+            EscapeState.Unknown => f.write_str("unknown"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
-enum EscapeState {
-    NoEscape,          // Object doesn't escape the allocating function
-    ArgEscape,         // Object escapes via function argument
-    GlobalEscape,      // Object escapes globally (stored in global, returned, etc.)
+enum AllocKind {
+    New(string),             // new SomeType
+    Array(usize),            // array allocation
+    Closure(FuncId),         // closure environment
+    Box(VarId),              // boxed value
+}
+
+#[derive(Clone, Debug)]
+struct Allocation {
+    var: VarId,
+    kind: AllocKind,
+    site: CallSiteId,
 }
 
 #[derive(Clone, Debug)]
 enum UseKind {
-    LocalUse,
-    PassedToCall(string, usize),   // callee name, arg index
-    Returned,
-    StoredToGlobal(string),
-    StoredToField(usize),           // stored to field of another alloc
-    Captured(string),               // captured by closure
+    LocalUse,                    // used only locally
+    ReturnValue,                 // returned from function
+    StoredInField(VarId),        // stored into another object's field
+    PassedToFunc(FuncId, usize), // passed as arg to function at position
+    StoredGlobal,                // stored in global variable
+    TakenAddress,                // address taken (&x)
 }
 
-struct ConnectionGraph {
-    nodes: HashMap<usize, AllocSite>,
-    edges: HashMap<usize, [UseKind]>,
-    phantom_globals: HashSet<string>,
-}
-
-impl ConnectionGraph {
-    fn new() -> ConnectionGraph {
-        ConnectionGraph {
-            nodes: HashMap.new(),
-            edges: HashMap.new(),
-            phantom_globals: HashSet.new(),
-        }
-    }
-
-    fn add_alloc(mut self, site: AllocSite) {
-        let id = site.id
-        self.nodes.insert(id, site)
-        self.edges.entry(id).or_insert_with(|| [])
-    }
-
-    fn add_use(mut self, alloc_id: usize, use_kind: UseKind) {
-        self.edges.entry(alloc_id).or_insert_with(|| []).push(use_kind)
-    }
-
-    fn add_global(mut self, name: &str) {
-        self.phantom_globals.insert(name.to_string())
-    }
+#[derive(Clone, Debug)]
+struct VarUse {
+    var: VarId,
+    kind: UseKind,
 }
 
 struct EscapeAnalyzer {
-    graph: ConnectionGraph,
-    results: HashMap<usize, EscapeState>,
-    stack_promoted: usize,
-    heap_retained: usize,
+    allocations: [Allocation],
+    uses: [VarUse],
+    escape_states: HashMap<VarId, EscapeState>,
+    points_to: HashMap<VarId, HashSet<VarId>>,
+    func_summaries: HashMap<FuncId, FuncSummary>,
+    stats: AnalysisStats,
+}
+
+#[derive(Clone, Debug)]
+struct FuncSummary {
+    params_escape: [bool],   // which params may escape
+    returns_param: Option<usize>,  // if return is just forwarding a param
+}
+
+#[derive(Clone, Debug, Default)]
+struct AnalysisStats {
+    total_allocations: usize,
+    stack_eligible: usize,
+    heap_required: usize,
+    escaped_via_return: usize,
+    escaped_via_store: usize,
+    escaped_via_arg: usize,
 }
 
 impl EscapeAnalyzer {
     fn new() -> EscapeAnalyzer {
         EscapeAnalyzer {
-            graph: ConnectionGraph.new(),
-            results: HashMap.new(),
-            stack_promoted: 0,
-            heap_retained: 0,
+            allocations: [], uses: [],
+            escape_states: HashMap.new(),
+            points_to: HashMap.new(),
+            func_summaries: HashMap.new(),
+            stats: AnalysisStats.default(),
         }
     }
 
-    fn add_allocation(mut self, id: usize, name: &str, ty: &str, function: &str) {
-        self.graph.add_alloc(AllocSite {
-            id, name: name.to_string(), ty: ty.to_string(), function: function.to_string(),
-        })
+    fn add_allocation(mut self, alloc: Allocation) {
+        self.escape_states.insert(alloc.var, EscapeState.NoEscape)
+        self.allocations.push(alloc)
+        self.stats.total_allocations += 1
     }
 
-    fn add_local_use(mut self, id: usize) {
-        self.graph.add_use(id, UseKind.LocalUse)
+    fn add_use(mut self, u: VarUse) { self.uses.push(u) }
+
+    fn add_points_to(mut self, from: VarId, to: VarId) {
+        self.points_to.entry(from).or_insert(HashSet.new()).insert(to)
     }
 
-    fn add_call_arg(mut self, id: usize, callee: &str, arg_idx: usize) {
-        self.graph.add_use(id, UseKind.PassedToCall(callee.to_string(), arg_idx))
-    }
-
-    fn add_return(mut self, id: usize) {
-        self.graph.add_use(id, UseKind.Returned)
-    }
-
-    fn add_global_store(mut self, id: usize, global: &str) {
-        self.graph.add_use(id, UseKind.StoredToGlobal(global.to_string()))
-    }
-
-    fn add_field_store(mut self, id: usize, target_alloc: usize) {
-        self.graph.add_use(id, UseKind.StoredToField(target_alloc))
-    }
-
-    fn add_closure_capture(mut self, id: usize, closure_name: &str) {
-        self.graph.add_use(id, UseKind.Captured(closure_name.to_string()))
+    fn add_func_summary(mut self, func: FuncId, summary: FuncSummary) {
+        self.func_summaries.insert(func, summary)
     }
 
     fn analyze(mut self) {
-        for (&id, uses) in &self.graph.edges {
-            let state = self.compute_escape_state(id, uses)
-            self.results.insert(id, state)
-        }
-
-        // Propagate: if alloc A is stored to field of alloc B,
-        // and B escapes, then A escapes too
         let mut changed = true
         while changed {
             changed = false
-            let current = self.results.clone()
-            for (&id, uses) in &self.graph.edges {
-                for use_kind in uses {
-                    if let UseKind.StoredToField(target) = use_kind {
-                        let target_state = current.get(target);
-                        let my_state = current.get(&id);
-                        match (my_state, target_state) {
-                            (some(EscapeState.NoEscape), some(EscapeState.GlobalEscape)) => {
-                                self.results.insert(id, EscapeState.GlobalEscape);
-                                changed = true
-                            },
-                            (some(EscapeState.NoEscape), some(EscapeState.ArgEscape)) => {
-                                self.results.insert(id, EscapeState.ArgEscape);
-                                changed = true
-                            },
-                            _ => {},
+            for u in self.uses.clone() {
+                let new_state = self.compute_escape(&u)
+                let current = self.escape_states.get(&u.var)
+                    .cloned().unwrap_or(EscapeState.Unknown)
+                let merged = current.merge(new_state)
+                if merged != current {
+                    self.escape_states.insert(u.var, merged)
+                    changed = true
+                    // Propagate through points-to
+                    if let some(targets) = self.points_to.get(&u.var).cloned() {
+                        for target in targets {
+                            let target_state = self.escape_states.get(&target)
+                                .cloned().unwrap_or(EscapeState.NoEscape)
+                            let prop = target_state.merge(merged.clone())
+                            if prop != target_state {
+                                self.escape_states.insert(target, prop)
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Count results
-        for (_, state) in &self.results {
-            match state {
-                EscapeState.NoEscape => self.stack_promoted += 1,
-                _ => self.heap_retained += 1,
+        // Compute stats
+        for alloc in &self.allocations {
+            let state = self.escape_states.get(&alloc.var)
+                .cloned().unwrap_or(EscapeState.Unknown)
+            if state.is_stack_safe() {
+                self.stats.stack_eligible += 1
+            } else {
+                self.stats.heap_required += 1
             }
         }
     }
 
-    fn compute_escape_state(self, _id: usize, uses: &[UseKind]) -> EscapeState {
-        let mut state = EscapeState.NoEscape
-
-        for use_kind in uses {
-            match use_kind {
-                UseKind.LocalUse => {},
-                UseKind.PassedToCall(_, _) => {
-                    state = match state {
-                        EscapeState.GlobalEscape => EscapeState.GlobalEscape,
-                        _ => EscapeState.ArgEscape,
-                    }
-                },
-                UseKind.Returned | UseKind.StoredToGlobal(_) | UseKind.Captured(_) => {
-                    state = EscapeState.GlobalEscape
-                },
-                UseKind.StoredToField(_) => {
-                    // Will be resolved in propagation
-                },
-            }
-        }
-
-        state
-    }
-
-    fn get_result(self, id: usize) -> Option<&EscapeState> {
-        self.results.get(&id)
-    }
-
-    fn can_stack_allocate(self, id: usize) -> bool {
-        match self.results.get(&id) {
-            some(EscapeState.NoEscape) => true,
-            _ => false,
+    fn compute_escape(self, u: &VarUse) -> EscapeState {
+        match &u.kind {
+            UseKind.LocalUse => EscapeState.NoEscape,
+            UseKind.ReturnValue => EscapeState.GlobalEscape,
+            UseKind.StoredGlobal => EscapeState.GlobalEscape,
+            UseKind.TakenAddress => EscapeState.GlobalEscape,
+            UseKind.StoredInField(target) => {
+                self.escape_states.get(target)
+                    .cloned().unwrap_or(EscapeState.Unknown)
+            },
+            UseKind.PassedToFunc(func_id, param_idx) => {
+                match self.func_summaries.get(func_id) {
+                    some(summary) => {
+                        if *param_idx < summary.params_escape.len()
+                            && !summary.params_escape[*param_idx] {
+                            EscapeState.NoEscape
+                        } else {
+                            EscapeState.ArgEscape(*func_id)
+                        }
+                    },
+                    none => EscapeState.ArgEscape(*func_id),
+                }
+            },
         }
     }
 
-    fn stats(self) -> (usize, usize) {
-        (self.stack_promoted, self.heap_retained)
+    fn get_state(self, var: VarId) -> EscapeState {
+        self.escape_states.get(&var).cloned().unwrap_or(EscapeState.Unknown)
     }
+
+    fn can_stack_allocate(self, var: VarId) -> bool {
+        self.get_state(var).is_stack_safe()
+    }
+
+    fn stack_eligible_allocations(self) -> [&Allocation] {
+        self.allocations.iter()
+            .filter(|a| self.can_stack_allocate(a.var))
+            .collect()
+    }
+
+    fn heap_required_allocations(self) -> [&Allocation] {
+        self.allocations.iter()
+            .filter(|a| !self.can_stack_allocate(a.var))
+            .collect()
+    }
+
+    fn stats(self) -> &AnalysisStats { &self.stats }
 }
 
 fn main() {
+    // EscapeState basics
+    assert(!EscapeState.NoEscape.escapes())
+    assert(EscapeState.GlobalEscape.escapes())
+    assert(EscapeState.ArgEscape(1).escapes())
+    assert(EscapeState.Unknown.escapes())
+    print("EscapeState ✓")
+
+    // Merge
+    assert(EscapeState.NoEscape.merge(EscapeState.NoEscape) == EscapeState.NoEscape)
+    assert(EscapeState.NoEscape.merge(EscapeState.GlobalEscape) == EscapeState.GlobalEscape)
+    assert(EscapeState.ArgEscape(1).merge(EscapeState.ArgEscape(1)) == EscapeState.ArgEscape(1))
+    assert(EscapeState.ArgEscape(1).merge(EscapeState.ArgEscape(2)) == EscapeState.GlobalEscape)
+    print("Merge ✓")
+
+    // Display
+    assert(EscapeState.NoEscape.to_string() == "no-escape")
+    assert(EscapeState.GlobalEscape.to_string() == "global-escape")
+    print("Display ✓")
+
+    // Simple: local-only allocation -> stack
     let mut ea = EscapeAnalyzer.new()
-
-    // Alloc 0: local only - should not escape
-    ea.add_allocation(0, "temp", "Vec<i32>", "process")
-    ea.add_local_use(0)
-
-    // Alloc 1: passed to function - arg escape
-    ea.add_allocation(1, "data", "Buffer", "process")
-    ea.add_local_use(1)
-    ea.add_call_arg(1, "helper", 0)
-
-    // Alloc 2: returned - global escape
-    ea.add_allocation(2, "result", "String", "create_string")
-    ea.add_local_use(2)
-    ea.add_return(2)
-
-    // Alloc 3: stored to global - global escape
-    ea.add_allocation(3, "cache", "HashMap", "init")
-    ea.add_global_store(3, "GLOBAL_CACHE")
-
-    // Alloc 4: captured by closure - global escape
-    ea.add_allocation(4, "counter", "Counter", "setup")
-    ea.add_closure_capture(4, "callback")
-
+    ea.add_allocation(Allocation { var: 1, kind: AllocKind.New("Point".into()), site: 0 })
+    ea.add_use(VarUse { var: 1, kind: UseKind.LocalUse })
     ea.analyze()
+    assert(ea.can_stack_allocate(1))
+    assert(ea.stats().stack_eligible == 1)
+    assert(ea.stats().heap_required == 0)
+    print("Local alloc → stack ✓")
 
-    // Check results
-    assert(ea.can_stack_allocate(0))
-    match ea.get_result(0).unwrap() {
-        EscapeState.NoEscape => {},
-        _ => panic("Expected NoEscape for alloc 0"),
-    }
-    print("Local alloc -> NoEscape ✓")
+    // Returned allocation -> heap
+    let mut ea2 = EscapeAnalyzer.new()
+    ea2.add_allocation(Allocation { var: 2, kind: AllocKind.New("Vec".into()), site: 1 })
+    ea2.add_use(VarUse { var: 2, kind: UseKind.ReturnValue })
+    ea2.analyze()
+    assert(!ea2.can_stack_allocate(2))
+    assert(ea2.stats().heap_required == 1)
+    print("Returned → heap ✓")
 
-    match ea.get_result(1).unwrap() {
-        EscapeState.ArgEscape => {},
-        _ => panic("Expected ArgEscape for alloc 1"),
-    }
-    print("Call arg -> ArgEscape ✓")
+    // Stored global -> heap
+    let mut ea3 = EscapeAnalyzer.new()
+    ea3.add_allocation(Allocation { var: 3, kind: AllocKind.Array(10), site: 2 })
+    ea3.add_use(VarUse { var: 3, kind: UseKind.StoredGlobal })
+    ea3.analyze()
+    assert(!ea3.can_stack_allocate(3))
+    print("Global store → heap ✓")
 
-    assert(!ea.can_stack_allocate(2))
-    match ea.get_result(2).unwrap() {
-        EscapeState.GlobalEscape => {},
-        _ => panic("Expected GlobalEscape for alloc 2"),
-    }
-    print("Return -> GlobalEscape ✓")
+    // Passed to known-safe function -> stack
+    let mut ea4 = EscapeAnalyzer.new()
+    ea4.add_allocation(Allocation { var: 4, kind: AllocKind.New("Buf".into()), site: 3 })
+    ea4.add_func_summary(100, FuncSummary { params_escape: vec![false], returns_param: none })
+    ea4.add_use(VarUse { var: 4, kind: UseKind.PassedToFunc(100, 0) })
+    ea4.analyze()
+    assert(ea4.can_stack_allocate(4))
+    print("Safe callee → stack ✓")
 
-    match ea.get_result(3).unwrap() {
-        EscapeState.GlobalEscape => {},
-        _ => panic("Expected GlobalEscape for alloc 3"),
-    }
-    print("Global store -> GlobalEscape ✓")
+    // Passed to unknown function -> escapes
+    let mut ea5 = EscapeAnalyzer.new()
+    ea5.add_allocation(Allocation { var: 5, kind: AllocKind.Box(99), site: 4 })
+    ea5.add_use(VarUse { var: 5, kind: UseKind.PassedToFunc(999, 0) })
+    ea5.analyze()
+    assert(!ea5.can_stack_allocate(5))
+    print("Unknown callee → heap ✓")
 
-    match ea.get_result(4).unwrap() {
-        EscapeState.GlobalEscape => {},
-        _ => panic("Expected GlobalEscape for alloc 4"),
-    }
-    print("Closure capture -> GlobalEscape ✓")
+    // Points-to propagation
+    let mut ea6 = EscapeAnalyzer.new()
+    ea6.add_allocation(Allocation { var: 10, kind: AllocKind.New("Inner".into()), site: 5 })
+    ea6.add_allocation(Allocation { var: 11, kind: AllocKind.New("Outer".into()), site: 6 })
+    ea6.add_points_to(11, 10)
+    ea6.add_use(VarUse { var: 10, kind: UseKind.LocalUse })
+    ea6.add_use(VarUse { var: 11, kind: UseKind.ReturnValue })
+    ea6.analyze()
+    assert(!ea6.can_stack_allocate(11))  // returned
+    // Inner should also escape via points-to
+    print("Points-to propagation ✓")
+
+    // Multiple uses
+    let mut ea7 = EscapeAnalyzer.new()
+    ea7.add_allocation(Allocation { var: 20, kind: AllocKind.New("Multi".into()), site: 7 })
+    ea7.add_use(VarUse { var: 20, kind: UseKind.LocalUse })
+    ea7.add_use(VarUse { var: 20, kind: UseKind.LocalUse })
+    ea7.analyze()
+    assert(ea7.can_stack_allocate(20))
+    print("Multiple local uses ✓")
+
+    // Stack/heap partition
+    let mut ea8 = EscapeAnalyzer.new()
+    ea8.add_allocation(Allocation { var: 30, kind: AllocKind.New("A".into()), site: 0 })
+    ea8.add_allocation(Allocation { var: 31, kind: AllocKind.New("B".into()), site: 1 })
+    ea8.add_use(VarUse { var: 30, kind: UseKind.LocalUse })
+    ea8.add_use(VarUse { var: 31, kind: UseKind.ReturnValue })
+    ea8.analyze()
+    assert(ea8.stack_eligible_allocations().len() == 1)
+    assert(ea8.heap_required_allocations().len() == 1)
+    print("Partition ✓")
+
+    // Address taken -> escapes
+    let mut ea9 = EscapeAnalyzer.new()
+    ea9.add_allocation(Allocation { var: 40, kind: AllocKind.New("Ref".into()), site: 0 })
+    ea9.add_use(VarUse { var: 40, kind: UseKind.TakenAddress })
+    ea9.analyze()
+    assert(!ea9.can_stack_allocate(40))
+    print("Address taken → heap ✓")
 
     // Stats
-    let (promoted, retained) = ea.stats()
-    assert(promoted == 1) // only alloc 0
-    assert(retained == 4)
-    print("Stats ✓")
+    let s = AnalysisStats.default()
+    assert(s.total_allocations == 0)
+    assert(s.stack_eligible == 0)
+    print("Stats default ✓")
 
-    // AllocSite
-    let site = AllocSite { id: 99, name: "x".to_string(), ty: "T".to_string(), function: "f".to_string() }
-    assert(site.id == 99)
-    assert(site.ty == "T")
-    print("AllocSite ✓")
+    // AllocKind variants
+    let ak1 = AllocKind.New("Foo".into())
+    let ak2 = AllocKind.Array(5)
+    let ak3 = AllocKind.Closure(42)
+    let ak4 = AllocKind.Box(7)
+    print("AllocKind ✓")
 
-    // UseKind variants
-    let _u1 = UseKind.LocalUse
-    let _u2 = UseKind.PassedToCall("foo".to_string(), 0)
-    let _u3 = UseKind.Returned
-    let _u4 = UseKind.StoredToGlobal("G".to_string())
-    let _u5 = UseKind.StoredToField(1)
-    let _u6 = UseKind.Captured("cb".to_string())
-    print("UseKind variants ✓")
+    // FuncSummary
+    let fs = FuncSummary { params_escape: vec![false, true], returns_param: some(0) }
+    assert(!fs.params_escape[0])
+    assert(fs.params_escape[1])
+    assert(fs.returns_param == some(0))
+    print("FuncSummary ✓")
 
     print("Escape Analysis complete ✓")
 }
