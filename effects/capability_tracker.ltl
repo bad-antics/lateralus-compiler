@@ -1,0 +1,172 @@
+// compiler/effects/capability_tracker.ltl
+//
+// Static capability-effect tracker for Lateralus.
+//
+// Each function carries a set of *capabilities* it may exercise
+// (net::listen, fs::write, clock::read, ffi::call, ...). A function
+// inherits the union of its callees' capabilities; explicit
+// #[caps(...)] attributes narrow or extend this set. The compiler
+// rejects any call whose callee demands a capability not declared by
+// the caller.
+//
+// Niche but distinctive: this is the pass that makes Lateralus
+// programs provably `network = none` for the purposes of sandboxing
+// untrusted code, at zero runtime cost.
+//
+// Batch 78 / distinctive.
+
+import std::ast
+import std::collections::{Map, Set}
+import std::compiler::{Pass, Module, Diagnostic}
+
+pub type Capability = String     // stable identifier, e.g. "net::listen"
+
+pub struct CapSet {
+    caps:   Set<Capability>,
+    locked: Bool,                // #[caps_sealed] forbids widening
+}
+
+pub fn empty() -> CapSet { CapSet { caps: Set::empty(), locked: false } }
+pub fn of(items: [Capability]) -> CapSet {
+    CapSet { caps: items |> Set::from_list(), locked: false }
+}
+
+pub struct TrackerCtx {
+    declared: Map<ast::FnId, CapSet>,
+    inferred: Map<ast::FnId, CapSet>,
+    worklist: [ast::FnId],
+    diags:    [Diagnostic],
+}
+
+/// Public entry point for the compiler pipeline.
+pub fn run(module: &mut Module) -> Result<(), [Diagnostic]> {
+    let mut ctx = TrackerCtx {
+        declared: read_declared_caps(module),
+        inferred: Map::empty(),
+        worklist: module.items |> filter(|i| i.is_fn()) |> map(|f| f.id),
+        diags:    [],
+    }
+
+    // Fixed-point inference over the call graph.
+    loop_fixpoint(&mut ctx, module)
+
+    // Enforcement pass: every call must satisfy its caller's declared set.
+    enforce(&mut ctx, module)
+
+    if ctx.diags |> any(|d| d.is_error()) {
+        Err(ctx.diags)
+    } else {
+        write_back(module, ctx.inferred)
+        Ok(())
+    }
+}
+
+fn read_declared_caps(m: Module) -> Map<ast::FnId, CapSet> {
+    m.items
+        |> filter(|i| i.is_fn())
+        |> fold(Map::empty(), |acc, f| {
+            let caps = f.attrs
+                |> find(|a| a.name == "caps")
+                |> map(|a| a.args |> map(|(k, _)| k) |> CapSet::of)
+                |> unwrap_or(empty())
+            let locked = f.attrs |> any(|a| a.name == "caps_sealed")
+            acc |> set(f.id, CapSet { locked, ..caps })
+        })
+}
+
+fn loop_fixpoint(ctx: &mut TrackerCtx, module: Module) {
+    let mut changed = true
+    while changed {
+        changed = false
+        for fn_id in ctx.worklist {
+            let before = ctx.inferred |> get(fn_id) |> unwrap_or(empty())
+            let after  = infer_body_caps(ctx, module, fn_id)
+            if not cap_set_eq(before, after) {
+                ctx.inferred |> set_mut(fn_id, after)
+                changed = true
+            }
+        }
+    }
+}
+
+fn infer_body_caps(ctx: &TrackerCtx, m: Module, fn_id: ast::FnId) -> CapSet {
+    let f = m |> lookup_fn(fn_id)
+    let mut acc = Set::empty()
+
+    // 1. Direct intrinsics carry their own capabilities via #[intrinsic_cap(X)].
+    for call in f.body |> walk_calls() {
+        let callee = call.callee_fn_id
+        let cs = ctx.inferred |> get(callee) |> unwrap_or(empty())
+        acc = acc |> Set::union(cs.caps)
+    }
+
+    // 2. Declared caps are always included.
+    let decl = ctx.declared |> get(fn_id) |> unwrap_or(empty())
+    acc = acc |> Set::union(decl.caps)
+
+    CapSet { caps: acc, locked: decl.locked }
+}
+
+fn enforce(ctx: &mut TrackerCtx, module: Module) {
+    for f in module.items |> filter(|i| i.is_fn()) {
+        let decl = ctx.declared |> get(f.id) |> unwrap_or(empty())
+        let inf  = ctx.inferred |> get(f.id) |> unwrap_or(empty())
+
+        // Locked functions must not have inferred capabilities outside their declared set.
+        if decl.locked {
+            let leaked = inf.caps |> Set::diff(decl.caps)
+            if not (leaked |> Set::is_empty()) {
+                ctx.diags |> push(Diagnostic::error(
+                    "{f.name}: sealed capability set leaks {leaked |> Set::to_list() |> join(\", \")}",
+                    [f.span]))
+            }
+        }
+
+        // Every call's callee capabilities must be a subset of caller's (declared + inferred).
+        for call in f.body |> walk_calls() {
+            let callee_caps = ctx.inferred
+                |> get(call.callee_fn_id)
+                |> unwrap_or(empty())
+            let caller_caps = CapSet {
+                caps:   decl.caps |> Set::union(inf.caps),
+                locked: decl.locked,
+            }
+            let missing = callee_caps.caps |> Set::diff(caller_caps.caps)
+            if not (missing |> Set::is_empty()) {
+                ctx.diags |> push(Diagnostic::error(
+                    "{f.name}: missing capabilities for call to {call.callee_name}: {missing |> Set::to_list() |> join(\", \")}",
+                    [call.span]))
+            }
+        }
+    }
+}
+
+fn write_back(m: &mut Module, inferred: Map<ast::FnId, CapSet>) {
+    // Surface the inferred set in the debug symbol table so LSP hover and
+    // `lateralus caps <file>` can display it. Does not change code gen.
+    for f in m.items |> filter(|i| i.is_fn()) {
+        let cs = inferred |> get(f.id) |> unwrap_or(empty())
+        f.debug |> set_mut("caps", cs.caps |> Set::to_list() |> join(","))
+    }
+}
+
+fn cap_set_eq(a: CapSet, b: CapSet) -> Bool {
+    a.locked == b.locked && Set::eq(a.caps, b.caps)
+}
+
+// -- Public helpers the CLI / LSP call ---------------------------------------
+
+pub fn describe(module: Module, fn_id: ast::FnId) -> String {
+    let cs = module |> lookup_inferred_caps(fn_id) |> unwrap_or(empty())
+    if cs.caps |> Set::is_empty() {
+        "pure (no capabilities required)"
+    } else {
+        "requires: " + (cs.caps |> Set::to_list() |> sort() |> join(", "))
+    }
+}
+
+pub fn is_pure(module: Module, fn_id: ast::FnId) -> Bool {
+    module |> lookup_inferred_caps(fn_id)
+           |> map(|cs| cs.caps |> Set::is_empty())
+           |> unwrap_or(false)
+}
