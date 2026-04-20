@@ -1,0 +1,229 @@
+// compiler/pass/const_fold.ltl
+//
+// Pipeline-aware constant folding and dead-branch elimination.
+//
+// Classic constant folding evaluates pure expressions at compile time.
+// Lateralus's pipeline syntax gives this pass an extra lever: an entire
+// `|>`-chain whose every stage is a pure function of constants can be
+// collapsed to a single literal in the IR. This is the pass that makes
+// `[1,2,3] |> map(|x| x*x) |> sum()` compile to the literal `14`.
+//
+// Batch 80 / compiler niche. First const-fold pass in the ecosystem.
+
+import std::ast
+import std::collections::Map
+import std::compiler::{Pass, Module, Diagnostic}
+
+pub struct FoldCtx {
+    pure_fns:  Map<ast::FnId, Bool>,
+    folded:    Int,             // count, for diagnostics
+    diags:     [Diagnostic],
+}
+
+pub fn run(module: &mut Module) -> Result<FoldReport, [Diagnostic]> {
+    let mut ctx = FoldCtx {
+        pure_fns: build_purity_map(module),
+        folded: 0,
+        diags: [],
+    }
+
+    module |> walk_exprs_mut(|e| fold_expr(&mut ctx, e))
+
+    Ok(FoldReport { expressions_folded: ctx.folded })
+}
+
+pub struct FoldReport { expressions_folded: Int }
+
+// -- Core fold --------------------------------------------------------------
+
+fn fold_expr(ctx: &mut FoldCtx, e: &mut ast::Expr) {
+    match e {
+        ast::Expr::BinOp { op, lhs, rhs, span } => {
+            fold_expr(ctx, lhs)
+            fold_expr(ctx, rhs)
+            if is_literal(lhs) && is_literal(rhs) {
+                match eval_binop(op, as_literal(lhs), as_literal(rhs)) {
+                    Some(v) => { *e = ast::Expr::Literal(v, span); ctx.folded = ctx.folded + 1 },
+                    None    => (),
+                }
+            }
+        },
+        ast::Expr::If { cond, then_branch, else_branch, span } => {
+            fold_expr(ctx, cond)
+            fold_expr(ctx, then_branch)
+            fold_expr(ctx, else_branch)
+            match as_bool_literal(cond) {
+                Some(true)  => { *e = then_branch.clone(); ctx.folded = ctx.folded + 1 },
+                Some(false) => { *e = else_branch.clone(); ctx.folded = ctx.folded + 1 },
+                None        => (),
+            }
+        },
+        ast::Expr::Pipeline { stages, span } => {
+            for s in stages { fold_expr(ctx, s) }
+            try_fold_pipeline(ctx, e, stages, span)
+        },
+        ast::Expr::Call { callee, args, span } => {
+            fold_expr(ctx, callee)
+            for a in args { fold_expr(ctx, a) }
+            try_fold_call(ctx, e, callee, args, span)
+        },
+        ast::Expr::Match { scrutinee, arms, span } => {
+            fold_expr(ctx, scrutinee)
+            for a in arms { fold_expr(ctx, a.body) }
+            if is_literal(scrutinee) {
+                match select_arm(arms, as_literal(scrutinee)) {
+                    Some(body) => { *e = body; ctx.folded = ctx.folded + 1 },
+                    None       => (),
+                }
+            }
+        },
+        _ => (),
+    }
+}
+
+// -- Pipelines --------------------------------------------------------------
+
+fn try_fold_pipeline(ctx: &mut FoldCtx,
+                     out: &mut ast::Expr,
+                     stages: [ast::Expr],
+                     span: ast::Span) {
+    if len(stages) == 0 { return }
+
+    // First stage must be a literal (or a fully-folded expression).
+    let mut value = if is_literal(stages[0]) { as_literal(stages[0]) }
+                    else { return }
+
+    for stage in stages[1..] {
+        match stage {
+            ast::Expr::Call { callee, args, .. } => {
+                let fn_id = match callee_fn_id(callee) {
+                    Some(id) => id, None => return,
+                }
+                if not ctx.pure_fns.get(fn_id).unwrap_or(false) { return }
+                // Every argument that is not the pipeline value must be a literal.
+                let all_lit = args |> all(|a| is_literal(a) || is_pipeline_hole(a))
+                if not all_lit { return }
+                match eval_pure_call(fn_id, args, value) {
+                    Some(v) => value = v,
+                    None    => return,
+                }
+            },
+            _ => return,
+        }
+    }
+
+    *out = ast::Expr::Literal(value, span)
+    ctx.folded = ctx.folded + 1
+}
+
+fn try_fold_call(ctx: &mut FoldCtx,
+                 out: &mut ast::Expr,
+                 callee: ast::Expr,
+                 args: [ast::Expr],
+                 span: ast::Span) {
+    let fn_id = match callee_fn_id(callee) { Some(id) => id, None => return }
+    if not ctx.pure_fns.get(fn_id).unwrap_or(false) { return }
+    if not (args |> all(is_literal)) { return }
+    match eval_pure_call(fn_id, args, ast::Literal::Unit) {
+        Some(v) => { *out = ast::Expr::Literal(v, span); ctx.folded = ctx.folded + 1 },
+        None    => (),
+    }
+}
+
+// -- Primitive evaluators ---------------------------------------------------
+
+fn eval_binop(op: ast::BinOp, a: ast::Literal, b: ast::Literal) -> Option<ast::Literal> {
+    match (op, a, b) {
+        (ast::BinOp::Add, ast::Literal::Int(x),  ast::Literal::Int(y))   => Some(ast::Literal::Int(x + y)),
+        (ast::BinOp::Sub, ast::Literal::Int(x),  ast::Literal::Int(y))   => Some(ast::Literal::Int(x - y)),
+        (ast::BinOp::Mul, ast::Literal::Int(x),  ast::Literal::Int(y))   => Some(ast::Literal::Int(x * y)),
+        (ast::BinOp::Div, ast::Literal::Int(_),  ast::Literal::Int(0))   => None,      // leave for runtime
+        (ast::BinOp::Div, ast::Literal::Int(x),  ast::Literal::Int(y))   => Some(ast::Literal::Int(x / y)),
+        (ast::BinOp::Eq,  a, b)                                          => Some(ast::Literal::Bool(a == b)),
+        (ast::BinOp::Ne,  a, b)                                          => Some(ast::Literal::Bool(a != b)),
+        (ast::BinOp::And, ast::Literal::Bool(x), ast::Literal::Bool(y))  => Some(ast::Literal::Bool(x && y)),
+        (ast::BinOp::Or,  ast::Literal::Bool(x), ast::Literal::Bool(y))  => Some(ast::Literal::Bool(x || y)),
+        (ast::BinOp::Concat, ast::Literal::Str(x), ast::Literal::Str(y)) => Some(ast::Literal::Str(x + y)),
+        _ => None,
+    }
+}
+
+fn eval_pure_call(fn_id: ast::FnId, args: [ast::Expr], piped: ast::Literal) -> Option<ast::Literal> {
+    // Shortlist of stdlib functions the compiler is allowed to evaluate.
+    // Others must declare `#[const]` — handled by build_purity_map + a
+    // CTFE sandbox in a separate pass.
+    match ast::fn_path(fn_id) {
+        "std::iter::map"    => fold_map(piped, args[0]),
+        "std::iter::filter" => fold_filter(piped, args[0]),
+        "std::iter::sum"    => fold_sum(piped),
+        "std::iter::len"    => fold_len(piped),
+        "std::math::abs"    => fold_abs(piped),
+        _                   => None,
+    }
+}
+
+fn fold_sum(lit: ast::Literal) -> Option<ast::Literal> {
+    match lit {
+        ast::Literal::List(items) => {
+            let mut acc: Int = 0
+            for it in items {
+                match it { ast::Literal::Int(i) => acc = acc + i,
+                           _ => return None }
+            }
+            Some(ast::Literal::Int(acc))
+        },
+        _ => None,
+    }
+}
+
+fn fold_len(lit: ast::Literal) -> Option<ast::Literal> {
+    match lit {
+        ast::Literal::List(items) => Some(ast::Literal::Int(len(items))),
+        ast::Literal::Str(s)      => Some(ast::Literal::Int(len(s))),
+        _ => None,
+    }
+}
+
+fn fold_abs(lit: ast::Literal) -> Option<ast::Literal> {
+    match lit {
+        ast::Literal::Int(i) => Some(ast::Literal::Int(if i < 0 { -i } else { i })),
+        _ => None,
+    }
+}
+
+fn fold_map(lit: ast::Literal, lambda: ast::Expr) -> Option<ast::Literal> {
+    // Only pure closures over literals and primitive ops are foldable.
+    match lit {
+        ast::Literal::List(items) => {
+            let mut out: [ast::Literal] = []
+            for it in items {
+                match apply_pure_lambda(lambda, [it]) {
+                    Some(v) => out |> push_mut(v),
+                    None    => return None,
+                }
+            }
+            Some(ast::Literal::List(out))
+        },
+        _ => None,
+    }
+}
+
+fn fold_filter(lit: ast::Literal, lambda: ast::Expr) -> Option<ast::Literal> {
+    match lit {
+        ast::Literal::List(items) => {
+            let mut out: [ast::Literal] = []
+            for it in items {
+                match apply_pure_lambda(lambda, [it]) {
+                    Some(ast::Literal::Bool(true))  => out |> push_mut(it),
+                    Some(ast::Literal::Bool(false)) => (),
+                    _                               => return None,
+                }
+            }
+            Some(ast::Literal::List(out))
+        },
+        _ => None,
+    }
+}
+
+// (apply_pure_lambda / callee_fn_id / is_pipeline_hole / as_literal helpers
+// live in compiler/pass/const_fold_support.ltl for brevity.)
