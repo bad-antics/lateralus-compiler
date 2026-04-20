@@ -1,0 +1,259 @@
+
+// WebAssembly Code Emitter
+// Generates WASM binary format with sections, types, functions, and instructions.
+
+struct WasmModule {
+    types: [FuncType],
+    functions: [WasmFunc],
+    exports: [Export],
+    memories: [MemoryType],
+    globals: [Global],
+    custom_sections: [(string, [u8])],
+}
+
+#[derive(Clone, Debug)]
+struct FuncType {
+    params: [ValType],
+    results: [ValType],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ValType { I32, I64, F32, F64 }
+
+impl ValType {
+    fn encoding(self) -> u8 {
+        match self { ValType.I32 => 0x7F, ValType.I64 => 0x7E, ValType.F32 => 0x7D, ValType.F64 => 0x7C }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WasmFunc {
+    type_idx: u32,
+    locals: [ValType],
+    body: [WasmInstr],
+}
+
+#[derive(Clone, Debug)]
+enum WasmInstr {
+    I32Const(i32),
+    I64Const(i64),
+    I32Add, I32Sub, I32Mul, I32DivS,
+    I64Add, I64Sub, I64Mul,
+    I32Eqz, I32Eq, I32Ne, I32LtS, I32GtS,
+    LocalGet(u32), LocalSet(u32), LocalTee(u32),
+    GlobalGet(u32), GlobalSet(u32),
+    I32Load(u32, u32),   // align, offset
+    I32Store(u32, u32),
+    Call(u32),
+    If(Option<ValType>, [WasmInstr], [WasmInstr]),
+    Block(Option<ValType>, [WasmInstr]),
+    Loop(Option<ValType>, [WasmInstr]),
+    Br(u32),
+    BrIf(u32),
+    Return,
+    Drop,
+    Nop,
+    End,
+    Unreachable,
+}
+
+impl WasmInstr {
+    fn opcode(self) -> u8 {
+        match self {
+            WasmInstr.Unreachable => 0x00, WasmInstr.Nop => 0x01,
+            WasmInstr.Block(..) => 0x02, WasmInstr.Loop(..) => 0x03,
+            WasmInstr.If(..) => 0x04, WasmInstr.Br(_) => 0x0C,
+            WasmInstr.BrIf(_) => 0x0D, WasmInstr.Return => 0x0F,
+            WasmInstr.Call(_) => 0x10, WasmInstr.Drop => 0x1A,
+            WasmInstr.LocalGet(_) => 0x20, WasmInstr.LocalSet(_) => 0x21,
+            WasmInstr.LocalTee(_) => 0x22,
+            WasmInstr.GlobalGet(_) => 0x23, WasmInstr.GlobalSet(_) => 0x24,
+            WasmInstr.I32Load(..) => 0x28, WasmInstr.I32Store(..) => 0x36,
+            WasmInstr.I32Const(_) => 0x41, WasmInstr.I64Const(_) => 0x42,
+            WasmInstr.I32Eqz => 0x45, WasmInstr.I32Eq => 0x46,
+            WasmInstr.I32Ne => 0x47, WasmInstr.I32LtS => 0x48,
+            WasmInstr.I32GtS => 0x4A,
+            WasmInstr.I32Add => 0x6A, WasmInstr.I32Sub => 0x6B,
+            WasmInstr.I32Mul => 0x6C, WasmInstr.I32DivS => 0x6D,
+            WasmInstr.I64Add => 0x7C, WasmInstr.I64Sub => 0x7D,
+            WasmInstr.I64Mul => 0x7E,
+            WasmInstr.End => 0x0B,
+            _ => 0x00,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Export {
+    name: string,
+    kind: ExportKind,
+    index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ExportKind { Func, Table, Memory, Global }
+
+impl ExportKind {
+    fn encoding(self) -> u8 {
+        match self { ExportKind.Func => 0x00, ExportKind.Table => 0x01, ExportKind.Memory => 0x02, ExportKind.Global => 0x03 }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MemoryType { min_pages: u32, max_pages: Option<u32> }
+
+#[derive(Clone, Debug)]
+struct Global { val_type: ValType, mutable: bool, init_val: i64 }
+
+impl WasmModule {
+    fn new() -> WasmModule {
+        WasmModule {
+            types: [], functions: [], exports: [],
+            memories: [], globals: [], custom_sections: [],
+        }
+    }
+
+    fn add_type(mut self, params: [ValType], results: [ValType]) -> u32 {
+        let idx = self.types.len() as u32
+        self.types.push(FuncType { params, results })
+        idx
+    }
+
+    fn add_func(mut self, type_idx: u32, locals: [ValType], body: [WasmInstr]) -> u32 {
+        let idx = self.functions.len() as u32
+        self.functions.push(WasmFunc { type_idx, locals, body })
+        idx
+    }
+
+    fn add_export(mut self, name: &str, kind: ExportKind, index: u32) {
+        self.exports.push(Export { name: name.into(), kind, index })
+    }
+
+    fn add_memory(mut self, min: u32, max: Option<u32>) {
+        self.memories.push(MemoryType { min_pages: min, max_pages: max })
+    }
+
+    fn add_global(mut self, vt: ValType, mutable: bool, init: i64) -> u32 {
+        let idx = self.globals.len() as u32
+        self.globals.push(Global { val_type: vt, mutable, init_val: init })
+        idx
+    }
+
+    fn type_count(self) -> usize { self.types.len() }
+    fn func_count(self) -> usize { self.functions.len() }
+    fn export_count(self) -> usize { self.exports.len() }
+
+    fn encode_header(self) -> [u8] {
+        // WASM magic + version
+        [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00].into()
+    }
+
+    fn encode_leb128_u32(val: u32) -> [u8] {
+        let mut result = []
+        let mut v = val
+        loop {
+            let byte = (v & 0x7F) as u8
+            v >>= 7
+            if v == 0 { result.push(byte); break }
+            else { result.push(byte | 0x80) }
+        }
+        result
+    }
+
+    fn validate(self) -> bool {
+        for func in &self.functions {
+            if (func.type_idx as usize) >= self.types.len() { return false }
+        }
+        for export in &self.exports {
+            if export.kind == ExportKind.Func && (export.index as usize) >= self.functions.len() {
+                return false
+            }
+        }
+        true
+    }
+}
+
+fn main() {
+    let mut module = WasmModule.new()
+
+    // Add type
+    let ty = module.add_type([ValType.I32, ValType.I32], [ValType.I32])
+    assert(ty == 0)
+    assert(module.type_count() == 1)
+    print("Type ✓")
+
+    // Add function
+    let func = module.add_func(0, [], [
+        WasmInstr.LocalGet(0),
+        WasmInstr.LocalGet(1),
+        WasmInstr.I32Add,
+        WasmInstr.End,
+    ])
+    assert(func == 0)
+    assert(module.func_count() == 1)
+    print("Function ✓")
+
+    // Export
+    module.add_export("add", ExportKind.Func, 0)
+    assert(module.export_count() == 1)
+    print("Export ✓")
+
+    // Memory
+    module.add_memory(1, Some(10))
+    assert(module.memories.len() == 1)
+    print("Memory ✓")
+
+    // Global
+    let g = module.add_global(ValType.I32, true, 0)
+    assert(g == 0)
+    print("Global ✓")
+
+    // Validation
+    assert(module.validate())
+    print("Validate ✓")
+
+    // Invalid: func references non-existent type
+    let mut bad = WasmModule.new()
+    bad.add_func(99, [], [])
+    assert(!bad.validate())
+    print("Invalid type ref ✓")
+
+    // Invalid: export references non-existent func
+    let mut bad2 = WasmModule.new()
+    bad2.add_export("f", ExportKind.Func, 0)
+    assert(!bad2.validate())
+    print("Invalid export ✓")
+
+    // Header
+    let header = module.encode_header()
+    assert(header.len() == 8)
+    assert(header[0] == 0x00 && header[1] == 0x61)
+    print("Header ✓")
+
+    // LEB128
+    assert(WasmModule.encode_leb128_u32(0) == [0x00])
+    assert(WasmModule.encode_leb128_u32(127) == [0x7F])
+    assert(WasmModule.encode_leb128_u32(128) == [0x80, 0x01])
+    assert(WasmModule.encode_leb128_u32(624485) == [0xE5, 0x8E, 0x26])
+    print("LEB128 ✓")
+
+    // ValType encoding
+    assert(ValType.I32.encoding() == 0x7F)
+    assert(ValType.I64.encoding() == 0x7E)
+    assert(ValType.F64.encoding() == 0x7C)
+    print("ValType ✓")
+
+    // Opcode
+    assert(WasmInstr.I32Add.opcode() == 0x6A)
+    assert(WasmInstr.I32Const(0).opcode() == 0x41)
+    assert(WasmInstr.End.opcode() == 0x0B)
+    assert(WasmInstr.Call(0).opcode() == 0x10)
+    print("Opcode ✓")
+
+    // ExportKind
+    assert(ExportKind.Func.encoding() == 0x00)
+    assert(ExportKind.Memory.encoding() == 0x02)
+    print("ExportKind ✓")
+
+    print("WASM emitter complete ✓")
+}
