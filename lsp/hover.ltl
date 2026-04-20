@@ -1,0 +1,119 @@
+// compiler/lsp/hover.ltl
+//
+// Hover provider for the Lateralus Language Server.
+//
+// Given a document URI and a (line, column) position, produce a
+// Markdown payload with the symbol's type, docstring, and (for
+// pipeline stages) the inferred input/output types of the stage.
+//
+// Batch 77 / tooling.
+
+import std::ast
+import std::compiler::{Module, TypeEnv, Span}
+import std::collections::Map
+import std::json
+
+pub struct HoverParams {
+    uri:  String,
+    line: Int,
+    col:  Int,
+}
+
+pub struct HoverResult {
+    contents: String,         // Markdown
+    range:    Span,
+}
+
+pub fn handle(modules: Map<String, Module>, params: HoverParams)
+    -> Option<HoverResult>
+{
+    let module = modules |> get(params.uri)?
+    let node   = module |> find_node_at(params.line, params.col)?
+
+    match node {
+        ast::Node::Ident(name, ty, span)    => Some(render_ident(name, ty, span)),
+        ast::Node::FnCall(callee, ty, span) => Some(render_call(callee, ty, span, module)),
+        ast::Node::PipeStage(stage, span)   => Some(render_stage(stage, span, module)),
+        ast::Node::Literal(lit, ty, span)   => Some(render_literal(lit, ty, span)),
+        _ => None,
+    }
+}
+
+fn render_ident(name: String, ty: ast::Type, span: Span) -> HoverResult {
+    let body = "```lateralus\n{name}: {ty |> format_type()}\n```"
+    HoverResult { contents: body, range: span }
+}
+
+fn render_call(callee: ast::Expr, ty: ast::Type, span: Span, m: Module) -> HoverResult {
+    let doc = m |> docstring_for(callee) |> unwrap_or("")
+    let sig = m |> signature_of(callee) |> unwrap_or("<unknown signature>")
+    let body = [
+        "```lateralus",
+        sig,
+        "```",
+        "",
+        "**Returns:** `{ty |> format_type()}`",
+        "",
+        doc,
+    ] |> join("\n")
+    HoverResult { contents: body, range: span }
+}
+
+fn render_stage(stage: ast::Expr, span: Span, m: Module) -> HoverResult {
+    // Pipeline stage hovers are the *most* useful case: we show both
+    // sides of the |> so the user can see exactly what flows in and out.
+    let in_ty  = m |> inferred_input(stage)  |> unwrap_or(ast::Type::unknown())
+    let out_ty = m |> inferred_output(stage) |> unwrap_or(ast::Type::unknown())
+    let body = [
+        "**Pipeline stage**",
+        "",
+        "```lateralus",
+        "in  : {in_ty  |> format_type()}",
+        "out : {out_ty |> format_type()}",
+        "```",
+        "",
+        "_Hover the call itself for the function signature._",
+    ] |> join("\n")
+    HoverResult { contents: body, range: span }
+}
+
+fn render_literal(lit: ast::Literal, ty: ast::Type, span: Span) -> HoverResult {
+    let body = match lit {
+        ast::Literal::Int(n)
+            => "```lateralus\n{n}: {ty |> format_type()}\n```\n\nhex: `{n |> hex()}` | bin: `{n |> bin()}`",
+        ast::Literal::Float(f)
+            => "```lateralus\n{f}: {ty |> format_type()}\n```",
+        ast::Literal::Str(s)
+            => "```lateralus\n\"...\": String\n```\n\nlength: {len(s)} bytes",
+        ast::Literal::Bool(b)
+            => "```lateralus\n{b}: Bool\n```",
+    }
+    HoverResult { contents: body, range: span }
+}
+
+fn format_type(t: ast::Type) -> String {
+    match t {
+        ast::Type::Named(n, [])     => n,
+        ast::Type::Named(n, args)   => "{n}<{args |> map(format_type) |> join(\", \")}>",
+        ast::Type::Fn(args, ret)
+            => "fn({args |> map(format_type) |> join(\", \")}) -> {format_type(*ret)}",
+        ast::Type::Tuple(elts)
+            => "({elts |> map(format_type) |> join(\", \")})",
+        ast::Type::Ref(inner, is_mut)
+            => "{if is_mut { \"&mut \" } else { \"&\" }}{format_type(*inner)}",
+        ast::Type::Unknown
+            => "?",
+    }
+}
+
+/// LSP transport glue.
+pub fn serialize(result: Option<HoverResult>) -> json::Value {
+    match result {
+        None    => json::Null,
+        Some(h) => json::Obj(Map::empty()
+            |> set("contents", json::Obj(Map::empty()
+                |> set("kind",  json::Str("markdown"))
+                |> set("value", json::Str(h.contents))))
+            |> set("range", h.range |> Span::to_lsp_range())),
+    }
+}
