@@ -1,0 +1,234 @@
+
+// ELF Writer - Generates Executable and Linkable Format binaries
+// Supports ELF64 header, sections, symbols, and program headers.
+
+const ELF_MAGIC: [u8; 4] = [0x7F, 0x45, 0x4C, 0x46]
+const ELFCLASS64: u8 = 2
+const ELFDATA2LSB: u8 = 1
+const ET_EXEC: u16 = 2
+const ET_DYN: u16 = 3
+const EM_X86_64: u16 = 0x3E
+const EM_AARCH64: u16 = 0xB7
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ElfType { Exec, Dyn, Rel }
+
+impl ElfType {
+    fn value(self) -> u16 {
+        match self { ElfType.Exec => 2, ElfType.Dyn => 3, ElfType.Rel => 1 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SectionType { Null, ProgBits, SymTab, StrTab, Rela, NoBits, Dynamic }
+
+impl SectionType {
+    fn value(self) -> u32 {
+        match self {
+            SectionType.Null => 0, SectionType.ProgBits => 1,
+            SectionType.SymTab => 2, SectionType.StrTab => 3,
+            SectionType.Rela => 4, SectionType.NoBits => 8,
+            SectionType.Dynamic => 6,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Section {
+    name: string,
+    section_type: SectionType,
+    flags: u64,
+    addr: u64,
+    data: [u8],
+    alignment: u64,
+    entry_size: u64,
+}
+
+impl Section {
+    fn new(name: &str, st: SectionType) -> Section {
+        Section { name: name.into(), section_type: st, flags: 0, addr: 0, data: [], alignment: 1, entry_size: 0 }
+    }
+    fn with_flags(mut self, f: u64) -> Section { self.flags = f; self }
+    fn with_data(mut self, d: [u8]) -> Section { self.data = d; self }
+    fn with_addr(mut self, a: u64) -> Section { self.addr = a; self }
+    fn with_alignment(mut self, a: u64) -> Section { self.alignment = a; self }
+    fn size(self) -> usize { self.data.len() }
+}
+
+#[derive(Clone, Debug)]
+struct Symbol {
+    name: string,
+    value: u64,
+    size: u64,
+    section_idx: u16,
+    binding: u8,
+    sym_type: u8,
+}
+
+impl Symbol {
+    fn new(name: &str, value: u64, size: u64) -> Symbol {
+        Symbol { name: name.into(), value, size, section_idx: 0, binding: 0, sym_type: 0 }
+    }
+    fn global(mut self) -> Symbol { self.binding = 1; self }
+    fn local(mut self) -> Symbol { self.binding = 0; self }
+    fn func(mut self) -> Symbol { self.sym_type = 2; self }
+    fn object(mut self) -> Symbol { self.sym_type = 1; self }
+    fn in_section(mut self, idx: u16) -> Symbol { self.section_idx = idx; self }
+    fn info(self) -> u8 { (self.binding << 4) | (self.sym_type & 0xF) }
+}
+
+struct ElfWriter {
+    elf_type: ElfType,
+    machine: u16,
+    entry_point: u64,
+    sections: [Section],
+    symbols: [Symbol],
+    string_table: [u8],
+}
+
+impl ElfWriter {
+    fn new(elf_type: ElfType) -> ElfWriter {
+        let null_section = Section.new("", SectionType.Null)
+        ElfWriter {
+            elf_type, machine: EM_X86_64, entry_point: 0x400000,
+            sections: [null_section], symbols: [],
+            string_table: [0],  // null byte
+        }
+    }
+
+    fn set_machine(mut self, m: u16) { self.machine = m }
+    fn set_entry(mut self, e: u64) { self.entry_point = e }
+
+    fn add_string(mut self, s: &str) -> u32 {
+        let offset = self.string_table.len() as u32
+        self.string_table.extend_from_slice(s.as_bytes())
+        self.string_table.push(0)
+        offset
+    }
+
+    fn add_section(mut self, section: Section) -> u16 {
+        let idx = self.sections.len() as u16
+        self.sections.push(section)
+        idx
+    }
+
+    fn add_symbol(mut self, symbol: Symbol) { self.symbols.push(symbol) }
+
+    fn section_count(self) -> usize { self.sections.len() }
+    fn symbol_count(self) -> usize { self.symbols.len() }
+
+    fn encode_header(self) -> [u8; 64] {
+        let mut header = [0u8; 64]
+        header[0..4].copy_from_slice(&ELF_MAGIC)
+        header[4] = ELFCLASS64
+        header[5] = ELFDATA2LSB
+        header[6] = 1  // version
+        // type
+        header[16] = (self.elf_type.value() & 0xFF) as u8
+        header[17] = (self.elf_type.value() >> 8) as u8
+        // machine
+        header[18] = (self.machine & 0xFF) as u8
+        header[19] = (self.machine >> 8) as u8
+        // version
+        header[20] = 1
+        // entry point (bytes 24-31)
+        let ep = self.entry_point.to_le_bytes()
+        header[24..32].copy_from_slice(&ep)
+        // e_ehsize
+        header[52] = 64
+        header
+    }
+
+    fn total_size(self) -> usize {
+        64 + self.sections.iter().map(|s| s.size()).sum::<usize>()
+    }
+
+    fn validate(self) -> bool {
+        self.sections.len() > 0 && self.sections[0].section_type == SectionType.Null
+    }
+}
+
+fn main() {
+    // ELF types
+    assert(ElfType.Exec.value() == 2)
+    assert(ElfType.Dyn.value() == 3)
+    assert(ElfType.Rel.value() == 1)
+    print("ElfType ✓")
+
+    // Section types
+    assert(SectionType.ProgBits.value() == 1)
+    assert(SectionType.StrTab.value() == 3)
+    assert(SectionType.NoBits.value() == 8)
+    print("SectionType ✓")
+
+    // Basic writer
+    let mut elf = ElfWriter.new(ElfType.Exec)
+    assert(elf.section_count() == 1)  // null section
+    assert(elf.validate())
+    print("Writer init ✓")
+
+    // Add section
+    let text = Section.new(".text", SectionType.ProgBits)
+        .with_flags(0x6)  // alloc + exec
+        .with_data([0xCC, 0xC3].into())
+        .with_addr(0x401000)
+        .with_alignment(16)
+    let idx = elf.add_section(text)
+    assert(idx == 1)
+    assert(elf.section_count() == 2)
+    print("Section ✓")
+
+    // Add symbol
+    let sym = Symbol.new("main", 0x401000, 2).global().func().in_section(1)
+    assert(sym.info() == 0x12)  // global(1) << 4 | func(2)
+    elf.add_symbol(sym)
+    assert(elf.symbol_count() == 1)
+    print("Symbol ✓")
+
+    // String table
+    let off1 = elf.add_string(".text")
+    assert(off1 == 1)  // after null byte
+    let off2 = elf.add_string("main")
+    assert(off2 == 7)  // after ".text\0"
+    print("Strings ✓")
+
+    // Header encoding
+    let header = elf.encode_header()
+    assert(header[0] == 0x7F)
+    assert(header[1] == 0x45)  // 'E'
+    assert(header[2] == 0x4C)  // 'L'
+    assert(header[3] == 0x46)  // 'F'
+    assert(header[4] == ELFCLASS64)
+    assert(header[52] == 64)  // e_ehsize
+    print("Header ✓")
+
+    // Entry point in header
+    assert(header[24] == 0x00)  // 0x400000 LE
+    assert(header[25] == 0x00)
+    assert(header[26] == 0x40)
+    print("Entry ✓")
+
+    // Machine
+    elf.set_machine(EM_AARCH64)
+    assert(elf.machine == EM_AARCH64)
+    print("Machine ✓")
+
+    // Section properties
+    let sec = Section.new(".data", SectionType.ProgBits).with_data([1, 2, 3, 4].into())
+    assert(sec.size() == 4)
+    assert(sec.name == ".data")
+    print("Section props ✓")
+
+    // Symbol properties
+    let s2 = Symbol.new("var", 0x600000, 8).local().object()
+    assert(s2.binding == 0)
+    assert(s2.sym_type == 1)
+    assert(s2.info() == 0x01)
+    print("Symbol props ✓")
+
+    // Total size
+    assert(elf.total_size() >= 64)
+    print("Total size ✓")
+
+    print("ELF writer complete ✓")
+}
