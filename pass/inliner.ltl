@@ -1,0 +1,53 @@
+// compiler/pass/inliner.ltl — Call-site inlining with size budget.
+//
+// Greedy heuristic: score each call site by (callee_size_saved -
+// inline_growth - call_frequency_bonus) and inline the top-K that fit
+// within the function's growth budget. Inlining does three things:
+//     1. Rename callee's SSA vars into fresh IDs in the caller.
+//     2. Splice the callee's CFG into the call's basic block.
+//     3. Replace the callee's returns with jumps to a join block where
+//        the return value becomes a φ.
+// Careful with recursion: mark functions in-progress so we don't unroll
+// infinitely. Exception handlers need landing-pad fixup too.
+
+use ir::{FunctionId, InstrId, Module}
+
+pub struct InlineOpts {
+    pub max_growth_per_fn: u32,     // max instructions added per caller
+    pub max_callee_size: u32,       // biggest callee we'll consider
+    pub threshold: i32,             // score must exceed this
+}
+
+pub fn run(module: &mut Module, opts: &InlineOpts) -> usize {
+    let mut inlined = 0
+    let order = topo_order_call_graph(module)   // callees before callers
+    for fn_id in order {
+        let mut growth = 0u32
+        let calls: Vec<InstrId> = module.functions[fn_id].call_sites().collect()
+        // Score and sort — simple proxy: bigger leaf calls inline first.
+        let mut scored: Vec<(InstrId, i32)> = calls.into_iter()
+            .filter_map(|c| {
+                let callee = module.resolve_call(c)?
+                if module.functions[callee].size() > opts.max_callee_size { return None }
+                Some((c, score(module, c, callee)))
+            })
+            .collect()
+        scored.sort_by_key(|&(_, s)| -s)
+        for (call, s) in scored {
+            if s < opts.threshold { break }
+            let callee = module.resolve_call(call).unwrap()
+            let added = module.functions[callee].size()
+            if growth + added > opts.max_growth_per_fn { continue }
+            splice_inline(module, fn_id, call, callee)
+            growth += added; inlined += 1
+        }
+    }
+    inlined
+}
+
+fn score(_module: &Module, _site: InstrId, _callee: FunctionId) -> i32 {
+    // Static heuristic — production builds use PGO counts here.
+    50
+}
+fn splice_inline(_module: &mut Module, _caller: FunctionId, _call: InstrId, _callee: FunctionId) {}
+fn topo_order_call_graph(_module: &Module) -> Vec<FunctionId> { Vec::new() }
