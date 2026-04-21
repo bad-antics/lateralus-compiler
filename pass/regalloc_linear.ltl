@@ -1,0 +1,55 @@
+// compiler/pass/regalloc_linear.ltl — Poletto & Sarkar linear-scan allocator.
+//
+// Compute live intervals per virtual register, sort by start position,
+// then sweep once: at each interval start, expire any intervals that
+// ended before this point, assign a free physreg, or — if all are busy
+// — spill the interval with the farthest endpoint. O(n) + sort vs
+// graph-coloring's O(n²), at ~10% more spill cost. JITs love this.
+
+pub struct Interval { pub vreg: u32, pub start: u32, pub end: u32, pub assigned: Option<u8> }
+
+pub struct LinearScan { pub intervals: Vec<Interval>, pub num_regs: u8 }
+
+pub struct Assignment { pub reg_map: Vec<Option<u8>>, pub spilled: Vec<u32> }
+
+impl LinearScan {
+    pub fn run(&mut self) -> Assignment {
+        self.intervals.sort_by_key(|i| i.start)
+        let mut active: Vec<usize> = Vec::new()
+        let mut free: Vec<bool> = vec![true; self.num_regs as usize]
+        let mut spilled = Vec::new()
+        let mut reg_map = vec![None; self.intervals.len()]
+        for i in 0..self.intervals.len() {
+            let start = self.intervals[i].start
+            // Expire intervals whose end <= start.
+            active.retain(|&a| {
+                if self.intervals[a].end <= start {
+                    if let Some(r) = self.intervals[a].assigned { free[r as usize] = true }
+                    false
+                } else { true }
+            })
+            if let Some(r) = free.iter().position(|&x| x) {
+                free[r] = false
+                self.intervals[i].assigned = Some(r as u8)
+                reg_map[i] = Some(r as u8)
+                active.push(i)
+            } else {
+                // Spill: evict the interval with the farthest end if it's
+                // farther than the current one; otherwise spill current.
+                let &farthest = active.iter().max_by_key(|&&a| self.intervals[a].end).unwrap()
+                if self.intervals[farthest].end > self.intervals[i].end {
+                    let r = self.intervals[farthest].assigned.unwrap()
+                    self.intervals[i].assigned = Some(r)
+                    reg_map[i] = Some(r)
+                    spilled.push(self.intervals[farthest].vreg)
+                    self.intervals[farthest].assigned = None
+                    active.retain(|&a| a != farthest)
+                    active.push(i)
+                } else {
+                    spilled.push(self.intervals[i].vreg)
+                }
+            }
+        }
+        Assignment { reg_map, spilled }
+    }
+}
