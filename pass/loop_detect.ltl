@@ -1,0 +1,57 @@
+// compiler/pass/loop_detect.ltl — Natural loop detection via dominators.
+//
+// A back edge is an edge u → v where v dominates u. The natural loop
+// for a back edge has v as the header and includes all blocks that can
+// reach u without going through v. We compute these by a DFS from u in
+// the inverted CFG, stopping at v. Loops nest: inner loops have more
+// back edges inside them, which gives the tree structure.
+
+use ir::BlockId
+use std::collections::HashSet
+
+pub struct Loop {
+    pub header: BlockId,
+    pub back_edge_from: BlockId,
+    pub body: HashSet<BlockId>,
+    pub depth: u32,
+}
+
+pub fn find_natural_loops(
+    n_blocks: usize,
+    succ: &[Vec<BlockId>],
+    preds: &[Vec<BlockId>],
+    dominates: &dyn Fn(BlockId, BlockId) -> bool,
+) -> Vec<Loop> {
+    let mut loops = Vec::new()
+    for u in 0..n_blocks {
+        for &v in &succ[u] {
+            if dominates(v, u) {
+                let body = collect_natural_loop(u, v, preds)
+                loops.push(Loop { header: v, back_edge_from: u, body, depth: 0 })
+            }
+        }
+    }
+    assign_depths(&mut loops)
+    loops
+}
+
+fn collect_natural_loop(tail: BlockId, header: BlockId, preds: &[Vec<BlockId>]) -> HashSet<BlockId> {
+    let mut body: HashSet<BlockId> = [header, tail].iter().copied().collect()
+    let mut stack: Vec<BlockId> = vec![tail]
+    while let Some(b) = stack.pop() {
+        for &p in &preds[b] {
+            if !body.contains(&p) {
+                body.insert(p); stack.push(p)
+            }
+        }
+    }
+    body
+}
+
+fn assign_depths(loops: &mut [Loop]) {
+    // Depth = number of loops whose body is a superset of this loop's header.
+    let snapshot: Vec<HashSet<BlockId>> = loops.iter().map(|l| l.body.clone()).collect()
+    for l in loops.iter_mut() {
+        l.depth = snapshot.iter().filter(|b| b.contains(&l.header) && *b != &l.body).count() as u32
+    }
+}
