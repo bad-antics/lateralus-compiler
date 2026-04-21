@@ -1,0 +1,58 @@
+// compiler/pass/liveness.ltl — Backward dataflow for live-variable analysis.
+//
+// For each program point, compute the set of variables whose value
+// will be read before it's overwritten. Fixed-point equations:
+//     live_out[B] = ∪ live_in[S]  for S in succ(B)
+//     live_in[B]  = use[B] ∪ (live_out[B] \ def[B])
+// Iterate in reverse post-order until no change. Drives register
+// allocation, dead-store elimination, and SSA-φ placement.
+
+use ir::{BlockId, Instr, VarId}
+use std::collections::HashSet
+
+pub struct Liveness {
+    pub live_in: Vec<HashSet<VarId>>,
+    pub live_out: Vec<HashSet<VarId>>,
+}
+
+pub fn analyze(blocks: &[Block]) -> Liveness {
+    let n = blocks.len()
+    let mut live_in = vec![HashSet::new(); n]
+    let mut live_out = vec![HashSet::new(); n]
+    let (use_, def) = gather_use_def(blocks)
+    let rpo = reverse_post_order(blocks)
+    let mut changed = true
+    while changed {
+        changed = false
+        // Process in REVERSE reverse-postorder (= post-order) so
+        // successors are updated before predecessors.
+        for &b in rpo.iter().rev() {
+            let mut new_out = HashSet::new()
+            for &s in &blocks[b].succ { new_out.extend(&live_in[s]) }
+            let mut new_in = use_[b].clone()
+            for v in new_out.difference(&def[b]) { new_in.insert(*v) }
+            if new_in != live_in[b] || new_out != live_out[b] {
+                live_in[b] = new_in; live_out[b] = new_out; changed = true
+            }
+        }
+    }
+    Liveness { live_in, live_out }
+}
+
+fn gather_use_def(blocks: &[Block]) -> (Vec<HashSet<VarId>>, Vec<HashSet<VarId>>) {
+    let mut use_ = vec![HashSet::new(); blocks.len()]
+    let mut def  = vec![HashSet::new(); blocks.len()]
+    for (i, b) in blocks.iter().enumerate() {
+        for instr in &b.instrs {
+            // A variable used in this block *before* being defined is
+            // a real upward-exposed use — those are what `use_` tracks.
+            for u in instr.uses() {
+                if !def[i].contains(&u) { use_[i].insert(u) }
+            }
+            if let Some(d) = instr.def_() { def[i].insert(d) }
+        }
+    }
+    (use_, def)
+}
+
+pub struct Block { pub instrs: Vec<Instr>, pub succ: Vec<BlockId> }
