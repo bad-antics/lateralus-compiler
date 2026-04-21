@@ -1,0 +1,57 @@
+// compiler/pass/ssa_phi_placement.ltl — Cytron's dominance-frontier algorithm.
+//
+// For each variable, insert a φ-node in every block that is in the
+// dominance frontier of at least one block that defines the variable.
+// Iterate: once a block gets a φ, it counts as a defining block, so
+// we add φs in *its* dominance frontier too. This gives "minimal SSA"
+// — the canonical form PHP's Hack-JIT, LLVM, GCC all compute.
+
+use ir::{BlockId, VarId}
+use std::collections::{HashMap, HashSet}
+
+pub struct DomFrontier { pub per_block: Vec<HashSet<BlockId>> }
+
+pub fn place_phis(
+    n_blocks: usize,
+    defs_of: &HashMap<VarId, HashSet<BlockId>>,
+    df: &DomFrontier,
+) -> HashMap<VarId, HashSet<BlockId>> {
+    let mut phi_at: HashMap<VarId, HashSet<BlockId>> = HashMap::new()
+    for (&var, def_blocks) in defs_of {
+        let mut worklist: Vec<BlockId> = def_blocks.iter().copied().collect()
+        let mut has_phi: HashSet<BlockId> = HashSet::new()
+        let mut ever_on_worklist: HashSet<BlockId> = def_blocks.clone()
+        while let Some(b) = worklist.pop() {
+            for &y in &df.per_block[b] {
+                if !has_phi.contains(&y) {
+                    has_phi.insert(y)
+                    if !ever_on_worklist.contains(&y) {
+                        worklist.push(y); ever_on_worklist.insert(y)
+                    }
+                }
+            }
+        }
+        phi_at.insert(var, has_phi)
+    }
+    phi_at
+}
+
+/// Lengauer-Tarjan-style dominance frontier — each block's frontier is
+/// the set of nodes that are NOT strictly dominated by b but have a
+/// predecessor that IS.
+pub fn compute_dominance_frontier(
+    n_blocks: usize, preds: &[Vec<BlockId>], idom: &[Option<BlockId>]
+) -> DomFrontier {
+    let mut df = DomFrontier { per_block: vec![HashSet::new(); n_blocks] }
+    for b in 0..n_blocks {
+        if preds[b].len() < 2 { continue }
+        for &p in &preds[b] {
+            let mut runner = p
+            while Some(runner) != idom[b] {
+                df.per_block[runner].insert(b)
+                match idom[runner] { Some(d) => runner = d, None => break }
+            }
+        }
+    }
+    df
+}
